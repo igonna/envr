@@ -51,6 +51,21 @@ class RepositoryURLTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(envr.EnvrError):
                 envr.parse_repository_url(value)
 
+    def test_first_repository_check_can_confirm_host_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            private_key = Path(temporary) / "id_ed25519"
+            private_key.write_text("test key", encoding="utf-8")
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with mock.patch.object(envr, "run", return_value=completed) as execute:
+                app.verify_repository_access(
+                    "git@example.com:owner/repository.git", private_key
+                )
+
+            ssh_command = execute.call_args.kwargs["env"]["GIT_SSH_COMMAND"]
+            self.assertIn("StrictHostKeyChecking=ask", ssh_command)
+            self.assertNotIn("BatchMode=yes", ssh_command)
+
 
 class SecretAndStateTests(unittest.TestCase):
     def test_password_shape_and_randomness(self) -> None:

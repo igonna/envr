@@ -557,8 +557,6 @@ class Envr:
                 "-o",
                 "IdentitiesOnly=yes",
                 "-o",
-                "BatchMode=yes",
-                "-o",
                 "StrictHostKeyChecking=ask",
                 "-o",
                 f"UserKnownHostsFile={self.git_known_hosts}",
