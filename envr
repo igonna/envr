@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -1985,18 +1985,27 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
 
         cached = self.cached_instance(ram_gb)
         if cached is not None:
-            try:
-                reachable = self.remote_command(
-                    cached,
-                    "true",
-                    check=False,
-                    quiet=True,
-                    timeout=7,
-                    connect_timeout=5,
-                    strict_host_key_checking="yes",
-                )
-            except subprocess.TimeoutExpired:
-                reachable = None
+            reachable = None
+            for attempt in range(3):
+                try:
+                    reachable = self.remote_command(
+                        cached,
+                        "true",
+                        check=False,
+                        quiet=True,
+                        timeout=7,
+                        connect_timeout=5,
+                        strict_host_key_checking="yes",
+                    )
+                except subprocess.TimeoutExpired:
+                    reachable = None
+                if reachable is not None and reachable.returncode == 0:
+                    break
+                failure = (reachable.stderr or "") if reachable is not None else ""
+                if not self.transient_ssh_probe_failure(failure) or attempt == 2:
+                    break
+                print("SSH handshake interrupted; retrying...")
+                time.sleep(1)
             if reachable is not None and reachable.returncode == 0:
                 print(f"Using cached VPS at {cached['main_ip']}...")
                 prepared = self.prepare_existing_instance(cached, folder)
@@ -2029,6 +2038,25 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
             repository = self.repository(folder) if folder is not None else None
             instance = self.create_instance(api, ram_gb, repository)
         return instance, repository
+
+    @staticmethod
+    def transient_ssh_probe_failure(stderr: str) -> bool:
+        failure = stderr.lower()
+        non_retryable = (
+            "permission denied",
+            "authentication failed",
+            "host identification has changed",
+            "host key verification failed",
+            "no ed25519 host key is known",
+            "no ecdsa host key is known",
+            "no rsa host key is known",
+            "load key",
+            "identity file",
+            "bad permissions",
+            "invalid format",
+            "error in libcrypto",
+        )
+        return not any(marker in failure for marker in non_retryable)
 
     def status(self) -> int:
         api = self.api()

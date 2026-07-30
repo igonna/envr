@@ -89,7 +89,10 @@ All remote SSH commands and SCP transfers for the same VPS use
 `ControlMaster=auto` with a mode-private control socket and a five-minute
 `ControlPersist`. This makes the first successful authenticated connection the
 transport for the rest of setup, synchronization, and shell attachment. Local
-control sockets are transient and removed with instance state.
+control sockets are transient and removed with instance state. The idempotent
+initial `true` probe retries transient handshake/network failure up to three
+times; explicit authentication, host-key, and local-key failures stop
+immediately, and arbitrary remote operations are never automatically replayed.
 
 Removing a device key from the Vultr account prevents it from being included
 in future VPS instances. A key already installed on a running VPS must also be

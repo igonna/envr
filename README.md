@@ -94,6 +94,8 @@ Within one `up`, SSH and SCP share a private OpenSSH control connection. Once
 one key-authenticated handshake succeeds, package checks, credential and
 repository synchronization, and the interactive shell reuse that connection
 instead of repeatedly crossing an unreliable or filtered network path.
+Transient failures of the initial safe key probe are retried up to three times;
+authentication, host-key, and local-key failures are never blindly retried.
 
 Inspect the Vultr account, instance, live price, IP, and envr-managed recovery
 root password:

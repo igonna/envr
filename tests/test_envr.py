@@ -482,6 +482,51 @@ class LifecycleLogicTests(unittest.TestCase):
             app.prepare_existing_instance.assert_called_once()
             app.try_cached_device_key_sync.assert_called_once()
 
+    def test_up_retries_transient_cached_handshake_without_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            envr.atomic_write_text(app.vps_key, "private-key")
+            envr.atomic_write_text(app.vps_known_hosts, "trusted-host-key")
+            app.save_instance_state(
+                {
+                    "id": "instance-id",
+                    "main_ip": "192.0.2.10",
+                    "ram": 1024,
+                    "region": "fra",
+                }
+            )
+            app.api = mock.Mock(side_effect=AssertionError("API must not be required"))
+            app.remote_command = mock.Mock(
+                side_effect=[
+                    SimpleNamespace(
+                        returncode=255,
+                        stdout="",
+                        stderr=(
+                            "Connection timed out during banner exchange\n"
+                            "Connection to 192.0.2.10 port 22 timed out"
+                        ),
+                    ),
+                    SimpleNamespace(returncode=0, stdout="", stderr=""),
+                ]
+            )
+            expected = (
+                {"id": "instance-id", "main_ip": "192.0.2.10"},
+                None,
+            )
+            app.prepare_existing_instance = mock.Mock(return_value=expected)
+            app.try_cached_device_key_sync = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                mock.patch.object(envr.time, "sleep"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = app.up(1, None)
+
+            self.assertEqual(result, expected)
+            self.assertEqual(app.remote_command.call_count, 2)
+            app.api.assert_not_called()
+
     def test_instance_cache_preserves_ip_and_password_securely(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
