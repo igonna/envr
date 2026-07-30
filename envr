@@ -17,7 +17,6 @@ import re
 import secrets
 import shlex
 import shutil
-import string
 import subprocess
 import sys
 import tempfile
@@ -28,12 +27,18 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.1.0"
+VERSION = "0.3.0"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
-REMOTE_USER = "codex"
-REMOTE_ROOT = "/home/codex/envr"
+MANAGEMENT_TAG = "envr-managed"
+DEVICE_KEY_PREFIX = "envr-device-"
+REMOTE_USER = "remote"
+REMOTE_HOSTNAME = "envr"
+REMOTE_HOME = f"/home/{REMOTE_USER}"
+REMOTE_ROOT = f"{REMOTE_HOME}/envr"
+REMOTE_CONFIG_ROOT = f"{REMOTE_HOME}/.config/envr"
+REMOTE_REPOS = f"{REMOTE_CONFIG_ROOT}/repos.json"
 REGIONS = ("fra", "ams", "waw")
 PLAN_IDS = {
     1: "vc2-1c-1gb",
@@ -45,6 +50,25 @@ SSH_CONNECT_TIMEOUT = 10
 INSTANCE_TIMEOUT = 600
 CLOUD_INIT_TIMEOUT = 900
 DELETE_TIMEOUT = 300
+
+SCODEX_SCRIPT = """#!/bin/sh
+set -eu
+
+case "${1:-}" in
+    auth)
+        shift
+        exec codex login --device-auth "$@"
+        ;;
+    resume)
+        shift
+        exec codex resume --dangerously-bypass-approvals-and-sandbox "$@"
+        ;;
+    *)
+        echo "usage: scodex {auth|resume}" >&2
+        exit 2
+        ;;
+esac
+"""
 
 
 class EnvrError(RuntimeError):
@@ -65,7 +89,11 @@ def eprint(*values: object) -> None:
 
 def data_root() -> Path:
     override = os.environ.get("ENVR_HOME")
-    return Path(override).expanduser() if override else Path.home() / "envr"
+    if override:
+        return Path(override).expanduser()
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return base / "envr"
 
 
 def ensure_private_dir(directory: Path) -> None:
@@ -201,34 +229,20 @@ def ensure_commands(commands: Sequence[str]) -> None:
 
     environment = package_environment()
     if environment == "termux":
-        packages = set()
-        for command in missing:
-            packages.add("git" if command == "git" else "openssh")
-        run(["pkg", "install", "-y", *sorted(packages)])
+        run(["pkg", "install", "-y", "openssh"])
     elif environment == "linux" and shutil.which("apt-get"):
-        packages = set()
-        for command in missing:
-            packages.add("git" if command == "git" else "openssh-client")
         prefix = [] if os.geteuid() == 0 else ["sudo"]
-        run([*prefix, "apt-get", "install", "-y", *sorted(packages)])
+        run([*prefix, "apt-get", "install", "-y", "openssh-client"])
     elif environment == "macos" and shutil.which("brew"):
-        packages = set()
-        for command in missing:
-            packages.add("git" if command == "git" else "openssh")
-        run(["brew", "install", *sorted(packages)])
+        run(["brew", "install", "openssh"])
     else:
         raise EnvrError(
-            f"missing {', '.join(missing)}; install Git and OpenSSH, then retry"
+            f"missing {', '.join(missing)}; install OpenSSH, then retry"
         )
 
     still_missing = [command for command in missing if shutil.which(command) is None]
     if still_missing:
         raise EnvrError(f"still missing after installation: {', '.join(still_missing)}")
-
-
-def generate_password(length: int = 16) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def available_prepaid_credit(balance: float, pending_charges: float) -> float:
@@ -365,11 +379,41 @@ class Envr:
         self.vps_key = self.ssh_root / "id_ed25519"
         self.vps_public_key = self.ssh_root / "id_ed25519.pub"
         self.vps_known_hosts = self.ssh_root / "known_hosts"
-        self.git_known_hosts = self.ssh_root / "git_known_hosts"
         self.repos_path = self.root / "repos.json"
         self.state_path = self.root / "state.json"
-        self.client_id_path = self.root / "client-id"
         self.password_path = self.root / "instance-password"
+        if root is None:
+            self.migrate_legacy_layout()
+
+    def migrate_legacy_layout(self) -> None:
+        legacy = Path.home() / "envr"
+        if self.root == legacy or not legacy.is_dir():
+            return
+        names = (
+            "api",
+            "codex",
+            "git",
+            "ssh",
+            "repos.json",
+            "state.json",
+            "instance-password",
+            "client-id",
+        )
+        candidates = [name for name in names if (legacy / name).exists()]
+        if not candidates:
+            return
+        ensure_private_dir(self.root)
+        moved = []
+        for name in candidates:
+            source = legacy / name
+            destination = self.root / name
+            if destination.exists():
+                continue
+            ensure_private_dir(destination.parent)
+            os.replace(source, destination)
+            moved.append(name)
+        if moved:
+            print(f"Migrated envr state to {self.root}")
 
     def ensure_layout(self) -> None:
         ensure_private_dir(self.root)
@@ -377,20 +421,8 @@ class Envr:
         ensure_private_dir(self.ssh_root)
         ensure_private_dir(self.auth_path.parent)
 
-    def client_id(self) -> str:
-        self.ensure_layout()
-        if self.client_id_path.exists():
-            value = self.client_id_path.read_text(encoding="utf-8").strip()
-            if not re.fullmatch(r"[a-f0-9]{20}", value):
-                raise EnvrError(f"{self.client_id_path} is invalid")
-            self.client_id_path.chmod(0o600)
-            return value
-        value = secrets.token_hex(10)
-        atomic_write_text(self.client_id_path, value + "\n")
-        return value
-
     def management_tag(self) -> str:
-        return f"envr-managed-{self.client_id()}"
+        return MANAGEMENT_TAG
 
     def repositories(self) -> dict[str, Any]:
         default = {"schema": SCHEMA_VERSION, "repositories": {}}
@@ -431,14 +463,23 @@ class Envr:
         token = getpass.getpass("Vultr API token: ").strip()
         if not token:
             raise EnvrError("Vultr API token cannot be empty")
-        atomic_write_text(self.token_path, token + "\n")
         return token
 
     def api(self) -> VultrAPI:
-        return VultrAPI(self.api_token())
+        saved = self.token_path.exists() and bool(
+            self.token_path.read_text(encoding="utf-8").strip()
+        )
+        token = self.api_token()
+        api = VultrAPI(token)
+        if not saved:
+            print("Verifying Vultr API token...")
+            api.get("account")
+            atomic_write_text(self.token_path, token + "\n")
+            print(f"Vultr API token verified and saved to {self.token_path}")
+        return api
 
     def configure_git(self) -> None:
-        ensure_commands(("git", "ssh", "ssh-keygen"))
+        ensure_commands(("ssh-keygen",))
         self.ensure_layout()
 
         parsed = parse_repository_url(input("Repository SSH URL: ").strip())
@@ -525,7 +566,6 @@ class Envr:
             print("\nThe private key is never printed.")
             input("Press Enter after adding the key: ")
 
-            self.verify_repository_access(parsed["url"], candidate_private)
             ensure_private_dir(key_directory)
             atomic_write(private_key, candidate_private.read_bytes())
             atomic_write(public_key, candidate_public.read_bytes())
@@ -544,39 +584,6 @@ class Envr:
         print(f"\nSaved repository as: {parsed['folder']}")
         print(f"Run: envr up 4 {parsed['folder']}")
 
-    def verify_repository_access(self, url: str, private_key: Path) -> None:
-        ensure_private_dir(self.git_known_hosts.parent)
-        self.git_known_hosts.touch(mode=0o600, exist_ok=True)
-        self.git_known_hosts.chmod(0o600)
-        ssh_command = " ".join(
-            shlex.quote(part)
-            for part in (
-                "ssh",
-                "-i",
-                str(private_key),
-                "-o",
-                "IdentitiesOnly=yes",
-                "-o",
-                "StrictHostKeyChecking=ask",
-                "-o",
-                f"UserKnownHostsFile={self.git_known_hosts}",
-            )
-        )
-        environment = os.environ.copy()
-        environment["GIT_SSH_COMMAND"] = ssh_command
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        print("Verifying repository access...")
-        result = run(
-            ["git", "ls-remote", url],
-            env=environment,
-            quiet=True,
-            check=False,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip() if result.stderr else "access denied"
-            raise EnvrError(f"repository access verification failed: {detail}")
-
     def repository(self, folder: str) -> dict[str, Any]:
         if not FOLDER_RE.fullmatch(folder):
             raise EnvrError(f"invalid repository folder: {folder!r}")
@@ -587,6 +594,7 @@ class Envr:
             "url",
             "folder",
             "identity",
+            "host",
             "private_key",
             "author_name",
             "author_email",
@@ -614,7 +622,7 @@ class Envr:
                         "-N",
                         "",
                         "-C",
-                        f"envr-vultr:{self.client_id()}",
+                        f"envr-device:{platform.node() or 'device'}",
                         "-f",
                         str(temporary_key),
                     ]
@@ -638,11 +646,32 @@ class Envr:
                 return str(key["id"])
         created = api.post(
             "ssh-keys",
-            {"name": f"envr-{self.client_id()}", "ssh_key": normalized},
+            {
+                "name": DEVICE_KEY_PREFIX
+                + hashlib.sha256(normalized.encode()).hexdigest()[:12],
+                "ssh_key": normalized,
+            },
         ).get("ssh_key")
         if not isinstance(created, dict) or not created.get("id"):
             raise EnvrError("Vultr API did not return the uploaded SSH-key ID")
         return str(created["id"])
+
+    def managed_vultr_ssh_keys(
+        self, api: VultrAPI
+    ) -> list[dict[str, Any]]:
+        response = api.get("ssh-keys", query={"per_page": 500})
+        keys = response.get("ssh_keys")
+        if not isinstance(keys, list):
+            raise EnvrError("Vultr API returned an invalid SSH-key list")
+        managed = [
+            key
+            for key in keys
+            if isinstance(key, dict)
+            and str(key.get("name", "")).startswith(("envr-", DEVICE_KEY_PREFIX))
+            and key.get("id")
+            and key.get("ssh_key")
+        ]
+        return sorted(managed, key=lambda key: str(key.get("id")))
 
     def managed_instances(self, api: VultrAPI) -> list[dict[str, Any]]:
         response = api.get("instances", query={"per_page": 500})
@@ -654,7 +683,11 @@ class Envr:
             instance
             for instance in instances
             if isinstance(instance, dict)
-            and tag in (instance.get("tags") or [])
+            and any(
+                str(instance_tag) == tag
+                or str(instance_tag).startswith(tag + "-")
+                for instance_tag in (instance.get("tags") or [])
+            )
             and instance.get("label") == LABEL
         ]
         return sorted(managed, key=lambda item: str(item.get("date_created", "")))
@@ -673,17 +706,12 @@ class Envr:
                 return None
             raise EnvrError("envr-codex is not running")
         instance = instances[0]
-        previous = self.state()
-        same_instance = previous.get("instance_id") == instance.get("id")
         self.save_state(
             {
                 "schema": SCHEMA_VERSION,
                 "instance_id": instance.get("id"),
                 "ram_gb": int(instance.get("ram", 0)) // 1024,
                 "region": instance.get("region"),
-                "password_ready": (
-                    bool(previous.get("password_ready")) if same_instance else False
-                ),
             }
         )
         return instance
@@ -734,8 +762,19 @@ class Envr:
             )
         return available
 
-    def cloud_init(self, public_key: str) -> str:
-        quoted_key = json.dumps(public_key)
+    def cloud_init(self, public_keys: Sequence[str]) -> str:
+        if not public_keys:
+            raise EnvrError("at least one device SSH key is required")
+        authorized_keys = "\n".join(
+            f"      - {json.dumps(public_key)}" for public_key in public_keys
+        )
+        codex_config_command = json.dumps(
+            "printf '%s\\n' 'cli_auth_credentials_store = \"file\"' "
+            f"> {REMOTE_HOME}/.codex/config.toml && "
+            f"chown {REMOTE_USER}:{REMOTE_USER} {REMOTE_HOME}/.codex/config.toml && "
+            f"chmod 600 {REMOTE_HOME}/.codex/config.toml"
+        )
+        scodex_encoded = base64.b64encode(SCODEX_SCRIPT.encode()).decode()
         return f"""#cloud-config
 package_update: true
 package_upgrade: false
@@ -743,14 +782,14 @@ ssh_pwauth: true
 disable_root: false
 users:
   - default
-  - name: codex
+  - name: {REMOTE_USER}
     gecos: Codex
     shell: /bin/bash
     groups: [sudo]
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: true
     ssh_authorized_keys:
-      - {quoted_key}
+{authorized_keys}
 packages:
   - git
   - curl
@@ -762,6 +801,7 @@ packages:
   - unzip
   - nodejs
   - npm
+  - bubblewrap
   - docker.io
   - ufw
   - fail2ban
@@ -773,11 +813,6 @@ write_files:
       PasswordAuthentication yes
       PermitRootLogin yes
       PermitEmptyPasswords no
-  - path: /home/codex/.codex/config.toml
-    owner: codex:codex
-    permissions: '0600'
-    content: |
-      cli_auth_credentials_store = "file"
   - path: /etc/fail2ban/jail.d/envr.conf
     permissions: '0644'
     content: |
@@ -786,10 +821,15 @@ write_files:
       maxretry = 5
       findtime = 10m
       bantime = 1h
+  - path: /usr/local/bin/scodex
+    permissions: '0755'
+    encoding: b64
+    content: {scodex_encoded}
 runcmd:
-  - [bash, -lc, "usermod -aG docker codex"]
-  - [bash, -lc, "install -d -m 700 -o codex -g codex /home/codex/.ssh /home/codex/.ssh/envr /home/codex/.codex"]
-  - [bash, -lc, "install -d -m 755 -o codex -g codex {REMOTE_ROOT}"]
+  - [bash, -lc, "usermod -aG docker {REMOTE_USER}"]
+  - [bash, -lc, "install -d -m 700 -o {REMOTE_USER} -g {REMOTE_USER} {REMOTE_HOME}/.ssh {REMOTE_HOME}/.ssh/envr {REMOTE_HOME}/.codex {REMOTE_CONFIG_ROOT}"]
+  - [bash, -lc, {codex_config_command}]
+  - [bash, -lc, "install -d -m 755 -o {REMOTE_USER} -g {REMOTE_USER} {REMOTE_ROOT}"]
   - [bash, -lc, "for i in 1 2 3; do npm install -g @openai/codex@latest && break; sleep 10; done; command -v codex"]
   - [bash, -lc, "ufw default deny incoming"]
   - [bash, -lc, "ufw default allow outgoing"]
@@ -816,7 +856,7 @@ runcmd:
         self,
         api: VultrAPI,
         ram_gb: int,
-        repository: dict[str, Any],
+        repository: dict[str, Any] | None,
     ) -> dict[str, Any]:
         plan_id = PLAN_IDS[ram_gb]
         catalog = self.plan_catalog(api)
@@ -829,21 +869,30 @@ runcmd:
         regions = self.available_regions(api, plan_id, plan)
         public_key = self.ensure_vps_key()
         vultr_key_id = self.ensure_vultr_ssh_key(api, public_key)
-        user_data = base64.b64encode(self.cloud_init(public_key).encode()).decode()
+        account_keys = self.managed_vultr_ssh_keys(api)
+        if not any(str(key.get("id")) == vultr_key_id for key in account_keys):
+            account_keys.append(
+                {
+                    "id": vultr_key_id,
+                    "ssh_key": public_key,
+                    "name": DEVICE_KEY_PREFIX + "current",
+                }
+            )
+        key_ids = [str(key["id"]) for key in account_keys]
+        public_keys = [str(key["ssh_key"]).strip() for key in account_keys]
+        user_data = base64.b64encode(self.cloud_init(public_keys).encode()).decode()
 
         last_error: Exception | None = None
         for region in regions:
             print(f"Creating {ram_gb} GB envr VPS in {region}...")
-            password = generate_password()
-            atomic_write_text(self.password_path, password + "\n")
             payload = {
                 "region": region,
                 "plan": plan_id,
                 "os_id": os_id,
                 "label": LABEL,
-                "hostname": LABEL,
+                "hostname": REMOTE_HOSTNAME,
                 "tags": [self.management_tag()],
-                "sshkey_id": [vultr_key_id],
+                "sshkey_id": key_ids,
                 "user_data": user_data,
                 "backups": "disabled",
                 "enable_ipv6": False,
@@ -884,32 +933,31 @@ runcmd:
                     "instance_id": instance["id"],
                     "ram_gb": ram_gb,
                     "region": region,
-                    "password_ready": False,
                 }
             )
             try:
                 active = self.wait_for_instance(api, str(instance["id"]))
                 self.wait_for_ssh(active)
                 self.wait_for_cloud_init(active)
-                self.set_root_password(active)
             except (EnvrError, subprocess.TimeoutExpired) as error:
-                last_error = error
-                eprint(f"Deployment in {region} failed: {error}")
-                self.cleanup_failed_instance(api, instance)
-                continue
+                raise EnvrError(
+                    f"VPS {instance.get('id')} was created and remains running "
+                    f"and billable, but setup did not finish: {error}. "
+                    f"Run envr up {ram_gb} to resume it"
+                ) from error
 
             try:
+                self.ensure_remote_runtime(active)
                 self.install_cached_auth(active)
-                self.ensure_remote_repository(active, repository)
+                if repository is not None:
+                    self.ensure_remote_repository(active, repository)
             except (EnvrError, subprocess.TimeoutExpired) as error:
                 raise EnvrError(
                     f"VPS {active.get('id')} is running and billable, but "
-                    f"repository setup failed: {error}"
+                    f"workspace setup failed: {error}"
                 ) from error
             return active
 
-        with contextlib.suppress(FileNotFoundError):
-            self.password_path.unlink()
         raise EnvrError(f"all configured regions failed: {last_error}")
 
     def reconcile_creation(
@@ -937,19 +985,12 @@ runcmd:
                     and ip
                     and ip != "0.0.0.0"
                 ):
-                    previous = self.state()
-                    same_instance = previous.get("instance_id") == instance_id
                     self.save_state(
                         {
                             "schema": SCHEMA_VERSION,
                             "instance_id": instance_id,
                             "ram_gb": int(instance.get("ram", 0)) // 1024,
                             "region": instance.get("region"),
-                            "password_ready": (
-                                bool(previous.get("password_ready"))
-                                if same_instance
-                                else False
-                            ),
                         }
                     )
                     return instance
@@ -960,6 +1001,7 @@ runcmd:
         raise EnvrError(f"instance did not become active (last status: {status})")
 
     def ssh_options(self, *, connect_timeout: int = SSH_CONNECT_TIMEOUT) -> list[str]:
+        ensure_private_dir(self.vps_known_hosts.parent)
         self.vps_known_hosts.touch(mode=0o600, exist_ok=True)
         self.vps_known_hosts.chmod(0o600)
         return [
@@ -984,6 +1026,115 @@ runcmd:
         if not ip or ip == "0.0.0.0":
             raise EnvrError("instance does not have a usable public IPv4 address")
         return f"{REMOTE_USER}@{ip}"
+
+    def root_ssh_target(self, instance: dict[str, Any]) -> str:
+        ip = str(instance.get("main_ip", ""))
+        if not ip or ip == "0.0.0.0":
+            raise EnvrError("instance does not have a usable public IPv4 address")
+        return f"root@{ip}"
+
+    def instance_password(
+        self, api: VultrAPI, instance: dict[str, Any]
+    ) -> str:
+        password = str(instance.get("default_password") or "").strip()
+        if not password and instance.get("id"):
+            response = api.get(f"instances/{instance['id']}")
+            current = response.get("instance")
+            if isinstance(current, dict):
+                password = str(current.get("default_password") or "").strip()
+                instance.update(current)
+        if (
+            not password
+            and self.state().get("instance_id") == instance.get("id")
+            and self.password_path.exists()
+        ):
+            password = self.password_path.read_text(encoding="utf-8").strip()
+        if not password:
+            raise EnvrError(
+                "Vultr did not return the instance password; authorize this "
+                "device from an already-connected device or the Vultr console"
+            )
+        return password
+
+    def enroll_device_key(
+        self, api: VultrAPI, instance: dict[str, Any]
+    ) -> None:
+        password = self.instance_password(api, instance)
+        public_key = self.ensure_vps_key()
+        self.ensure_layout()
+        secret_fd, secret_name = tempfile.mkstemp(
+            prefix=".askpass-secret.", dir=self.root
+        )
+        os.close(secret_fd)
+        secret_path = Path(secret_name)
+        helper_path = self.root / f".askpass-{secrets.token_hex(6)}"
+        try:
+            atomic_write_text(secret_path, password + "\n")
+            helper = (
+                "#!/bin/sh\n"
+                f"exec cat {shlex.quote(str(secret_path))}\n"
+            )
+            atomic_write_text(helper_path, helper, 0o700)
+            environment = os.environ.copy()
+            environment["DISPLAY"] = "envr"
+            environment["SSH_ASKPASS"] = str(helper_path)
+            environment["SSH_ASKPASS_REQUIRE"] = "force"
+            quoted_key = shlex.quote(public_key)
+            command = (
+                "set -e; "
+                f"install -d -m 700 -o {REMOTE_USER} -g {REMOTE_USER} "
+                f"{REMOTE_HOME}/.ssh; "
+                f"touch {REMOTE_HOME}/.ssh/authorized_keys; "
+                f"chown {REMOTE_USER}:{REMOTE_USER} "
+                f"{REMOTE_HOME}/.ssh/authorized_keys; "
+                f"chmod 600 {REMOTE_HOME}/.ssh/authorized_keys; "
+                f"key={quoted_key}; "
+                f"grep -qxF \"$key\" {REMOTE_HOME}/.ssh/authorized_keys || "
+                f"printf '%s\\n' \"$key\" >> {REMOTE_HOME}/.ssh/authorized_keys"
+            )
+            ssh = [
+                "ssh",
+                "-T",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                f"UserKnownHostsFile={self.vps_known_hosts}",
+                "-o",
+                f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+                "-o",
+                "PreferredAuthentications=password,keyboard-interactive",
+                "-o",
+                "PubkeyAuthentication=no",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                self.root_ssh_target(instance),
+                command,
+            ]
+            run(ssh, env=environment, quiet=True, timeout=60)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                secret_path.unlink()
+            with contextlib.suppress(FileNotFoundError):
+                helper_path.unlink()
+            fsync_directory(self.root)
+
+    def ensure_device_access(
+        self, api: VultrAPI, instance: dict[str, Any]
+    ) -> None:
+        public_key = self.ensure_vps_key()
+        self.ensure_vultr_ssh_key(api, public_key)
+        result = self.remote_command(
+            instance, "true", check=False, quiet=True, timeout=15
+        )
+        if result.returncode == 0:
+            return
+        print("Authorizing this device on the running VPS...")
+        self.enroll_device_key(api, instance)
+        result = self.remote_command(
+            instance, "true", check=False, quiet=True, timeout=15
+        )
+        if result.returncode != 0:
+            raise EnvrError("the device SSH key was installed but login still failed")
 
     def remote_command(
         self,
@@ -1050,8 +1201,10 @@ runcmd:
         print("Waiting for cloud-init...")
         result = self.remote_command(
             instance,
-            "sudo cloud-init status --wait >/dev/null && "
-            "test -f /var/lib/envr-ready && command -v codex >/dev/null",
+            "sudo cloud-init status --wait >/dev/null 2>&1 || true; "
+            "if test -f /var/lib/envr-ready && command -v codex >/dev/null; "
+            "then exit 0; fi; "
+            "sudo cloud-init status --long >&2; exit 1",
             check=False,
             capture=True,
             timeout=CLOUD_INIT_TIMEOUT,
@@ -1059,23 +1212,6 @@ runcmd:
         if result.returncode != 0:
             detail = result.stderr.strip() if result.stderr else "cloud-init failed"
             raise EnvrError(detail)
-
-    def set_root_password(self, instance: dict[str, Any]) -> None:
-        if not self.password_path.exists():
-            raise EnvrError("generated instance password is missing locally")
-        password = self.password_path.read_text(encoding="utf-8").strip()
-        if not re.fullmatch(r"[A-Za-z0-9]{16}", password):
-            raise EnvrError("generated instance password is invalid")
-        self.remote_command(
-            instance,
-            "sudo chpasswd",
-            input_data=f"root:{password}\n",
-            quiet=True,
-            timeout=30,
-        )
-        state = self.state()
-        state["password_ready"] = True
-        self.save_state(state)
 
     def scp_options(self) -> list[str]:
         return self.ssh_options()
@@ -1099,16 +1235,36 @@ runcmd:
             return
         self.validate_auth_file(self.auth_path)
         self.remote_command(
-            instance, "install -d -m 700 /home/codex/.codex", quiet=True
+            instance, f"install -d -m 700 {REMOTE_HOME}/.codex", quiet=True
         )
-        temporary = f"/home/codex/.codex/.auth.json.envr-{secrets.token_hex(4)}"
+        temporary = (
+            f"{REMOTE_HOME}/.codex/.auth.json.envr-{secrets.token_hex(4)}"
+        )
         self.copy_to_remote(instance, self.auth_path, temporary)
         self.remote_command(
             instance,
             f"chmod 600 {shlex.quote(temporary)} && "
-            f"mv -f {shlex.quote(temporary)} /home/codex/.codex/auth.json",
+            f"mv -f {shlex.quote(temporary)} {REMOTE_HOME}/.codex/auth.json",
             quiet=True,
         )
+
+    def ensure_remote_runtime(self, instance: dict[str, Any]) -> None:
+        encoded = base64.b64encode(SCODEX_SCRIPT.encode()).decode()
+        script = f"""set -euo pipefail
+if ! command -v bwrap >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bubblewrap
+fi
+temporary=$(mktemp)
+trap 'rm -f "$temporary"' EXIT
+printf '%s' "$1" | base64 -d > "$temporary"
+sudo install -m 755 "$temporary" /usr/local/bin/scodex
+install -d -m 700 {REMOTE_HOME}/.codex
+printf '%s\n' 'cli_auth_credentials_store = "file"' \
+    > {REMOTE_HOME}/.codex/config.toml
+chmod 600 {REMOTE_HOME}/.codex/config.toml
+"""
+        self.remote_script(instance, script, (encoded,), timeout=300)
 
     @staticmethod
     def validate_auth_file(path: Path) -> None:
@@ -1124,8 +1280,8 @@ runcmd:
     def pull_auth(self, instance: dict[str, Any]) -> bool:
         result = self.remote_command(
             instance,
-            "test -s /home/codex/.codex/auth.json && "
-            "sha256sum /home/codex/.codex/auth.json",
+            f"test -s {REMOTE_HOME}/.codex/auth.json && "
+            f"sha256sum {REMOTE_HOME}/.codex/auth.json",
             capture=True,
             check=False,
             timeout=30,
@@ -1149,7 +1305,7 @@ runcmd:
                 [
                     "scp",
                     *self.scp_options(),
-                    f"{self.ssh_target(instance)}:/home/codex/.codex/auth.json",
+                    f"{self.ssh_target(instance)}:{REMOTE_HOME}/.codex/auth.json",
                     str(temporary),
                 ],
                 quiet=True,
@@ -1168,14 +1324,175 @@ runcmd:
             with contextlib.suppress(FileNotFoundError):
                 temporary.unlink()
 
+    @staticmethod
+    def portable_repository(repository: dict[str, Any]) -> dict[str, str]:
+        return {
+            key: str(repository[key])
+            for key in (
+                "url",
+                "folder",
+                "identity",
+                "host",
+                "author_name",
+                "author_email",
+            )
+        }
+
+    def update_remote_manifest(
+        self, instance: dict[str, Any], repository: dict[str, Any]
+    ) -> None:
+        record = self.portable_repository(repository)
+        encoded = base64.b64encode(
+            json.dumps(record, separators=(",", ":")).encode()
+        ).decode()
+        script = f"""set -euo pipefail
+install -d -m 700 {shlex.quote(REMOTE_CONFIG_ROOT)}
+python3 - "$1" {shlex.quote(REMOTE_REPOS)} <<'PY'
+import base64
+import json
+import os
+import sys
+import tempfile
+
+record = json.loads(base64.b64decode(sys.argv[1]).decode())
+path = sys.argv[2]
+value = {{"schema": {SCHEMA_VERSION}, "repositories": {{}}}}
+try:
+    with open(path, encoding="utf-8") as source:
+        existing = json.load(source)
+    if (
+        isinstance(existing, dict)
+        and existing.get("schema") == {SCHEMA_VERSION}
+        and isinstance(existing.get("repositories"), dict)
+    ):
+        value = existing
+except FileNotFoundError:
+    pass
+value["repositories"][record["folder"]] = record
+descriptor, temporary = tempfile.mkstemp(prefix=".repos.", dir=os.path.dirname(path))
+try:
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        json.dump(value, output, indent=2, sort_keys=True)
+        output.write("\\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+"""
+        self.remote_script(instance, script, (encoded,), timeout=60)
+
+    def sync_from_server(self, instance: dict[str, Any]) -> bool:
+        auth_synchronized = self.pull_auth(instance)
+        available = self.remote_command(
+            instance,
+            f"test -s {shlex.quote(REMOTE_REPOS)}",
+            check=False,
+            quiet=True,
+            timeout=30,
+        )
+        if available.returncode != 0:
+            return auth_synchronized
+
+        self.ensure_layout()
+        descriptor, manifest_name = tempfile.mkstemp(
+            prefix=".server-repos.", dir=self.root
+        )
+        os.close(descriptor)
+        manifest_path = Path(manifest_name)
+        try:
+            run(
+                [
+                    "scp",
+                    *self.scp_options(),
+                    f"{self.ssh_target(instance)}:{REMOTE_REPOS}",
+                    str(manifest_path),
+                ],
+                quiet=True,
+                timeout=120,
+            )
+            manifest_path.chmod(0o600)
+            remote_manifest = load_json(manifest_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                manifest_path.unlink()
+
+        remote_records = remote_manifest.get("repositories")
+        if not isinstance(remote_records, dict):
+            raise EnvrError("server repository manifest is invalid")
+        local_manifest = self.repositories()
+        local_records = local_manifest["repositories"]
+        for folder, record in remote_records.items():
+            if not isinstance(folder, str) or not isinstance(record, dict):
+                raise EnvrError("server repository manifest contains an invalid entry")
+            parsed = parse_repository_url(str(record.get("url", "")))
+            if folder != parsed["folder"] or record.get("folder") != folder:
+                raise EnvrError("server repository manifest has a folder mismatch")
+            if (
+                record.get("identity") != parsed["identity"]
+                or record.get("host") != parsed["host"]
+            ):
+                raise EnvrError("server repository manifest has an identity mismatch")
+            for field in ("identity", "host", "author_name", "author_email"):
+                validate_text_field(field, str(record.get(field, "")))
+
+            key_directory = self.git_root / folder
+            ensure_private_dir(key_directory)
+            private_key = key_directory / "id_ed25519"
+            public_key = key_directory / "id_ed25519.pub"
+            descriptor, candidate_name = tempfile.mkstemp(
+                prefix=".id_ed25519.", dir=key_directory
+            )
+            os.close(descriptor)
+            candidate = Path(candidate_name)
+            try:
+                run(
+                    [
+                        "scp",
+                        *self.scp_options(),
+                        f"{self.ssh_target(instance)}:"
+                        f"{REMOTE_HOME}/.ssh/envr/{folder}",
+                        str(candidate),
+                    ],
+                    quiet=True,
+                    timeout=120,
+                )
+                candidate.chmod(0o600)
+                derived = run(
+                    ["ssh-keygen", "-y", "-P", "", "-f", str(candidate)],
+                    capture=True,
+                    quiet=True,
+                ).stdout.strip()
+                if not derived:
+                    raise EnvrError(f"server repository key is invalid: {folder}")
+                atomic_write(private_key, candidate.read_bytes())
+                atomic_write_text(public_key, derived + "\n")
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    candidate.unlink()
+
+            local_records[folder] = {
+                **self.portable_repository(record),
+                "private_key": str(private_key),
+                "public_key": str(public_key),
+            }
+        self.save_repositories(local_manifest)
+
+        return auth_synchronized
+
     def ensure_remote_repository(
         self, instance: dict[str, Any], repository: dict[str, Any]
     ) -> None:
         folder = str(repository["folder"])
-        remote_key = f"/home/codex/.ssh/envr/{folder}"
+        remote_key = f"{REMOTE_HOME}/.ssh/envr/{folder}"
         self.remote_command(
             instance,
-            "install -d -m 700 /home/codex/.ssh /home/codex/.ssh/envr",
+            f"install -d -m 700 {REMOTE_HOME}/.ssh {REMOTE_HOME}/.ssh/envr",
             quiet=True,
         )
         temporary_key = remote_key + f".tmp-{secrets.token_hex(4)}"
@@ -1187,15 +1504,11 @@ runcmd:
             quiet=True,
         )
 
-        if not self.git_known_hosts.exists():
-            raise EnvrError("Git known_hosts is missing; rerun envr git")
-        remote_known_hosts = "/home/codex/.ssh/envr/known_hosts"
-        temporary_hosts = remote_known_hosts + f".tmp-{secrets.token_hex(4)}"
-        self.copy_to_remote(instance, self.git_known_hosts, temporary_hosts)
+        remote_known_hosts = f"{REMOTE_HOME}/.ssh/envr/known_hosts"
         self.remote_command(
             instance,
-            f"chmod 600 {shlex.quote(temporary_hosts)} && "
-            f"mv -f {shlex.quote(temporary_hosts)} {shlex.quote(remote_known_hosts)}",
+            f"touch {shlex.quote(remote_known_hosts)} && "
+            f"chmod 600 {shlex.quote(remote_known_hosts)}",
             quiet=True,
         )
 
@@ -1206,13 +1519,13 @@ key=$3
 known_hosts=$4
 author_name=$5
 author_email=$6
-root=/home/codex/envr
+root=/home/remote/envr
 target="$root/$folder"
-ssh_command="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+ssh_command="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o UserKnownHostsFile=$known_hosts"
 if [ ! -e "$target" ]; then
     temporary="$root/.${folder}.clone.$$"
     trap 'rm -rf -- "$temporary"' EXIT
-    GIT_SSH_COMMAND="$ssh_command" git clone -- "$url" "$temporary"
+    GIT_SSH_COMMAND="$ssh_command" git clone --quiet -- "$url" "$temporary"
     mv -- "$temporary" "$target"
     trap - EXIT
 elif ! git -C "$target" rev-parse --git-dir >/dev/null 2>&1; then
@@ -1224,6 +1537,7 @@ if [ "$origin" != "$url" ]; then
     echo "origin mismatch in $target: $origin" >&2
     exit 21
 fi
+GIT_SSH_COMMAND="$ssh_command" git ls-remote "$url" >/dev/null
 git -C "$target" config --local user.name "$author_name"
 git -C "$target" config --local user.email "$author_email"
 git -C "$target" config --local core.sshCommand "$ssh_command"
@@ -1241,40 +1555,39 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
             ),
             timeout=300,
         )
+        self.update_remote_manifest(instance, repository)
+        print(f"Repository ready: {folder}")
 
-    def attach_codex(
-        self, instance: dict[str, Any], repository: dict[str, Any]
+    def connect_shell(
+        self,
+        instance: dict[str, Any],
+        repository: dict[str, Any] | None,
     ) -> None:
-        folder = str(repository["folder"])
-        session = "codex-" + re.sub(r"[^A-Za-z0-9_-]", "-", str(repository["identity"]))
-        target = f"{REMOTE_ROOT}/{folder}"
-        codex_command = (
-            "if ! codex login status >/dev/null 2>&1; then "
-            "codex login --device-auth; fi; exec codex"
-        )
+        if repository is None:
+            display_name = "workspace"
+            target = REMOTE_ROOT
+        else:
+            display_name = str(repository["folder"])
+            target = f"{REMOTE_ROOT}/{display_name}"
         command = (
-            f"tmux has-session -t {shlex.quote(session)} 2>/dev/null || "
-            f"tmux new-session -d -s {shlex.quote(session)} "
-            f"-c {shlex.quote(target)} "
-            f"{shlex.quote(codex_command)}; "
-            f"exec tmux attach-session -t {shlex.quote(session)}"
+            f"cd {shlex.quote(target)} && "
+            'exec "${SHELL:-/bin/bash}" -l'
         )
-        print(f"Attaching to {folder}. Detach with Ctrl-b d.")
+        print(f"Connecting to {display_name}. Exit the shell to disconnect.")
         try:
             self.remote_command(instance, command, tty=True, check=False)
         finally:
             try:
-                self.pull_auth(instance)
+                self.sync_from_server(instance)
             except EnvrError as error:
-                eprint(f"Warning: could not cache Codex authentication: {error}")
+                eprint(f"Warning: could not refresh the local envr cache: {error}")
 
     def up(
-        self, ram_gb: int, folder: str
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self, ram_gb: int, folder: str | None
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if ram_gb not in PLAN_IDS:
             raise EnvrError("RAM must be one of: 1, 2, 4, 8")
-        ensure_commands(("git", "ssh", "scp", "ssh-keygen"))
-        repository = self.repository(folder)
+        ensure_commands(("ssh", "scp", "ssh-keygen"))
         api = self.api()
         api.get("account")
         instances = self.managed_instances(api)
@@ -1291,39 +1604,28 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
                     f"existing envr VPS has {current_ram} GB; requested {ram_gb} GB. "
                     "Run envr destroy before changing size."
                 )
-            self.ensure_vps_key()
-            previous = self.state()
-            same_instance = previous.get("instance_id") == instance.get("id")
             self.save_state(
                 {
                     "schema": SCHEMA_VERSION,
                     "instance_id": instance.get("id"),
                     "ram_gb": current_ram,
                     "region": instance.get("region"),
-                    "password_ready": (
-                        bool(previous.get("password_ready")) if same_instance else False
-                    ),
                 }
             )
             if instance.get("power_status") == "stopped":
                 api.request("POST", f"instances/{instance.get('id')}/start")
             instance = self.wait_for_instance(api, str(instance.get("id")))
-            self.wait_for_ssh(instance)
+            self.ensure_device_access(api, instance)
             self.wait_for_cloud_init(instance)
-            if not self.password_path.exists():
-                atomic_write_text(self.password_path, generate_password() + "\n")
-                current_state = self.state()
-                current_state["password_ready"] = False
-                self.save_state(current_state)
-            if not self.state().get("password_ready"):
-                self.set_root_password(instance)
-            if not self.pull_auth(instance):
+            self.ensure_remote_runtime(instance)
+            synchronized = self.sync_from_server(instance)
+            if not synchronized:
                 self.install_cached_auth(instance)
-            self.ensure_remote_repository(instance, repository)
+            repository = self.repository(folder) if folder is not None else None
+            if repository is not None:
+                self.ensure_remote_repository(instance, repository)
         else:
-            self.verify_repository_access(
-                str(repository["url"]), Path(repository["private_key"])
-            )
+            repository = self.repository(folder) if folder is not None else None
             instance = self.create_instance(api, ram_gb, repository)
         return instance, repository
 
@@ -1370,23 +1672,20 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         conflict = len(instances) > 1
         if conflict:
             print(f"\nCONFLICT: {len(instances)} envr-managed instances are running")
-        state = self.state()
         for instance in instances:
             plan = plans.get(str(instance.get("plan")), {})
-            password = "unavailable locally"
-            if (
-                state.get("instance_id") == instance.get("id")
-                and state.get("password_ready")
-                and self.password_path.exists()
-            ):
-                password = self.password_path.read_text(encoding="utf-8").strip()
+            try:
+                password = self.instance_password(api, instance)
+            except EnvrError:
+                password = "unavailable from API"
             print(f"\n{LABEL}")
             print(f"  ID:         {instance.get('id', '')}")
             print(f"  Region:     {instance.get('region', '')}")
             print(f"  RAM:        {int(instance.get('ram', 0)) // 1024} GB")
             print(f"  CPU:        {instance.get('vcpu_count', '')}")
             print(f"  IP:         {instance.get('main_ip', '')}")
-            print("  SSH user:   root")
+            print(f"  SSH user:   {REMOTE_USER} (key)")
+            print("  Root user:  root")
             print(f"  Password:   {password}")
             print(f"  Status:     {instance.get('status', '')}")
             print(f"  Power:      {instance.get('power_status', '')}")
@@ -1407,8 +1706,9 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         if instance is None:
             raise EnvrError(
                 "envr-codex is not running. Start it with "
-                "envr up RAM REPOSITORY_FOLDER."
+                "envr up RAM."
             )
+        self.ensure_device_access(api, instance)
         script = r"""set -euo pipefail
 port=$1
 sudo ufw allow "$port/tcp"
@@ -1421,7 +1721,7 @@ sudo ufw status | grep -Eq "^${port}/udp[[:space:]]+ALLOW"
 
     def git_safety(self, instance: dict[str, Any]) -> list[tuple[str, str]]:
         script = r"""set -u
-root=/home/codex/envr
+root=/home/remote/envr
 found=0
 for directory in "$root"/*; do
     [ -d "$directory" ] || continue
@@ -1510,18 +1810,6 @@ fi
             quiet=True,
         )
 
-    def cleanup_failed_instance(
-        self, api: VultrAPI, instance: dict[str, Any]
-    ) -> None:
-        try:
-            self.delete_instance(api, instance)
-        except EnvrError as error:
-            raise EnvrError(
-                f"failed deployment remains billable: ID={instance.get('id')} "
-                f"IP={instance.get('main_ip')}: {error}"
-            ) from error
-        self.clear_instance_state()
-
     def destroy(self) -> None:
         ensure_commands(("ssh", "scp", "ssh-keygen"))
         api = self.api()
@@ -1537,8 +1825,8 @@ fi
         summaries: list[tuple[dict[str, Any], list[tuple[str, str]]]] = []
         for instance in instances:
             try:
-                self.wait_for_ssh(instance)
-                if not self.pull_auth(instance):
+                self.ensure_device_access(api, instance)
+                if not self.sync_from_server(instance):
                     auth_ok = False
                 safety = self.git_safety(instance)
             except (EnvrError, subprocess.TimeoutExpired):
@@ -1602,7 +1890,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     up = subparsers.add_parser("up", help="create or reconnect to the VPS")
     up.add_argument("ram", type=int, choices=sorted(PLAN_IDS))
-    up.add_argument("repository_folder")
+    up.add_argument("repository_folder", nargs="?")
 
     subparsers.add_parser("status", help="show account and VPS status")
 
@@ -1621,7 +1909,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     namespace = parser.parse_args(arguments)
     app = Envr()
     try:
-        attachment: tuple[dict[str, Any], dict[str, Any]] | None = None
+        attachment: tuple[dict[str, Any], dict[str, Any] | None] | None = None
         with exclusive_lock(app.root):
             if namespace.command == "git":
                 app.configure_git()
@@ -1637,7 +1925,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 app.destroy()
                 return 0
         if attachment is not None:
-            app.attach_codex(*attachment)
+            app.connect_shell(*attachment)
             return 0
     except KeyboardInterrupt:
         eprint("\nenvr: interrupted")

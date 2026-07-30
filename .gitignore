@@ -1,4 +1,4 @@
-# envr runtime secrets and state when the source checkout is also ~/envr
+# Legacy envr runtime state if an old checkout also lives at ~/envr
 /api
 /client-id
 /instance-password

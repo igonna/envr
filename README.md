@@ -1,8 +1,8 @@
 # envr
 
 `envr` is a small command-line tool for using one disposable Vultr development
-VPS from Android Termux. It prepares Git repositories, persistent tmux
-sessions, Codex authentication, development tools, and safe instance cleanup.
+VPS from Android Termux. It prepares Git repositories, remote shells, Codex
+authentication, development tools, and safe instance cleanup.
 
 Status: implemented and locally tested; one funded-account Vultr validation
 cycle remains before calling it production-ready.
@@ -11,35 +11,65 @@ cycle remains before calling it production-ready.
 
 ```bash
 envr git
+envr up 4
 envr up 4 repository-folder
 envr status
 envr port-open 443
 envr destroy
 ```
 
-One `envr` installation manages at most one VPS. Multiple repositories share
-that machine and receive separate Git identities, SSH keys, directories, and
-tmux sessions.
+One Vultr account manages at most one `envr` VPS. Multiple repositories and
+trusted client devices share it. Each client has its own SSH key; the running
+VPS is authoritative for repository configuration and Codex authentication.
 
 ## Intended workflow
 
-Configure each repository once:
+Configure a repository once, on any device:
 
 ```bash
 envr git
 ```
 
-Create or reconnect to the VPS and enter that repository:
+This stores the repository configuration and dedicated key locally but does
+not contact the Git host. Clone and access verification happen only from the
+disposable VPS during `envr up`.
+
+Create or reconnect to the VPS and open a normal shell in the general workspace:
+
+```bash
+envr up 4
+```
+
+The normal prompt is short:
+
+```text
+remote@envr:~/envr$
+```
+
+Select a configured repository when needed:
 
 ```bash
 envr up 4 repository-folder
 ```
 
-After an Android or network disconnection, run the same command to reattach to
-the repository's persistent Codex session.
+`envr` never starts Codex automatically. Inside the remote shell:
 
-Inspect the Vultr account, instance, live price, IP, and generated fallback
-root password:
+```bash
+scodex auth
+scodex resume
+```
+
+`scodex auth` starts device authentication. `scodex resume` resumes Codex with
+approvals and sandboxing explicitly bypassed; use it only because this VPS is
+disposable and isolated for that purpose.
+
+To join from another Mac, Linux machine, or Android phone, install `envr`, enter
+the same Vultr API token, and run the same command. `envr` discovers the
+running VPS, authorizes that device, synchronizes the repository and Codex
+cache, and opens a shell in the selected directory.
+
+Inspect the Vultr account, instance, live price, IP, and Vultr-generated
+fallback root password:
 
 ```bash
 envr status
@@ -69,13 +99,13 @@ From this checkout:
 sh install.sh
 ```
 
-On Termux, the installer supplies Python, Git, and OpenSSH when needed and
+On Termux, the installer supplies Python and OpenSSH when needed and
 places `envr` in `$PREFIX/bin`. Linux and macOS use `~/.local/bin`.
 
 ## Implementation
 
 The client uses Python 3.10 or newer with the standard library only. A
-small POSIX installer handles local Python, Git, and OpenSSH prerequisites.
+small POSIX installer handles local Python and OpenSSH prerequisites.
 Termux is the primary client; Linux and macOS are secondary supported Unix
 clients.
 
@@ -84,10 +114,14 @@ contract are specified in [DESIGN.md](DESIGN.md).
 
 ## Security
 
-Runtime credentials and state live under `~/envr` with restrictive filesystem
-permissions. They must never be committed or placed in Android shared storage.
-The root `.gitignore` explicitly excludes these files in case the source
-checkout is itself located at `~/envr`.
+Runtime credentials and state live under `~/.config/envr` with restrictive
+filesystem permissions. They must never be committed or placed in Android
+shared storage. Existing state from the prototype’s `~/envr` layout is
+automatically migrated on first use.
+
+Each device stores only its API token, device SSH key, and a synchronized cache
+of repository credentials and Codex authentication. Repository working trees,
+shell tools, builds, and containers remain on the VPS.
 
 The VPS is hardened during its initial cloud-init run. Later `envr` commands do
 not reset its firewall. Automatic backups, snapshots, and additional storage
