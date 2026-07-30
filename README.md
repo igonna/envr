@@ -86,7 +86,9 @@ then all later connections are key-only and can proceed without the Vultr API.
 Only an explicit SSH authentication rejection can request that password.
 Timeouts, filtered routes, and other network failures instead report that the
 VPS is unreachable; changing VPN or mobile networks never removes a device
-key.
+key. TCP reachability, SSH handshake closure/reset, host-key verification, and
+local private-key failures are reported separately with the final sanitized
+SSH diagnostic.
 
 Inspect the Vultr account, instance, live price, IP, and envr-managed recovery
 root password:

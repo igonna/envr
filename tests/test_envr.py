@@ -607,6 +607,63 @@ class LifecycleLogicTests(unittest.TestCase):
 
             app.enroll_device_key.assert_not_called()
 
+    def test_ssh_handshake_reset_is_not_reported_as_missing_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.ensure_vps_key = mock.Mock(return_value="ssh-ed25519 AAAATEST")
+            app.ensure_vultr_ssh_key = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(
+                    returncode=255,
+                    stdout="",
+                    stderr=(
+                        "kex_exchange_identification: read: "
+                        "Connection reset by peer"
+                    ),
+                )
+            )
+            app.enroll_device_key = mock.Mock()
+
+            with self.assertRaisesRegex(
+                envr.EnvrError,
+                "SSH handshake was closed before authentication",
+            ) as raised:
+                app.ensure_device_access(
+                    mock.Mock(),
+                    {"id": "instance-id", "main_ip": "192.0.2.10"},
+                )
+
+            self.assertIn("Connection reset by peer", str(raised.exception))
+            app.enroll_device_key.assert_not_called()
+
+    def test_invalid_local_private_key_never_requests_password(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.ensure_vps_key = mock.Mock(return_value="ssh-ed25519 AAAATEST")
+            app.ensure_vultr_ssh_key = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(
+                    returncode=255,
+                    stdout="",
+                    stderr=(
+                        "Load key \"/private/id_ed25519\": invalid format\n"
+                        "remote@192.0.2.10: Permission denied (publickey)."
+                    ),
+                )
+            )
+            app.enroll_device_key = mock.Mock()
+
+            with self.assertRaisesRegex(
+                envr.EnvrError,
+                "local envr SSH private key could not be used",
+            ):
+                app.ensure_device_access(
+                    mock.Mock(),
+                    {"id": "instance-id", "main_ip": "192.0.2.10"},
+                )
+
+            app.enroll_device_key.assert_not_called()
+
     def test_explicit_key_rejection_can_enroll_device_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))

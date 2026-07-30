@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -1338,7 +1338,17 @@ runcmd:
             self.sync_managed_device_keys(api, instance)
             return
         failure = (result.stderr or "").lower()
-        authentication_failed = any(
+        local_key_failed = any(
+            marker in failure
+            for marker in (
+                "load key",
+                "identity file",
+                "bad permissions",
+                "invalid format",
+                "error in libcrypto",
+            )
+        )
+        authentication_failed = not local_key_failed and any(
             marker in failure
             for marker in (
                 "permission denied",
@@ -1348,14 +1358,63 @@ runcmd:
             )
         )
         if not authentication_failed:
+            detail = self.ssh_failure_detail(result.stderr or "")
             if "host identification has changed" in failure:
                 raise EnvrError(
-                    "the VPS SSH host key changed; refusing to connect"
+                    f"the VPS SSH host key changed; refusing to connect{detail}"
+                )
+            if any(
+                marker in failure
+                for marker in (
+                    "host key verification failed",
+                    "no ed25519 host key is known",
+                    "no ecdsa host key is known",
+                    "no rsa host key is known",
+                )
+            ):
+                raise EnvrError(
+                    f"the cached VPS SSH host identity could not be "
+                    f"verified{detail}"
+                )
+            if local_key_failed:
+                raise EnvrError(
+                    f"the local envr SSH private key could not be used{detail}"
+                )
+            if any(
+                marker in failure
+                for marker in (
+                    "kex_exchange_identification",
+                    "banner exchange",
+                    "connection closed",
+                    "connection reset",
+                    "broken pipe",
+                )
+            ):
+                raise EnvrError(
+                    f"TCP reached {instance.get('main_ip')}, but the SSH "
+                    "handshake was closed before authentication; the device "
+                    f"key remains installed. Network SSH filtering is "
+                    f"possible; retry with the VPN{detail}"
+                )
+            if any(
+                marker in failure
+                for marker in (
+                    "connection timed out",
+                    "operation timed out",
+                    "timed out",
+                    "no route to host",
+                    "network is unreachable",
+                    "connection refused",
+                )
+            ):
+                raise EnvrError(
+                    f"SSH at {instance.get('main_ip')} is unreachable from "
+                    "the current network; the device key remains installed. "
+                    f"Check the network or reconnect the VPN{detail}"
                 )
             raise EnvrError(
-                f"SSH at {instance.get('main_ip')} is unreachable from the "
-                "current network; the device key remains installed. Check "
-                "the network or reconnect the VPN"
+                "SSH failed before authentication; the device key remains "
+                f"installed{detail}"
             )
         print("Authorizing this device on the running VPS...")
         self.enroll_device_key(api, instance)
@@ -1365,6 +1424,20 @@ runcmd:
         if result.returncode != 0:
             raise EnvrError("the device SSH key was installed but login still failed")
         self.sync_managed_device_keys(api, instance)
+
+    @staticmethod
+    def ssh_failure_detail(stderr: str) -> str:
+        lines = [
+            "".join(
+                character if character.isprintable() else " "
+                for character in line
+            ).strip()
+            for line in stderr.splitlines()
+            if line.strip()
+        ]
+        if not lines:
+            return ""
+        return f" ({lines[-1][:300]})"
 
     def sync_managed_device_keys(
         self,

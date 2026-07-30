@@ -80,7 +80,10 @@ public key; later connections remain key-only.
 SSH exit code `255` is ambiguous. envr treats only explicit authentication
 messages such as `Permission denied` as authority to start password enrollment.
 Timeouts, refused or filtered connections, routing failures, and changed host
-keys never trigger a password prompt.
+keys never trigger a password prompt. TCP failure, SSH handshake closure,
+host-key verification, local-key loading, and unknown pre-authentication
+failure each produce a distinct error containing the final sanitized SSH
+diagnostic line.
 
 Removing a device key from the Vultr account prevents it from being included
 in future VPS instances. A key already installed on a running VPS must also be
