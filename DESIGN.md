@@ -85,6 +85,12 @@ host-key verification, local-key loading, and unknown pre-authentication
 failure each produce a distinct error containing the final sanitized SSH
 diagnostic line.
 
+All remote SSH commands and SCP transfers for the same VPS use
+`ControlMaster=auto` with a mode-private control socket and a five-minute
+`ControlPersist`. This makes the first successful authenticated connection the
+transport for the rest of setup, synchronization, and shell attachment. Local
+control sockets are transient and removed with instance state.
+
 Removing a device key from the Vultr account prevents it from being included
 in future VPS instances. A key already installed on a running VPS must also be
 removed there, or the disposable VPS can simply be destroyed and recreated.

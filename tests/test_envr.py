@@ -432,6 +432,13 @@ class LifecycleLogicTests(unittest.TestCase):
             options = app.ssh_options()
             self.assertIn("StrictHostKeyChecking=accept-new", options)
             self.assertIn("BatchMode=yes", options)
+            self.assertIn("ControlMaster=auto", options)
+            self.assertIn("ControlPersist=300", options)
+            self.assertIn(
+                f"ControlPath={app.ssh_root / 'control-%C'}",
+                options,
+            )
+            self.assertEqual(app.scp_options(), options)
             self.assertEqual(
                 app.ssh_target({"main_ip": "192.0.2.1"}),
                 "remote@192.0.2.1",

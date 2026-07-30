@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -385,6 +385,7 @@ class Envr:
         self.vps_key = self.ssh_root / "id_ed25519"
         self.vps_public_key = self.ssh_root / "id_ed25519.pub"
         self.vps_known_hosts = self.ssh_root / "known_hosts"
+        self.ssh_control_path = self.ssh_root / "control-%C"
         self.repos_path = self.root / "repos.json"
         self.state_path = self.root / "state.json"
         self.password_path = self.root / "instance-password"
@@ -564,6 +565,9 @@ class Envr:
             self.state_path.unlink()
         with contextlib.suppress(FileNotFoundError):
             self.password_path.unlink()
+        for control_socket in self.ssh_root.glob("control-*"):
+            with contextlib.suppress(FileNotFoundError):
+                control_socket.unlink()
         fsync_directory(self.root)
 
     def api_token(self) -> str:
@@ -1114,6 +1118,12 @@ runcmd:
             f"StrictHostKeyChecking={strict_host_key_checking}",
             "-o",
             f"UserKnownHostsFile={self.vps_known_hosts}",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=300",
+            "-o",
+            f"ControlPath={self.ssh_control_path}",
             "-o",
             f"ConnectTimeout={connect_timeout}",
             "-o",

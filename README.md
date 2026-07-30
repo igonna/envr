@@ -90,6 +90,11 @@ key. TCP reachability, SSH handshake closure/reset, host-key verification, and
 local private-key failures are reported separately with the final sanitized
 SSH diagnostic.
 
+Within one `up`, SSH and SCP share a private OpenSSH control connection. Once
+one key-authenticated handshake succeeds, package checks, credential and
+repository synchronization, and the interactive shell reuse that connection
+instead of repeatedly crossing an unreliable or filtered network path.
+
 Inspect the Vultr account, instance, live price, IP, and envr-managed recovery
 root password:
 
