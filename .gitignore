@@ -1,0 +1,33 @@
+# envr runtime secrets and state when the source checkout is also ~/envr
+/api
+/instance-password
+/repos.json
+/state.json
+/*.lock
+/codex/
+/git/
+/ssh/
+
+# Common secret files
+.env
+.env.local
+.env.*.local
+**/id_ed25519
+**/id_ed25519.pub
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
