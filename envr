@@ -1,0 +1,1654 @@
+#!/usr/bin/env python3
+"""Disposable Vultr development environments from a Unix terminal."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import secrets
+import shlex
+import shutil
+import string
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Iterator, Sequence
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+VERSION = "0.1.0"
+SCHEMA_VERSION = 1
+API_BASE = "https://api.vultr.com/v2"
+LABEL = "envr-codex"
+REMOTE_USER = "codex"
+REMOTE_ROOT = "/home/codex/envr"
+REGIONS = ("fra", "ams", "waw")
+PLAN_IDS = {
+    1: "vc2-1c-1gb",
+    2: "vc2-1c-2gb",
+    4: "vc2-2c-4gb",
+    8: "vc2-4c-8gb",
+}
+SSH_CONNECT_TIMEOUT = 10
+INSTANCE_TIMEOUT = 600
+CLOUD_INIT_TIMEOUT = 900
+DELETE_TIMEOUT = 300
+
+
+class EnvrError(RuntimeError):
+    """A concise, expected user-facing error."""
+
+
+class ApiError(EnvrError):
+    def __init__(self, status: int, message: str, *, retry_after: int | None = None):
+        self.status = status
+        self.message = message
+        self.retry_after = retry_after
+        super().__init__(message)
+
+
+def eprint(*values: object) -> None:
+    print(*values, file=sys.stderr)
+
+
+def data_root() -> Path:
+    override = os.environ.get("ENVR_HOME")
+    return Path(override).expanduser() if override else Path.home() / "envr"
+
+
+def ensure_private_dir(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
+
+
+def fsync_directory(directory: Path) -> None:
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    ensure_private_dir(path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        path.chmod(mode)
+        fsync_directory(path.parent)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def atomic_write_text(path: Path, value: str, mode: int = 0o600) -> None:
+    atomic_write(path, value.encode("utf-8"), mode)
+
+
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    content = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(path, content)
+
+
+def load_json(path: Path, *, default: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not path.exists():
+        return {} if default is None else default
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise EnvrError(f"{path} is not valid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise EnvrError(f"{path} must contain a JSON object")
+    if value.get("schema") != SCHEMA_VERSION:
+        raise EnvrError(
+            f"{path} has unsupported schema {value.get('schema')!r}; "
+            f"expected {SCHEMA_VERSION}"
+        )
+    return value
+
+
+@contextlib.contextmanager
+def exclusive_lock(root: Path) -> Iterator[None]:
+    ensure_private_dir(root)
+    lock_path = root / ".lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        lock_path.chmod(0o600)
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError as error:
+            raise EnvrError(f"cannot lock {lock_path}: {error}") from error
+        yield
+
+
+def run(
+    command: Sequence[str],
+    *,
+    input_data: str | bytes | None = None,
+    capture: bool = False,
+    check: bool = True,
+    timeout: int | None = None,
+    env: dict[str, str] | None = None,
+    quiet: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    if isinstance(input_data, bytes):
+        text_input = input_data.decode("utf-8")
+    else:
+        text_input = input_data
+    result = subprocess.run(
+        list(command),
+        input=text_input,
+        text=True,
+        stdout=subprocess.PIPE if capture or quiet else None,
+        stderr=subprocess.PIPE if capture or quiet else None,
+        check=False,
+        timeout=timeout,
+        env=env,
+    )
+    if check and result.returncode != 0:
+        detail = ""
+        if result.stderr:
+            detail = f": {result.stderr.strip()}"
+        raise EnvrError(f"{Path(command[0]).name} failed{detail}")
+    return result
+
+
+def prompt_yes_no(prompt: str, *, default: bool = False) -> bool:
+    suffix = " [Y/n] " if default else " [y/N] "
+    answer = input(prompt + suffix).strip().lower()
+    if not answer:
+        return default
+    return answer in {"y", "yes"}
+
+
+def package_environment() -> str:
+    prefix = os.environ.get("PREFIX", "")
+    if "com.termux" in prefix or shutil.which("pkg"):
+        return "termux"
+    if platform.system() == "Darwin":
+        return "macos"
+    if platform.system() == "Linux":
+        return "linux"
+    return "unknown"
+
+
+def ensure_commands(commands: Sequence[str]) -> None:
+    missing = sorted({command for command in commands if shutil.which(command) is None})
+    if not missing:
+        return
+
+    environment = package_environment()
+    if environment == "termux":
+        packages = set()
+        for command in missing:
+            packages.add("git" if command == "git" else "openssh")
+        run(["pkg", "install", "-y", *sorted(packages)])
+    elif environment == "linux" and shutil.which("apt-get"):
+        packages = set()
+        for command in missing:
+            packages.add("git" if command == "git" else "openssh-client")
+        prefix = [] if os.geteuid() == 0 else ["sudo"]
+        run([*prefix, "apt-get", "install", "-y", *sorted(packages)])
+    elif environment == "macos" and shutil.which("brew"):
+        packages = set()
+        for command in missing:
+            packages.add("git" if command == "git" else "openssh")
+        run(["brew", "install", *sorted(packages)])
+    else:
+        raise EnvrError(
+            f"missing {', '.join(missing)}; install Git and OpenSSH, then retry"
+        )
+
+    still_missing = [command for command in missing if shutil.which(command) is None]
+    if still_missing:
+        raise EnvrError(f"still missing after installation: {', '.join(still_missing)}")
+
+
+def generate_password(length: int = 16) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def available_prepaid_credit(balance: float, pending_charges: float) -> float:
+    """Translate Vultr's negative-credit balance into remaining prepaid credit."""
+    return max(-balance - pending_charges, 0.0)
+
+
+REPO_URL_RE = re.compile(
+    r"^(?P<user>[^@\s/:]+)@(?P<host>[^:\s/]+):(?P<repo_path>[^\s]+)$"
+)
+FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def parse_repository_url(url: str) -> dict[str, str]:
+    match = REPO_URL_RE.fullmatch(url.strip())
+    if not match:
+        raise EnvrError("repository URL must look like git@HOST:OWNER/REPOSITORY.git")
+    repository_path = match.group("repo_path").strip("/")
+    if repository_path.endswith(".git"):
+        repository_path = repository_path[:-4]
+    pieces = repository_path.split("/")
+    if len(pieces) < 2 or any(piece in {"", ".", ".."} for piece in pieces):
+        raise EnvrError("repository URL must contain an owner and repository")
+    folder = pieces[-1]
+    if not FOLDER_RE.fullmatch(folder):
+        raise EnvrError(f"repository folder {folder!r} is not safe")
+    identity = "-".join(pieces[-2:])
+    return {
+        "url": url.strip(),
+        "user": match.group("user"),
+        "host": match.group("host"),
+        "path": repository_path,
+        "folder": folder,
+        "identity": identity,
+    }
+
+
+def validate_text_field(label: str, value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise EnvrError(f"{label} cannot be empty")
+    if any(ord(character) < 32 for character in value):
+        raise EnvrError(f"{label} contains control characters")
+    return value
+
+
+class VultrAPI:
+    def __init__(self, token: str, base_url: str | None = None):
+        self.token = token
+        self.base_url = (base_url or os.environ.get("ENVR_VULTR_API") or API_BASE).rstrip(
+            "/"
+        )
+
+    def request(
+        self,
+        method: str,
+        resource: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        url = self.base_url + "/" + resource.lstrip("/")
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        body = None
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            "User-Agent": f"envr/{VERSION}",
+        }
+        if payload is not None:
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                content = response.read()
+        except urllib.error.HTTPError as error:
+            try:
+                content = error.read()
+            finally:
+                error.close()
+            message = self._error_message(content, error.reason)
+            retry_after = None
+            with contextlib.suppress(TypeError, ValueError):
+                retry_after = int(error.headers.get("Retry-After", ""))
+            raise ApiError(error.code, message, retry_after=retry_after) from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise ApiError(0, f"Vultr API network error: {error}") from error
+
+        if not content:
+            return {}
+        try:
+            value = json.loads(content.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise EnvrError("Vultr API returned malformed JSON") from error
+        if not isinstance(value, dict):
+            raise EnvrError("Vultr API returned an unexpected response")
+        return value
+
+    @staticmethod
+    def _error_message(content: bytes, fallback: object) -> str:
+        try:
+            value = json.loads(content.decode("utf-8"))
+            if isinstance(value, dict):
+                for key in ("error", "message"):
+                    if value.get(key):
+                        return str(value[key])
+        except (UnicodeError, json.JSONDecodeError):
+            pass
+        decoded = content.decode("utf-8", errors="replace").strip()
+        return decoded or str(fallback)
+
+    def get(
+        self, resource: str, *, query: dict[str, str | int] | None = None
+    ) -> dict[str, Any]:
+        return self.request("GET", resource, query=query)
+
+    def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.request("POST", resource, payload=payload)
+
+    def delete(self, resource: str) -> None:
+        self.request("DELETE", resource)
+
+
+class Envr:
+    def __init__(self, root: Path | None = None):
+        self.root = root or data_root()
+        self.token_path = self.root / "api"
+        self.auth_path = self.root / "codex" / "auth.json"
+        self.git_root = self.root / "git"
+        self.ssh_root = self.root / "ssh"
+        self.vps_key = self.ssh_root / "id_ed25519"
+        self.vps_public_key = self.ssh_root / "id_ed25519.pub"
+        self.vps_known_hosts = self.ssh_root / "known_hosts"
+        self.git_known_hosts = self.ssh_root / "git_known_hosts"
+        self.repos_path = self.root / "repos.json"
+        self.state_path = self.root / "state.json"
+        self.client_id_path = self.root / "client-id"
+        self.password_path = self.root / "instance-password"
+
+    def ensure_layout(self) -> None:
+        ensure_private_dir(self.root)
+        ensure_private_dir(self.git_root)
+        ensure_private_dir(self.ssh_root)
+        ensure_private_dir(self.auth_path.parent)
+
+    def client_id(self) -> str:
+        self.ensure_layout()
+        if self.client_id_path.exists():
+            value = self.client_id_path.read_text(encoding="utf-8").strip()
+            if not re.fullmatch(r"[a-f0-9]{20}", value):
+                raise EnvrError(f"{self.client_id_path} is invalid")
+            self.client_id_path.chmod(0o600)
+            return value
+        value = secrets.token_hex(10)
+        atomic_write_text(self.client_id_path, value + "\n")
+        return value
+
+    def management_tag(self) -> str:
+        return f"envr-managed-{self.client_id()}"
+
+    def repositories(self) -> dict[str, Any]:
+        default = {"schema": SCHEMA_VERSION, "repositories": {}}
+        value = load_json(self.repos_path, default=default)
+        repositories = value.get("repositories")
+        if not isinstance(repositories, dict):
+            raise EnvrError(f"{self.repos_path} has an invalid repositories object")
+        return value
+
+    def save_repositories(self, value: dict[str, Any]) -> None:
+        value["schema"] = SCHEMA_VERSION
+        atomic_write_json(self.repos_path, value)
+
+    def state(self) -> dict[str, Any]:
+        return load_json(
+            self.state_path,
+            default={"schema": SCHEMA_VERSION, "instance_id": None},
+        )
+
+    def save_state(self, value: dict[str, Any]) -> None:
+        value["schema"] = SCHEMA_VERSION
+        atomic_write_json(self.state_path, value)
+
+    def clear_instance_state(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            self.state_path.unlink()
+        with contextlib.suppress(FileNotFoundError):
+            self.password_path.unlink()
+        fsync_directory(self.root)
+
+    def api_token(self) -> str:
+        self.ensure_layout()
+        if self.token_path.exists():
+            self.token_path.chmod(0o600)
+            token = self.token_path.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        token = getpass.getpass("Vultr API token: ").strip()
+        if not token:
+            raise EnvrError("Vultr API token cannot be empty")
+        atomic_write_text(self.token_path, token + "\n")
+        return token
+
+    def api(self) -> VultrAPI:
+        return VultrAPI(self.api_token())
+
+    def configure_git(self) -> None:
+        ensure_commands(("git", "ssh", "ssh-keygen"))
+        self.ensure_layout()
+
+        parsed = parse_repository_url(input("Repository SSH URL: ").strip())
+        repositories = self.repositories()
+        records = repositories["repositories"]
+        existing_folder = next(
+            (
+                folder
+                for folder, record in records.items()
+                if isinstance(record, dict) and record.get("url") == parsed["url"]
+            ),
+            None,
+        )
+        if existing_folder is not None:
+            existing = records[existing_folder]
+            public_path = Path(existing["public_key"])
+            print(f"Repository is already configured as: {existing_folder}")
+            if public_path.exists():
+                print("\nPUBLIC key:\n")
+                print(public_path.read_text(encoding="utf-8").strip())
+                print()
+            if not prompt_yes_no("Replace its key or Git identity?"):
+                return
+
+        collision = records.get(parsed["folder"])
+        if collision and collision.get("url") != parsed["url"]:
+            raise EnvrError(
+                f"folder {parsed['folder']!r} is already used by {collision.get('url')}"
+            )
+
+        key_directory = self.git_root / parsed["folder"]
+        private_key = key_directory / "id_ed25519"
+        public_key = key_directory / "id_ed25519.pub"
+
+        with tempfile.TemporaryDirectory(dir=self.root) as temporary_directory:
+            candidate_private = Path(temporary_directory) / "id_ed25519"
+            candidate_public = candidate_private.with_suffix(".pub")
+            supplied = input(
+                "SSH private key path (leave empty to generate one): "
+            ).strip()
+            if supplied:
+                source = Path(supplied).expanduser().resolve()
+                if not source.is_file():
+                    raise EnvrError(f"SSH private key does not exist: {source}")
+                result = run(
+                    ["ssh-keygen", "-y", "-P", "", "-f", str(source)],
+                    capture=True,
+                    check=False,
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    raise EnvrError(
+                        "SSH private key is invalid or passphrase-protected; "
+                        "use a dedicated unencrypted key"
+                    )
+                atomic_write(candidate_private, source.read_bytes())
+                atomic_write_text(
+                    candidate_public, result.stdout.strip() + "\n", 0o600
+                )
+            else:
+                run(
+                    [
+                        "ssh-keygen",
+                        "-q",
+                        "-t",
+                        "ed25519",
+                        "-N",
+                        "",
+                        "-C",
+                        f"envr:{parsed['path']}",
+                        "-f",
+                        str(candidate_private),
+                    ]
+                )
+
+            author_name = validate_text_field(
+                "Git author name", input("Git author name: ")
+            )
+            author_email = validate_text_field(
+                "Git author email", input("Git author email: ")
+            )
+
+            print("\nAdd this PUBLIC key to the Git repository or account:\n")
+            print(candidate_public.read_text(encoding="utf-8").strip())
+            print("\nThe private key is never printed.")
+            input("Press Enter after adding the key: ")
+
+            self.verify_repository_access(parsed["url"], candidate_private)
+            ensure_private_dir(key_directory)
+            atomic_write(private_key, candidate_private.read_bytes())
+            atomic_write(public_key, candidate_public.read_bytes())
+
+        records[parsed["folder"]] = {
+            "url": parsed["url"],
+            "folder": parsed["folder"],
+            "identity": parsed["identity"],
+            "host": parsed["host"],
+            "private_key": str(private_key),
+            "public_key": str(public_key),
+            "author_name": author_name,
+            "author_email": author_email,
+        }
+        self.save_repositories(repositories)
+        print(f"\nSaved repository as: {parsed['folder']}")
+        print(f"Run: envr up 4 {parsed['folder']}")
+
+    def verify_repository_access(self, url: str, private_key: Path) -> None:
+        ensure_private_dir(self.git_known_hosts.parent)
+        self.git_known_hosts.touch(mode=0o600, exist_ok=True)
+        self.git_known_hosts.chmod(0o600)
+        ssh_command = " ".join(
+            shlex.quote(part)
+            for part in (
+                "ssh",
+                "-i",
+                str(private_key),
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=ask",
+                "-o",
+                f"UserKnownHostsFile={self.git_known_hosts}",
+            )
+        )
+        environment = os.environ.copy()
+        environment["GIT_SSH_COMMAND"] = ssh_command
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        print("Verifying repository access...")
+        result = run(
+            ["git", "ls-remote", url],
+            env=environment,
+            quiet=True,
+            check=False,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() if result.stderr else "access denied"
+            raise EnvrError(f"repository access verification failed: {detail}")
+
+    def repository(self, folder: str) -> dict[str, Any]:
+        if not FOLDER_RE.fullmatch(folder):
+            raise EnvrError(f"invalid repository folder: {folder!r}")
+        record = self.repositories()["repositories"].get(folder)
+        if not isinstance(record, dict):
+            raise EnvrError(f'Repository "{folder}" is not configured. Run: envr git')
+        required = {
+            "url",
+            "folder",
+            "identity",
+            "private_key",
+            "author_name",
+            "author_email",
+        }
+        if not required.issubset(record):
+            raise EnvrError(f"repository configuration for {folder!r} is incomplete")
+        private_key = Path(record["private_key"])
+        if not private_key.is_file():
+            raise EnvrError(f"repository key is missing: {private_key}")
+        private_key.chmod(0o600)
+        return record
+
+    def ensure_vps_key(self) -> str:
+        ensure_commands(("ssh", "scp", "ssh-keygen"))
+        self.ensure_layout()
+        if not self.vps_key.exists() or not self.vps_public_key.exists():
+            with tempfile.TemporaryDirectory(dir=self.root) as temporary_directory:
+                temporary_key = Path(temporary_directory) / "id_ed25519"
+                run(
+                    [
+                        "ssh-keygen",
+                        "-q",
+                        "-t",
+                        "ed25519",
+                        "-N",
+                        "",
+                        "-C",
+                        f"envr-vultr:{self.client_id()}",
+                        "-f",
+                        str(temporary_key),
+                    ]
+                )
+                atomic_write(self.vps_key, temporary_key.read_bytes())
+                atomic_write(
+                    self.vps_public_key, temporary_key.with_suffix(".pub").read_bytes()
+                )
+        self.vps_key.chmod(0o600)
+        self.vps_public_key.chmod(0o600)
+        return self.vps_public_key.read_text(encoding="utf-8").strip()
+
+    def ensure_vultr_ssh_key(self, api: VultrAPI, public_key: str) -> str:
+        response = api.get("ssh-keys", query={"per_page": 500})
+        keys = response.get("ssh_keys")
+        if not isinstance(keys, list):
+            raise EnvrError("Vultr API returned an invalid SSH-key list")
+        normalized = public_key.strip()
+        for key in keys:
+            if isinstance(key, dict) and str(key.get("ssh_key", "")).strip() == normalized:
+                return str(key["id"])
+        created = api.post(
+            "ssh-keys",
+            {"name": f"envr-{self.client_id()}", "ssh_key": normalized},
+        ).get("ssh_key")
+        if not isinstance(created, dict) or not created.get("id"):
+            raise EnvrError("Vultr API did not return the uploaded SSH-key ID")
+        return str(created["id"])
+
+    def managed_instances(self, api: VultrAPI) -> list[dict[str, Any]]:
+        response = api.get("instances", query={"per_page": 500})
+        instances = response.get("instances")
+        if not isinstance(instances, list):
+            raise EnvrError("Vultr API returned an invalid instance list")
+        tag = self.management_tag()
+        managed = [
+            instance
+            for instance in instances
+            if isinstance(instance, dict)
+            and tag in (instance.get("tags") or [])
+            and instance.get("label") == LABEL
+        ]
+        return sorted(managed, key=lambda item: str(item.get("date_created", "")))
+
+    def resolve_single_instance(
+        self, api: VultrAPI, *, allow_none: bool = True
+    ) -> dict[str, Any] | None:
+        instances = self.managed_instances(api)
+        if len(instances) > 1:
+            raise EnvrError(
+                f"conflict: {len(instances)} envr-managed instances exist; "
+                "run envr status, then envr destroy"
+            )
+        if not instances:
+            if allow_none:
+                return None
+            raise EnvrError("envr-codex is not running")
+        instance = instances[0]
+        previous = self.state()
+        same_instance = previous.get("instance_id") == instance.get("id")
+        self.save_state(
+            {
+                "schema": SCHEMA_VERSION,
+                "instance_id": instance.get("id"),
+                "ram_gb": int(instance.get("ram", 0)) // 1024,
+                "region": instance.get("region"),
+                "password_ready": (
+                    bool(previous.get("password_ready")) if same_instance else False
+                ),
+            }
+        )
+        return instance
+
+    def plan_catalog(self, api: VultrAPI) -> dict[str, dict[str, Any]]:
+        response = api.get("plans", query={"type": "vc2", "per_page": 500})
+        plans = response.get("plans")
+        if not isinstance(plans, list):
+            raise EnvrError("Vultr API returned an invalid plan catalog")
+        return {
+            str(plan["id"]): plan
+            for plan in plans
+            if isinstance(plan, dict) and plan.get("id")
+        }
+
+    def ubuntu_os_id(self, api: VultrAPI) -> int:
+        response = api.get("os", query={"per_page": 500})
+        systems = response.get("os")
+        if not isinstance(systems, list):
+            raise EnvrError("Vultr API returned an invalid OS catalog")
+        exact = [
+            system
+            for system in systems
+            if isinstance(system, dict)
+            and system.get("name") == "Ubuntu 24.04 LTS x64"
+            and system.get("family") == "ubuntu"
+            and system.get("arch") == "x64"
+        ]
+        if len(exact) != 1:
+            raise EnvrError("Ubuntu 24.04 LTS x64 is not uniquely available")
+        return int(exact[0]["id"])
+
+    def available_regions(
+        self, api: VultrAPI, plan_id: str, plan: dict[str, Any]
+    ) -> list[str]:
+        advertised = plan.get("locations", [])
+        candidates = [region for region in REGIONS if region in advertised]
+        available = []
+        for region in candidates:
+            response = api.get(f"regions/{region}/availability")
+            plans = response.get("available_plans")
+            if isinstance(plans, list) and plan_id in plans:
+                available.append(region)
+        if not available:
+            raise EnvrError(
+                f"{plan_id} is unavailable in configured regions: "
+                + ", ".join(REGIONS)
+            )
+        return available
+
+    def cloud_init(self, public_key: str) -> str:
+        quoted_key = json.dumps(public_key)
+        return f"""#cloud-config
+package_update: true
+package_upgrade: false
+ssh_pwauth: true
+disable_root: false
+users:
+  - default
+  - name: codex
+    gecos: Codex
+    shell: /bin/bash
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - {quoted_key}
+packages:
+  - git
+  - curl
+  - ca-certificates
+  - build-essential
+  - tmux
+  - jq
+  - rsync
+  - unzip
+  - nodejs
+  - npm
+  - docker.io
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+write_files:
+  - path: /etc/ssh/sshd_config.d/00-envr.conf
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PermitRootLogin yes
+      PermitEmptyPasswords no
+  - path: /home/codex/.codex/config.toml
+    owner: codex:codex
+    permissions: '0600'
+    content: |
+      cli_auth_credentials_store = "file"
+  - path: /etc/fail2ban/jail.d/envr.conf
+    permissions: '0644'
+    content: |
+      [sshd]
+      enabled = true
+      maxretry = 5
+      findtime = 10m
+      bantime = 1h
+runcmd:
+  - [bash, -lc, "usermod -aG docker codex"]
+  - [bash, -lc, "install -d -m 700 -o codex -g codex /home/codex/.ssh /home/codex/.ssh/envr /home/codex/.codex"]
+  - [bash, -lc, "install -d -m 755 -o codex -g codex {REMOTE_ROOT}"]
+  - [bash, -lc, "for i in 1 2 3; do npm install -g @openai/codex@latest && break; sleep 10; done; command -v codex"]
+  - [bash, -lc, "ufw default deny incoming"]
+  - [bash, -lc, "ufw default allow outgoing"]
+  - [bash, -lc, "ufw allow 22/tcp"]
+  - [bash, -lc, "ufw --force enable"]
+  - [bash, -lc, "systemctl enable --now fail2ban docker"]
+  - [bash, -lc, "systemctl restart ssh"]
+  - [bash, -lc, "touch /var/lib/envr-ready"]
+"""
+
+    @staticmethod
+    def retryable_region_error(error: ApiError) -> bool:
+        if error.status in {409, 429, 500, 502, 503, 504}:
+            return True
+        if error.status != 400:
+            return False
+        message = error.message.lower()
+        return any(
+            word in message
+            for word in ("capacity", "available", "availability", "stock", "region")
+        )
+
+    def create_instance(
+        self,
+        api: VultrAPI,
+        ram_gb: int,
+        repository: dict[str, Any],
+    ) -> dict[str, Any]:
+        plan_id = PLAN_IDS[ram_gb]
+        catalog = self.plan_catalog(api)
+        plan = catalog.get(plan_id)
+        if not plan:
+            raise EnvrError(f"Vultr plan {plan_id} is not present in the live catalog")
+        if int(plan.get("ram", 0)) != ram_gb * 1024:
+            raise EnvrError(f"Vultr plan {plan_id} no longer matches {ram_gb} GB")
+        os_id = self.ubuntu_os_id(api)
+        regions = self.available_regions(api, plan_id, plan)
+        public_key = self.ensure_vps_key()
+        vultr_key_id = self.ensure_vultr_ssh_key(api, public_key)
+        user_data = base64.b64encode(self.cloud_init(public_key).encode()).decode()
+
+        last_error: Exception | None = None
+        for region in regions:
+            print(f"Creating {ram_gb} GB envr VPS in {region}...")
+            password = generate_password()
+            atomic_write_text(self.password_path, password + "\n")
+            payload = {
+                "region": region,
+                "plan": plan_id,
+                "os_id": os_id,
+                "label": LABEL,
+                "hostname": LABEL,
+                "tags": [self.management_tag()],
+                "sshkey_id": [vultr_key_id],
+                "user_data": user_data,
+                "backups": "disabled",
+                "enable_ipv6": False,
+                "ddos_protection": False,
+                "activation_email": False,
+                "user_scheme": "root",
+            }
+            try:
+                response = api.post("instances", payload)
+                instance = response.get("instance")
+                if not isinstance(instance, dict) or not instance.get("id"):
+                    raise EnvrError("Vultr did not return the created instance ID")
+            except ApiError as error:
+                wait_seconds = 20 if error.status == 0 or error.status >= 500 else 0
+                discovered = self.reconcile_creation(api, wait_seconds=wait_seconds)
+                if len(discovered) == 1:
+                    instance = discovered[0]
+                elif len(discovered) > 1:
+                    raise EnvrError(
+                        "ambiguous creation produced multiple envr instances; "
+                        "run envr status"
+                    ) from error
+                elif error.status == 0:
+                    raise EnvrError(
+                        "instance creation outcome is unknown after a network "
+                        "failure; run envr status before retrying"
+                    ) from error
+                elif self.retryable_region_error(error):
+                    last_error = error
+                    eprint(f"Creation in {region} failed: {error}")
+                    continue
+                else:
+                    raise
+
+            self.save_state(
+                {
+                    "schema": SCHEMA_VERSION,
+                    "instance_id": instance["id"],
+                    "ram_gb": ram_gb,
+                    "region": region,
+                    "password_ready": False,
+                }
+            )
+            try:
+                active = self.wait_for_instance(api, str(instance["id"]))
+                self.wait_for_ssh(active)
+                self.wait_for_cloud_init(active)
+                self.set_root_password(active)
+            except (EnvrError, subprocess.TimeoutExpired) as error:
+                last_error = error
+                eprint(f"Deployment in {region} failed: {error}")
+                self.cleanup_failed_instance(api, instance)
+                continue
+
+            try:
+                self.install_cached_auth(active)
+                self.ensure_remote_repository(active, repository)
+            except (EnvrError, subprocess.TimeoutExpired) as error:
+                raise EnvrError(
+                    f"VPS {active.get('id')} is running and billable, but "
+                    f"repository setup failed: {error}"
+                ) from error
+            return active
+
+        with contextlib.suppress(FileNotFoundError):
+            self.password_path.unlink()
+        raise EnvrError(f"all configured regions failed: {last_error}")
+
+    def reconcile_creation(
+        self, api: VultrAPI, *, wait_seconds: int
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            instances = self.managed_instances(api)
+            if instances or time.monotonic() >= deadline:
+                return instances
+            time.sleep(2)
+
+    def wait_for_instance(self, api: VultrAPI, instance_id: str) -> dict[str, Any]:
+        deadline = time.monotonic() + INSTANCE_TIMEOUT
+        last: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            response = api.get(f"instances/{instance_id}")
+            instance = response.get("instance")
+            if isinstance(instance, dict):
+                last = instance
+                ip = str(instance.get("main_ip", ""))
+                if (
+                    instance.get("status") == "active"
+                    and instance.get("power_status") == "running"
+                    and ip
+                    and ip != "0.0.0.0"
+                ):
+                    previous = self.state()
+                    same_instance = previous.get("instance_id") == instance_id
+                    self.save_state(
+                        {
+                            "schema": SCHEMA_VERSION,
+                            "instance_id": instance_id,
+                            "ram_gb": int(instance.get("ram", 0)) // 1024,
+                            "region": instance.get("region"),
+                            "password_ready": (
+                                bool(previous.get("password_ready"))
+                                if same_instance
+                                else False
+                            ),
+                        }
+                    )
+                    return instance
+            time.sleep(5)
+        status = (
+            last.get("status") or last.get("server_status") or "unknown"
+        ) if last else "unknown"
+        raise EnvrError(f"instance did not become active (last status: {status})")
+
+    def ssh_options(self, *, connect_timeout: int = SSH_CONNECT_TIMEOUT) -> list[str]:
+        self.vps_known_hosts.touch(mode=0o600, exist_ok=True)
+        self.vps_known_hosts.chmod(0o600)
+        return [
+            "-i",
+            str(self.vps_key),
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"UserKnownHostsFile={self.vps_known_hosts}",
+            "-o",
+            f"ConnectTimeout={connect_timeout}",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+        ]
+
+    def ssh_target(self, instance: dict[str, Any]) -> str:
+        ip = str(instance.get("main_ip", ""))
+        if not ip or ip == "0.0.0.0":
+            raise EnvrError("instance does not have a usable public IPv4 address")
+        return f"{REMOTE_USER}@{ip}"
+
+    def remote_command(
+        self,
+        instance: dict[str, Any],
+        command: str,
+        *,
+        input_data: str | None = None,
+        capture: bool = False,
+        check: bool = True,
+        timeout: int | None = None,
+        tty: bool = False,
+        quiet: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        ssh = ["ssh", *self.ssh_options()]
+        if tty:
+            ssh.append("-tt")
+        ssh.extend([self.ssh_target(instance), command])
+        return run(
+            ssh,
+            input_data=input_data,
+            capture=capture,
+            check=check,
+            timeout=timeout,
+            quiet=quiet,
+        )
+
+    def remote_script(
+        self,
+        instance: dict[str, Any],
+        script: str,
+        arguments: Sequence[str] = (),
+        *,
+        capture: bool = False,
+        check: bool = True,
+        timeout: int | None = None,
+        quiet: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        command = "bash -s --"
+        if arguments:
+            command += " " + " ".join(shlex.quote(argument) for argument in arguments)
+        return self.remote_command(
+            instance,
+            command,
+            input_data=script,
+            capture=capture,
+            check=check,
+            timeout=timeout,
+            quiet=quiet,
+        )
+
+    def wait_for_ssh(self, instance: dict[str, Any]) -> None:
+        print(f"Waiting for SSH at {instance.get('main_ip')}...")
+        deadline = time.monotonic() + INSTANCE_TIMEOUT
+        while time.monotonic() < deadline:
+            result = self.remote_command(
+                instance, "true", check=False, quiet=True, timeout=15
+            )
+            if result.returncode == 0:
+                return
+            time.sleep(5)
+        raise EnvrError("SSH did not become reachable")
+
+    def wait_for_cloud_init(self, instance: dict[str, Any]) -> None:
+        print("Waiting for cloud-init...")
+        result = self.remote_command(
+            instance,
+            "sudo cloud-init status --wait >/dev/null && "
+            "test -f /var/lib/envr-ready && command -v codex >/dev/null",
+            check=False,
+            capture=True,
+            timeout=CLOUD_INIT_TIMEOUT,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() if result.stderr else "cloud-init failed"
+            raise EnvrError(detail)
+
+    def set_root_password(self, instance: dict[str, Any]) -> None:
+        if not self.password_path.exists():
+            raise EnvrError("generated instance password is missing locally")
+        password = self.password_path.read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"[A-Za-z0-9]{16}", password):
+            raise EnvrError("generated instance password is invalid")
+        self.remote_command(
+            instance,
+            "sudo chpasswd",
+            input_data=f"root:{password}\n",
+            quiet=True,
+            timeout=30,
+        )
+        state = self.state()
+        state["password_ready"] = True
+        self.save_state(state)
+
+    def scp_options(self) -> list[str]:
+        return self.ssh_options()
+
+    def copy_to_remote(
+        self, instance: dict[str, Any], local: Path, remote: str
+    ) -> None:
+        run(
+            [
+                "scp",
+                *self.scp_options(),
+                str(local),
+                f"{self.ssh_target(instance)}:{remote}",
+            ],
+            quiet=True,
+            timeout=120,
+        )
+
+    def install_cached_auth(self, instance: dict[str, Any]) -> None:
+        if not self.auth_path.exists():
+            return
+        self.validate_auth_file(self.auth_path)
+        self.remote_command(
+            instance, "install -d -m 700 /home/codex/.codex", quiet=True
+        )
+        temporary = f"/home/codex/.codex/.auth.json.envr-{secrets.token_hex(4)}"
+        self.copy_to_remote(instance, self.auth_path, temporary)
+        self.remote_command(
+            instance,
+            f"chmod 600 {shlex.quote(temporary)} && "
+            f"mv -f {shlex.quote(temporary)} /home/codex/.codex/auth.json",
+            quiet=True,
+        )
+
+    @staticmethod
+    def validate_auth_file(path: Path) -> None:
+        if not path.is_file() or path.stat().st_size == 0:
+            raise EnvrError(f"Codex auth file is empty: {path}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise EnvrError(f"Codex auth file is invalid JSON: {path}") from error
+        if not isinstance(value, dict) or not value:
+            raise EnvrError(f"Codex auth file does not contain credentials: {path}")
+
+    def pull_auth(self, instance: dict[str, Any]) -> bool:
+        result = self.remote_command(
+            instance,
+            "test -s /home/codex/.codex/auth.json && "
+            "sha256sum /home/codex/.codex/auth.json",
+            capture=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+        remote_hash = result.stdout.split()[0]
+        if self.auth_path.exists():
+            local_hash = hashlib.sha256(self.auth_path.read_bytes()).hexdigest()
+            if local_hash == remote_hash:
+                return True
+
+        ensure_private_dir(self.auth_path.parent)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".auth.json.", dir=self.auth_path.parent
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            run(
+                [
+                    "scp",
+                    *self.scp_options(),
+                    f"{self.ssh_target(instance)}:/home/codex/.codex/auth.json",
+                    str(temporary),
+                ],
+                quiet=True,
+                timeout=120,
+            )
+            temporary.chmod(0o600)
+            self.validate_auth_file(temporary)
+            downloaded_hash = hashlib.sha256(temporary.read_bytes()).hexdigest()
+            if downloaded_hash != remote_hash:
+                raise EnvrError("Codex auth changed during download; retry")
+            os.replace(temporary, self.auth_path)
+            self.auth_path.chmod(0o600)
+            fsync_directory(self.auth_path.parent)
+            return True
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    def ensure_remote_repository(
+        self, instance: dict[str, Any], repository: dict[str, Any]
+    ) -> None:
+        folder = str(repository["folder"])
+        remote_key = f"/home/codex/.ssh/envr/{folder}"
+        self.remote_command(
+            instance,
+            "install -d -m 700 /home/codex/.ssh /home/codex/.ssh/envr",
+            quiet=True,
+        )
+        temporary_key = remote_key + f".tmp-{secrets.token_hex(4)}"
+        self.copy_to_remote(instance, Path(repository["private_key"]), temporary_key)
+        self.remote_command(
+            instance,
+            f"chmod 600 {shlex.quote(temporary_key)} && "
+            f"mv -f {shlex.quote(temporary_key)} {shlex.quote(remote_key)}",
+            quiet=True,
+        )
+
+        if not self.git_known_hosts.exists():
+            raise EnvrError("Git known_hosts is missing; rerun envr git")
+        remote_known_hosts = "/home/codex/.ssh/envr/known_hosts"
+        temporary_hosts = remote_known_hosts + f".tmp-{secrets.token_hex(4)}"
+        self.copy_to_remote(instance, self.git_known_hosts, temporary_hosts)
+        self.remote_command(
+            instance,
+            f"chmod 600 {shlex.quote(temporary_hosts)} && "
+            f"mv -f {shlex.quote(temporary_hosts)} {shlex.quote(remote_known_hosts)}",
+            quiet=True,
+        )
+
+        script = r"""set -euo pipefail
+url=$1
+folder=$2
+key=$3
+known_hosts=$4
+author_name=$5
+author_email=$6
+root=/home/codex/envr
+target="$root/$folder"
+ssh_command="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+if [ ! -e "$target" ]; then
+    temporary="$root/.${folder}.clone.$$"
+    trap 'rm -rf -- "$temporary"' EXIT
+    GIT_SSH_COMMAND="$ssh_command" git clone -- "$url" "$temporary"
+    mv -- "$temporary" "$target"
+    trap - EXIT
+elif ! git -C "$target" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "existing path is not a Git repository: $target" >&2
+    exit 20
+fi
+origin=$(git -C "$target" remote get-url origin)
+if [ "$origin" != "$url" ]; then
+    echo "origin mismatch in $target: $origin" >&2
+    exit 21
+fi
+git -C "$target" config --local user.name "$author_name"
+git -C "$target" config --local user.email "$author_email"
+git -C "$target" config --local core.sshCommand "$ssh_command"
+"""
+        self.remote_script(
+            instance,
+            script,
+            (
+                str(repository["url"]),
+                folder,
+                remote_key,
+                remote_known_hosts,
+                str(repository["author_name"]),
+                str(repository["author_email"]),
+            ),
+            timeout=300,
+        )
+
+    def attach_codex(
+        self, instance: dict[str, Any], repository: dict[str, Any]
+    ) -> None:
+        folder = str(repository["folder"])
+        session = "codex-" + re.sub(r"[^A-Za-z0-9_-]", "-", str(repository["identity"]))
+        target = f"{REMOTE_ROOT}/{folder}"
+        codex_command = (
+            "if ! codex login status >/dev/null 2>&1; then "
+            "codex login --device-auth; fi; exec codex"
+        )
+        command = (
+            f"tmux has-session -t {shlex.quote(session)} 2>/dev/null || "
+            f"tmux new-session -d -s {shlex.quote(session)} "
+            f"-c {shlex.quote(target)} "
+            f"{shlex.quote(codex_command)}; "
+            f"exec tmux attach-session -t {shlex.quote(session)}"
+        )
+        print(f"Attaching to {folder}. Detach with Ctrl-b d.")
+        try:
+            self.remote_command(instance, command, tty=True, check=False)
+        finally:
+            try:
+                self.pull_auth(instance)
+            except EnvrError as error:
+                eprint(f"Warning: could not cache Codex authentication: {error}")
+
+    def up(
+        self, ram_gb: int, folder: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if ram_gb not in PLAN_IDS:
+            raise EnvrError("RAM must be one of: 1, 2, 4, 8")
+        ensure_commands(("git", "ssh", "scp", "ssh-keygen"))
+        repository = self.repository(folder)
+        api = self.api()
+        api.get("account")
+        instances = self.managed_instances(api)
+        if len(instances) > 1:
+            raise EnvrError(
+                f"conflict: {len(instances)} envr instances exist; "
+                "run envr status, then envr destroy"
+            )
+        if instances:
+            instance = instances[0]
+            current_ram = int(instance.get("ram", 0)) // 1024
+            if current_ram != ram_gb:
+                raise EnvrError(
+                    f"existing envr VPS has {current_ram} GB; requested {ram_gb} GB. "
+                    "Run envr destroy before changing size."
+                )
+            self.ensure_vps_key()
+            previous = self.state()
+            same_instance = previous.get("instance_id") == instance.get("id")
+            self.save_state(
+                {
+                    "schema": SCHEMA_VERSION,
+                    "instance_id": instance.get("id"),
+                    "ram_gb": current_ram,
+                    "region": instance.get("region"),
+                    "password_ready": (
+                        bool(previous.get("password_ready")) if same_instance else False
+                    ),
+                }
+            )
+            if instance.get("power_status") == "stopped":
+                api.request("POST", f"instances/{instance.get('id')}/start")
+            instance = self.wait_for_instance(api, str(instance.get("id")))
+            self.wait_for_ssh(instance)
+            self.wait_for_cloud_init(instance)
+            if not self.password_path.exists():
+                atomic_write_text(self.password_path, generate_password() + "\n")
+                current_state = self.state()
+                current_state["password_ready"] = False
+                self.save_state(current_state)
+            if not self.state().get("password_ready"):
+                self.set_root_password(instance)
+            if not self.pull_auth(instance):
+                self.install_cached_auth(instance)
+            self.ensure_remote_repository(instance, repository)
+        else:
+            self.verify_repository_access(
+                str(repository["url"]), Path(repository["private_key"])
+            )
+            instance = self.create_instance(api, ram_gb, repository)
+        return instance, repository
+
+    def status(self) -> int:
+        api = self.api()
+        account_response = api.get("account")
+        account = account_response.get("account")
+        if not isinstance(account, dict):
+            raise EnvrError("Vultr API returned invalid account information")
+        instances = self.managed_instances(api)
+        plans = self.plan_catalog(api)
+
+        balance = float(account.get("balance", 0))
+        pending = float(account.get("pending_charges", 0))
+        credit = available_prepaid_credit(balance, pending)
+        if balance < 0:
+            balance_text = f"${-balance:.2f} credit"
+        elif balance > 0:
+            balance_text = f"${balance:.2f} due"
+        else:
+            balance_text = "$0.00"
+        print("Vultr")
+        print(f"  Balance:          {balance_text}")
+        print(f"  Pending charges:  ${pending:.2f}")
+        print(f"  Available credit: ${credit:.2f}")
+
+        if len(instances) == 1:
+            plan = plans.get(str(instances[0].get("plan")), {})
+            hourly = float(plan.get("hourly_cost", 0) or 0)
+            if hourly > 0 and credit > 0:
+                days = credit / (hourly * 24)
+                print(
+                    f"  Credit runway:    about {days:.1f} days at ${hourly:.3f}/hour"
+                )
+            else:
+                print("  Credit runway:    n/a")
+        else:
+            print("  Credit runway:    n/a")
+
+        if not instances:
+            print("\nenvr-codex: not running")
+            return 0
+
+        conflict = len(instances) > 1
+        if conflict:
+            print(f"\nCONFLICT: {len(instances)} envr-managed instances are running")
+        state = self.state()
+        for instance in instances:
+            plan = plans.get(str(instance.get("plan")), {})
+            password = "unavailable locally"
+            if (
+                state.get("instance_id") == instance.get("id")
+                and state.get("password_ready")
+                and self.password_path.exists()
+            ):
+                password = self.password_path.read_text(encoding="utf-8").strip()
+            print(f"\n{LABEL}")
+            print(f"  ID:         {instance.get('id', '')}")
+            print(f"  Region:     {instance.get('region', '')}")
+            print(f"  RAM:        {int(instance.get('ram', 0)) // 1024} GB")
+            print(f"  CPU:        {instance.get('vcpu_count', '')}")
+            print(f"  IP:         {instance.get('main_ip', '')}")
+            print("  SSH user:   root")
+            print(f"  Password:   {password}")
+            print(f"  Status:     {instance.get('status', '')}")
+            print(f"  Power:      {instance.get('power_status', '')}")
+            hourly = plan.get("hourly_cost")
+            monthly = plan.get("monthly_cost")
+            if hourly is not None and monthly is not None:
+                print(f"  Price:      ${float(hourly):.3f}/hour · ${monthly}/month")
+            else:
+                print("  Price:      unavailable")
+        return 2 if conflict else 0
+
+    def port_open(self, port: int) -> None:
+        if not 1 <= port <= 65535:
+            raise EnvrError("port must be an integer from 1 through 65535")
+        ensure_commands(("ssh", "ssh-keygen"))
+        api = self.api()
+        instance = self.resolve_single_instance(api)
+        if instance is None:
+            raise EnvrError(
+                "envr-codex is not running. Start it with "
+                "envr up RAM REPOSITORY_FOLDER."
+            )
+        script = r"""set -euo pipefail
+port=$1
+sudo ufw allow "$port/tcp"
+sudo ufw allow "$port/udp"
+sudo ufw status | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"
+sudo ufw status | grep -Eq "^${port}/udp[[:space:]]+ALLOW"
+"""
+        self.remote_script(instance, script, (str(port),), timeout=60)
+        print(f"Opened port {port} (TCP and UDP) on envr-codex.")
+
+    def git_safety(self, instance: dict[str, Any]) -> list[tuple[str, str]]:
+        script = r"""set -u
+root=/home/codex/envr
+found=0
+for directory in "$root"/*; do
+    [ -d "$directory" ] || continue
+    if ! git -C "$directory" rev-parse --git-dir >/dev/null 2>&1; then
+        continue
+    fi
+    found=1
+    folder=${directory##*/}
+    if [ -n "$(git -C "$directory" status --porcelain 2>/dev/null)" ]; then
+        printf '%s\t%s\n' "$folder" "UNCOMMITTED"
+        continue
+    fi
+    if ! git -C "$directory" symbolic-ref -q HEAD >/dev/null 2>&1; then
+        printf '%s\t%s\n' "$folder" "DETACHED HEAD"
+        continue
+    fi
+    branches=$(git -C "$directory" for-each-ref \
+        --format='%(refname:short)|%(upstream:short)' refs/heads) || {
+            printf '%s\t%s\n' "$folder" "CHECK FAILED"
+            continue
+        }
+    missing_upstream=""
+    total_ahead=0
+    check_failed=0
+    while IFS='|' read -r branch upstream; do
+        [ -n "$branch" ] || continue
+        if [ -z "$upstream" ]; then
+            missing_upstream=$branch
+            break
+        fi
+        ahead=$(git -C "$directory" rev-list --count "$upstream..$branch" 2>/dev/null) || {
+            check_failed=1
+            break
+        }
+        total_ahead=$((total_ahead + ahead))
+    done <<EOF
+$branches
+EOF
+    if [ -n "$missing_upstream" ]; then
+        printf '%s\t%s\n' "$folder" "NO UPSTREAM ($missing_upstream)"
+    elif [ "$check_failed" -ne 0 ]; then
+        printf '%s\t%s\n' "$folder" "CHECK FAILED"
+    elif [ "$total_ahead" -gt 0 ]; then
+        printf '%s\t%s\n' "$folder" "$total_ahead UNPUSHED COMMITS"
+    else
+        printf '%s\t%s\n' "$folder" "clean and pushed"
+    fi
+done
+if [ "$found" -eq 0 ]; then
+    printf '%s\t%s\n' "(none)" "no repositories"
+fi
+"""
+        result = self.remote_script(
+            instance, script, capture=True, timeout=60, check=False
+        )
+        if result.returncode != 0:
+            return [("(check)", "CHECK FAILED")]
+        rows = []
+        for line in result.stdout.splitlines():
+            if "\t" in line:
+                folder, status = line.split("\t", 1)
+                rows.append((folder, status))
+        return rows or [("(check)", "CHECK FAILED")]
+
+    def delete_instance(self, api: VultrAPI, instance: dict[str, Any]) -> None:
+        instance_id = str(instance.get("id", ""))
+        if not instance_id:
+            raise EnvrError("cannot delete instance without an ID")
+        api.delete(f"instances/{instance_id}")
+        deadline = time.monotonic() + DELETE_TIMEOUT
+        while time.monotonic() < deadline:
+            instances = self.managed_instances(api)
+            if not any(item.get("id") == instance_id for item in instances):
+                self.remove_known_host(str(instance.get("main_ip", "")))
+                return
+            time.sleep(3)
+        raise EnvrError(f"Vultr did not confirm deletion of {instance_id}")
+
+    def remove_known_host(self, ip: str) -> None:
+        if not ip or not self.vps_known_hosts.exists():
+            return
+        ensure_commands(("ssh-keygen",))
+        run(
+            ["ssh-keygen", "-q", "-R", ip, "-f", str(self.vps_known_hosts)],
+            check=False,
+            quiet=True,
+        )
+
+    def cleanup_failed_instance(
+        self, api: VultrAPI, instance: dict[str, Any]
+    ) -> None:
+        try:
+            self.delete_instance(api, instance)
+        except EnvrError as error:
+            raise EnvrError(
+                f"failed deployment remains billable: ID={instance.get('id')} "
+                f"IP={instance.get('main_ip')}: {error}"
+            ) from error
+        self.clear_instance_state()
+
+    def destroy(self) -> None:
+        ensure_commands(("ssh", "scp", "ssh-keygen"))
+        api = self.api()
+        instances = self.managed_instances(api)
+        if not instances:
+            print("envr-codex: not running")
+            self.clear_instance_state()
+            return
+
+        state_id = self.state().get("instance_id")
+        instances.sort(key=lambda item: item.get("id") == state_id)
+        auth_ok = True
+        summaries: list[tuple[dict[str, Any], list[tuple[str, str]]]] = []
+        for instance in instances:
+            try:
+                self.wait_for_ssh(instance)
+                if not self.pull_auth(instance):
+                    auth_ok = False
+                safety = self.git_safety(instance)
+            except (EnvrError, subprocess.TimeoutExpired):
+                auth_ok = False
+                safety = [("(connection)", "CHECK FAILED")]
+            summaries.append((instance, safety))
+
+        print("\nRepository safety:")
+        unsafe = False
+        for instance, rows in summaries:
+            if len(instances) > 1:
+                print(
+                    f"  Instance {instance.get('id')} ({instance.get('main_ip')}):"
+                )
+                indent = "    "
+            else:
+                indent = "  "
+            width = max((len(folder) for folder, _ in rows), default=1)
+            for folder, status in rows:
+                print(f"{indent}{folder:<{width}}  {status}")
+                if status not in {"clean and pushed", "no repositories"}:
+                    unsafe = True
+
+        if not auth_ok:
+            print("\nWarning: the newest Codex authentication could not be preserved.")
+        if unsafe:
+            print("\nSome work may be permanently lost.")
+        else:
+            print("\nAll repositories are committed and pushed.")
+        if len(instances) > 1:
+            print(
+                f"Warning: {len(instances)} conflicting envr instances will be destroyed."
+            )
+        confirmation = "Destroy envr VPS permanently?"
+        if not auth_ok or unsafe:
+            confirmation = "Destroy permanently despite the warnings above?"
+        if not prompt_yes_no(confirmation):
+            print("Cancelled.")
+            return
+
+        failures = []
+        for instance in instances:
+            try:
+                self.delete_instance(api, instance)
+                print(f"Deleted {instance.get('id')}.")
+            except EnvrError as error:
+                failures.append(str(error))
+        if failures:
+            raise EnvrError("; ".join(failures))
+        self.clear_instance_state()
+        print("envr-codex destroyed; compute billing has stopped.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="envr", description="Disposable Vultr Codex environment"
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("git", help="configure one Git repository")
+
+    up = subparsers.add_parser("up", help="create or reconnect to the VPS")
+    up.add_argument("ram", type=int, choices=sorted(PLAN_IDS))
+    up.add_argument("repository_folder")
+
+    subparsers.add_parser("status", help="show account and VPS status")
+
+    port_open = subparsers.add_parser("port-open", help="open one TCP/UDP port")
+    port_open.add_argument("port", type=int)
+
+    subparsers.add_parser("destroy", help="check work and destroy the VPS")
+    return parser
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    if sys.version_info < (3, 10):
+        eprint("envr requires Python 3.10 or newer")
+        return 1
+    parser = build_parser()
+    namespace = parser.parse_args(arguments)
+    app = Envr()
+    try:
+        attachment: tuple[dict[str, Any], dict[str, Any]] | None = None
+        with exclusive_lock(app.root):
+            if namespace.command == "git":
+                app.configure_git()
+                return 0
+            if namespace.command == "up":
+                attachment = app.up(namespace.ram, namespace.repository_folder)
+            elif namespace.command == "status":
+                return app.status()
+            elif namespace.command == "port-open":
+                app.port_open(namespace.port)
+                return 0
+            elif namespace.command == "destroy":
+                app.destroy()
+                return 0
+        if attachment is not None:
+            app.attach_codex(*attachment)
+            return 0
+    except KeyboardInterrupt:
+        eprint("\nenvr: interrupted")
+        return 130
+    except (EnvrError, subprocess.TimeoutExpired) as error:
+        eprint(f"envr: error: {error}")
+        return 1
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,5 +1,6 @@
 # envr runtime secrets and state when the source checkout is also ~/envr
 /api
+/client-id
 /instance-password
 /repos.json
 /state.json

@@ -4,7 +4,8 @@
 VPS from Android Termux. It prepares Git repositories, persistent tmux
 sessions, Codex authentication, development tools, and safe instance cleanup.
 
-Status: requirements finalized; implementation and live testing pending.
+Status: implemented and locally tested; one funded-account Vultr validation
+cycle remains before calling it production-ready.
 
 ## Interface
 
@@ -60,9 +61,20 @@ Before deletion, `envr` preserves refreshed Codex credentials and reports
 uncommitted changes, unpushed commits, missing upstreams, and detached branches
 for every repository on the VPS.
 
+## Install
+
+From this checkout:
+
+```bash
+sh install.sh
+```
+
+On Termux, the installer supplies Python, Git, and OpenSSH when needed and
+places `envr` in `$PREFIX/bin`. Linux and macOS use `~/.local/bin`.
+
 ## Implementation
 
-The client will use Python 3.10 or newer with the standard library only. A
+The client uses Python 3.10 or newer with the standard library only. A
 small POSIX installer handles local Python, Git, and OpenSSH prerequisites.
 Termux is the primary client; Linux and macOS are secondary supported Unix
 clients.
@@ -81,3 +93,11 @@ The VPS is hardened during its initial cloud-init run. Later `envr` commands do
 not reset its firewall. Automatic backups, snapshots, and additional storage
 are not used, and confirmed instance destruction removes transient local
 credentials.
+
+## Local verification
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -Wall -m py_compile envr tests/test_envr.py
+sh -n install.sh
+```

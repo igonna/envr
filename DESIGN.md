@@ -1,6 +1,6 @@
 # envr working design
 
-Status: requirements finalized; implementation and live validation pending.
+Status: implemented and locally tested; funded-account live validation pending.
 
 ## Implementation choice
 
@@ -218,6 +218,7 @@ user's primary SSH key does not need to be copied to a VPS.
 ```text
 ~/envr/
 ├── api
+├── client-id
 ├── codex/
 │   └── auth.json
 ├── git/
@@ -243,6 +244,10 @@ storage, Git, messaging applications, email, or cloud notes.
 `repos.json` records repository SSH URLs, derived folder names, local key
 paths, and repository-local Git author names/emails. It contains no
 credentials.
+
+`client-id` is a stable random identifier used only to derive this
+installation's unique Vultr management tag. It persists across destroyed
+instances so commands never adopt another envr installation's VPS.
 
 ## `up` command grammar
 
@@ -611,8 +616,9 @@ The account summary appears first:
 
 ```text
 Vultr
-  Balance:          $18.42
+  Balance:          $20.00 credit
   Pending charges:  $1.58
+  Available credit: $18.42
   Credit runway:    about 26 days at $0.027/hour
 ```
 
@@ -631,10 +637,12 @@ envr-codex
   Price:    $0.027/hour · $20/month
 ```
 
-Pricing comes from the current Vultr plan catalog. Credit runway is only an
-estimate based on prepaid credit and current compute price; it cannot measure
-the spending capacity of a linked payment card and excludes taxes and
-overages.
+Pricing comes from the current Vultr plan catalog. Vultr represents prepaid
+credit as a negative API balance, so `envr` converts that sign and subtracts
+pending charges for the user-facing available-credit figure. Credit runway is
+only an estimate based on that remaining prepaid credit and current compute
+price; it cannot measure the spending capacity of a linked payment card and
+excludes taxes and overages.
 
 Before each VPS creation, `envr` generates a new cryptographically random
 16-character alphanumeric root password. Alphanumeric output is used so it can
