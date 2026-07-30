@@ -70,6 +70,13 @@ asks for it explicitly in the controlling terminal without an SSH probe
 timeout. Trusted-device synchronization remains a passwordless alternative;
 the Vultr web console can provide the password as a manual fallback.
 
+After any key-authorized connection, envr creates or retrieves one strong
+per-VPS recovery password, sets it for root through `chpasswd` standard input,
+and stores it mode `600` both on the VPS and connected client. Thus envr no
+longer depends on Vultr continuing to expose its original provisioning
+password. A new client may enter the recovery password once to install its
+public key; later connections remain key-only.
+
 Removing a device key from the Vultr account prevents it from being included
 in future VPS instances. A key already installed on a running VPS must also be
 removed there, or the disposable VPS can simply be destroyed and recreated.
@@ -371,10 +378,11 @@ Stopping is not exposed because Vultr continues billing stopped instances.
 - Repository keys are dedicated credentials, not the user’s primary SSH key.
 - Git-host access occurs only from the VPS. Its first Git host key is accepted
   into a VPS-local known-hosts file; changed keys are rejected thereafter.
-- When available, the provider default password is used only for fallback
-  access and one-time device enrollment. Temporary askpass files are mode
-  `600` and deleted immediately. Normal SSH probes are key-only and
-  noninteractive.
+- When available, the provider default password is used only before envr
+  establishes its per-VPS recovery password. Recovery passwords are
+  transferred only through SSH standard input, cached mode `600`, and used for
+  one-time device enrollment. Temporary askpass files are mode `600` and
+  deleted immediately. Normal SSH probes are key-only and noninteractive.
 - Password login and direct root login remain enabled intentionally for
   cross-device recovery. UFW, fail2ban, short VPS lifetime, and a strong
   provider password reduce but do not eliminate Internet-facing risk.

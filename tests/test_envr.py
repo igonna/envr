@@ -356,6 +356,8 @@ class LifecycleLogicTests(unittest.TestCase):
             app.wait_for_ssh = mock.Mock()
             app.wait_for_cloud_init = mock.Mock()
             app.ensure_remote_runtime = mock.Mock()
+            app.ensure_recovery_password = mock.Mock()
+            app.record_successful_connection = mock.Mock()
             app.install_cached_auth = mock.Mock()
             app.ensure_remote_repository = mock.Mock()
             api = mock.Mock()
@@ -512,6 +514,32 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(cached["main_ip"], "192.0.2.10")
             self.assertEqual(app.state()["main_ip"], "192.0.2.10")
 
+    def test_successful_connection_durably_records_ssh_first_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            envr.atomic_write_text(app.vps_key, "private-key")
+            envr.atomic_write_text(app.vps_public_key, "public-key")
+            envr.atomic_write_text(
+                app.vps_known_hosts,
+                "192.0.2.10 ssh-ed25519 AAAATRUSTED\n",
+            )
+
+            app.record_successful_connection(
+                {
+                    "id": "instance-id",
+                    "main_ip": "192.0.2.10",
+                    "ram": 1024,
+                    "region": "fra",
+                }
+            )
+
+            cached = app.cached_instance(1)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["main_ip"], "192.0.2.10")
+            self.assertEqual(app.state()["instance_id"], "instance-id")
+            self.assertEqual(app.vps_key.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(app.vps_known_hosts.stat().st_mode & 0o777, 0o600)
+
     def test_authorized_device_syncs_all_registered_device_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -604,6 +632,71 @@ class LifecycleLogicTests(unittest.TestCase):
             prompt.assert_called_once()
             self.assertEqual(app.password_path.read_text(), "TypedPassword123\n")
             self.assertFalse(any(app.root.glob(".askpass*")))
+
+    def test_recovery_password_is_synchronized_without_command_exposure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+            app.remote_command = mock.Mock(
+                side_effect=[
+                    SimpleNamespace(
+                        returncode=0,
+                        stdout="SharedRecoveryPassword123\n",
+                        stderr="",
+                    ),
+                    completed,
+                    completed,
+                ]
+            )
+            instance = {"id": "instance-id", "main_ip": "192.0.2.10"}
+
+            app.ensure_recovery_password(instance)
+
+            calls = app.remote_command.call_args_list
+            self.assertEqual(
+                calls[1].kwargs["input_data"],
+                "root:SharedRecoveryPassword123\n",
+            )
+            self.assertEqual(
+                calls[2].kwargs["input_data"],
+                "SharedRecoveryPassword123\n",
+            )
+            for call in calls:
+                self.assertNotIn(
+                    "SharedRecoveryPassword123",
+                    " ".join(str(argument) for argument in call.args),
+                )
+            self.assertEqual(
+                app.password_path.read_text(),
+                "SharedRecoveryPassword123\n",
+            )
+            self.assertEqual(app.password_path.stat().st_mode & 0o777, 0o600)
+
+    def test_recovery_password_is_generated_once_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.save_state({"instance_id": "instance-id", "ram_gb": 1})
+            app.generate_recovery_password = mock.Mock(
+                return_value="GeneratedRecoveryPassword1"
+            )
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+            app.remote_command = mock.Mock(
+                side_effect=[
+                    SimpleNamespace(returncode=1, stdout="", stderr=""),
+                    completed,
+                    completed,
+                ]
+            )
+
+            app.ensure_recovery_password(
+                {"id": "instance-id", "main_ip": "192.0.2.10"}
+            )
+
+            app.generate_recovery_password.assert_called_once()
+            self.assertEqual(
+                app.password_path.read_text(),
+                "GeneratedRecoveryPassword1\n",
+            )
 
     def test_destroy_can_confirm_after_unreachable_ssh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -703,6 +796,8 @@ class LifecycleLogicTests(unittest.TestCase):
             app.ensure_device_access = mock.Mock()
             app.wait_for_cloud_init = mock.Mock()
             app.ensure_remote_runtime = mock.Mock()
+            app.ensure_recovery_password = mock.Mock()
+            app.record_successful_connection = mock.Mock()
             app.ensure_remote_repository = mock.Mock()
 
             def synchronize(_instance: dict[str, object]) -> bool:
@@ -754,6 +849,8 @@ class LifecycleLogicTests(unittest.TestCase):
             app.ensure_device_access = mock.Mock()
             app.wait_for_cloud_init = mock.Mock()
             app.ensure_remote_runtime = mock.Mock()
+            app.ensure_recovery_password = mock.Mock()
+            app.record_successful_connection = mock.Mock()
             app.sync_from_server = mock.Mock(return_value=False)
             app.install_cached_auth = mock.Mock()
             app.ensure_remote_repository = mock.Mock()

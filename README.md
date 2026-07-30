@@ -78,8 +78,14 @@ securely synchronizes all registered envr public keys. On connection, the new
 device immediately receives the current repository configuration, dedicated
 Git keys, and Codex auth cache from the VPS.
 
-Inspect the Vultr account, instance, live price, IP, and Vultr-generated
-fallback root password:
+Every successful `up` also establishes one strong recovery password for that
+VPS, synchronizes it to the connected device with mode `600`, and durably
+records the IP, device key, and trusted SSH host key. An authorized device can
+show the recovery password with `envr status`; a new device enters it once,
+then all later connections are key-only and can proceed without the Vultr API.
+
+Inspect the Vultr account, instance, live price, IP, and envr-managed recovery
+root password:
 
 ```bash
 envr status

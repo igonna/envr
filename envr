@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -40,6 +40,7 @@ REMOTE_HOME = f"/home/{REMOTE_USER}"
 REMOTE_ROOT = f"{REMOTE_HOME}/envr"
 REMOTE_CONFIG_ROOT = f"{REMOTE_HOME}/.config/envr"
 REMOTE_REPOS = f"{REMOTE_CONFIG_ROOT}/repos.json"
+REMOTE_RECOVERY_PASSWORD = f"{REMOTE_CONFIG_ROOT}/recovery-password"
 REGIONS = ("fra", "ams", "waw")
 PLAN_IDS = {
     1: "vc2-1c-1gb",
@@ -1046,9 +1047,11 @@ runcmd:
 
             try:
                 self.ensure_remote_runtime(active)
+                self.ensure_recovery_password(active)
                 self.install_cached_auth(active)
                 if repository is not None:
                     self.ensure_remote_repository(active, repository)
+                self.record_successful_connection(active)
             except (EnvrError, subprocess.TimeoutExpired) as error:
                 raise EnvrError(
                     f"VPS {active.get('id')} is running and billable, but "
@@ -1153,6 +1156,92 @@ runcmd:
                 "device from an already-connected device or the Vultr console"
             )
         return password
+
+    @staticmethod
+    def valid_recovery_password(password: str) -> bool:
+        return (
+            16 <= len(password) <= 128
+            and ":" not in password
+            and not any(
+                character.isspace() or ord(character) < 32
+                for character in password
+            )
+        )
+
+    def generate_recovery_password(self) -> str:
+        alphabet = (
+            "ABCDEFGHJKLMNPQRSTUVWXYZ"
+            "abcdefghijkmnopqrstuvwxyz"
+            "23456789"
+            "@#%+=_,.-"
+        )
+        return "".join(secrets.choice(alphabet) for _ in range(24))
+
+    def ensure_recovery_password(self, instance: dict[str, Any]) -> None:
+        result = self.remote_command(
+            instance,
+            f"test -s {shlex.quote(REMOTE_RECOVERY_PASSWORD)} && "
+            f"cat {shlex.quote(REMOTE_RECOVERY_PASSWORD)}",
+            capture=True,
+            check=False,
+            quiet=True,
+            timeout=30,
+        )
+        password = result.stdout.strip() if result.returncode == 0 else ""
+        if password and not self.valid_recovery_password(password):
+            raise EnvrError("the VPS recovery password cache is invalid")
+        if not password:
+            password = ""
+            if (
+                self.state().get("instance_id") == instance.get("id")
+                and self.password_path.is_file()
+            ):
+                password = self.password_path.read_text(encoding="utf-8").strip()
+            if not self.valid_recovery_password(password):
+                password = self.generate_recovery_password()
+
+        self.remote_command(
+            instance,
+            "sudo chpasswd",
+            input_data=f"root:{password}\n",
+            quiet=True,
+            timeout=30,
+        )
+        store_command = (
+            f"install -d -m 700 {shlex.quote(REMOTE_CONFIG_ROOT)} && "
+            f"temporary=$(mktemp {shlex.quote(REMOTE_CONFIG_ROOT)}/"
+            ".recovery-password.XXXXXX) && "
+            "trap 'rm -f \"$temporary\"' EXIT && "
+            "cat > \"$temporary\" && chmod 600 \"$temporary\" && "
+            f"mv -f \"$temporary\" {shlex.quote(REMOTE_RECOVERY_PASSWORD)} && "
+            "trap - EXIT"
+        )
+        self.remote_command(
+            instance,
+            store_command,
+            input_data=password + "\n",
+            quiet=True,
+            timeout=30,
+        )
+        atomic_write_text(self.password_path, password + "\n")
+
+    def record_successful_connection(self, instance: dict[str, Any]) -> None:
+        self.save_instance_state(instance)
+        for path, mode in (
+            (self.vps_key, 0o600),
+            (self.vps_public_key, 0o600),
+            (self.vps_known_hosts, 0o600),
+        ):
+            if not path.is_file():
+                raise EnvrError(f"successful SSH connection was not cached: {path}")
+            path.chmod(mode)
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        fsync_directory(self.root)
+        fsync_directory(self.ssh_root)
 
     def enroll_device_key(
         self, api: VultrAPI, instance: dict[str, Any]
@@ -1767,12 +1856,14 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         self.wait_for_cloud_init(instance)
         self.ensure_remote_runtime(instance)
+        self.ensure_recovery_password(instance)
         synchronized = self.sync_from_server(instance)
         if not synchronized:
             self.install_cached_auth(instance)
         repository = self.repository(folder) if folder is not None else None
         if repository is not None:
             self.ensure_remote_repository(instance, repository)
+        self.record_successful_connection(instance)
         return instance, repository
 
     def up(
