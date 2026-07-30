@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -1324,12 +1324,39 @@ runcmd:
     ) -> None:
         public_key = self.ensure_vps_key()
         self.ensure_vultr_ssh_key(api, public_key)
-        result = self.remote_command(
-            instance, "true", check=False, quiet=True, timeout=15
-        )
+        try:
+            result = self.remote_command(
+                instance, "true", check=False, quiet=True, timeout=15
+            )
+        except subprocess.TimeoutExpired as error:
+            raise EnvrError(
+                f"SSH at {instance.get('main_ip')} is unreachable from the "
+                "current network; the device key remains installed. Check "
+                "the network or reconnect the VPN"
+            ) from error
         if result.returncode == 0:
             self.sync_managed_device_keys(api, instance)
             return
+        failure = (result.stderr or "").lower()
+        authentication_failed = any(
+            marker in failure
+            for marker in (
+                "permission denied",
+                "authentication failed",
+                "no supported authentication methods",
+                "too many authentication failures",
+            )
+        )
+        if not authentication_failed:
+            if "host identification has changed" in failure:
+                raise EnvrError(
+                    "the VPS SSH host key changed; refusing to connect"
+                )
+            raise EnvrError(
+                f"SSH at {instance.get('main_ip')} is unreachable from the "
+                "current network; the device key remains installed. Check "
+                "the network or reconnect the VPN"
+            )
         print("Authorizing this device on the running VPS...")
         self.enroll_device_key(api, instance)
         result = self.remote_command(

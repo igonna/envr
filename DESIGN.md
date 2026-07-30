@@ -77,6 +77,11 @@ longer depends on Vultr continuing to expose its original provisioning
 password. A new client may enter the recovery password once to install its
 public key; later connections remain key-only.
 
+SSH exit code `255` is ambiguous. envr treats only explicit authentication
+messages such as `Permission denied` as authority to start password enrollment.
+Timeouts, refused or filtered connections, routing failures, and changed host
+keys never trigger a password prompt.
+
 Removing a device key from the Vultr account prevents it from being included
 in future VPS instances. A key already installed on a running VPS must also be
 removed there, or the disposable VPS can simply be destroyed and recreated.

@@ -582,6 +582,57 @@ class LifecycleLogicTests(unittest.TestCase):
             app.sync_managed_device_keys.assert_called_once_with(api, instance)
             self.assertEqual(app.remote_command.call_args.kwargs["timeout"], 15)
 
+    def test_network_ssh_failure_never_requests_password_enrollment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.ensure_vps_key = mock.Mock(return_value="ssh-ed25519 AAAATEST")
+            app.ensure_vultr_ssh_key = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(
+                    returncode=255,
+                    stdout="",
+                    stderr="ssh: connect to host 192.0.2.10 port 22: timed out",
+                )
+            )
+            app.enroll_device_key = mock.Mock()
+
+            with self.assertRaisesRegex(
+                envr.EnvrError,
+                "unreachable from the current network",
+            ):
+                app.ensure_device_access(
+                    mock.Mock(),
+                    {"id": "instance-id", "main_ip": "192.0.2.10"},
+                )
+
+            app.enroll_device_key.assert_not_called()
+
+    def test_explicit_key_rejection_can_enroll_device_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.ensure_vps_key = mock.Mock(return_value="ssh-ed25519 AAAATEST")
+            app.ensure_vultr_ssh_key = mock.Mock()
+            app.remote_command = mock.Mock(
+                side_effect=[
+                    SimpleNamespace(
+                        returncode=255,
+                        stdout="",
+                        stderr="remote@192.0.2.10: Permission denied (publickey).",
+                    ),
+                    SimpleNamespace(returncode=0, stdout="", stderr=""),
+                ]
+            )
+            app.enroll_device_key = mock.Mock()
+            app.sync_managed_device_keys = mock.Mock()
+            api = mock.Mock()
+            instance = {"id": "instance-id", "main_ip": "192.0.2.10"}
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                app.ensure_device_access(api, instance)
+
+            app.enroll_device_key.assert_called_once_with(api, instance)
+            app.sync_managed_device_keys.assert_called_once_with(api, instance)
+
     def test_device_enrollment_keeps_password_out_of_command_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
