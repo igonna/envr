@@ -56,17 +56,19 @@ when a new device joins a running VPS:
 ```text
 find VPS through Vultr API
 → try the device key
-→ retrieve the instance default password from Vultr
-→ accept and record a previously unseen VPS SSH host key
-→ use a temporary SSH askpass file to authenticate as root
-→ append only the device public key to remote authorized_keys
-→ delete the temporary password/helper files
+→ fail immediately without an interactive password prompt if unauthorized
+→ register the device public key in the Vultr account
+→ run envr up once from an already-authorized device
+→ synchronize every registered envr public key to remote authorized_keys
 → reconnect as remote with the device key
 ```
 
-The password never appears in a process argument or log. If Vultr does not
-return it, a device that already has server access or the Vultr web console
-must authorize the new device.
+If Vultr supplies the instance default password through its API, envr can
+instead enroll the device directly through a temporary SSH askpass file. The
+password never appears in a process argument or log. If Vultr omits it, envr
+asks for it explicitly in the controlling terminal without an SSH probe
+timeout. Trusted-device synchronization remains a passwordless alternative;
+the Vultr web console can provide the password as a manual fallback.
 
 Removing a device key from the Vultr account prevents it from being included
 in future VPS instances. A key already installed on a running VPS must also be
@@ -80,6 +82,13 @@ authentication. It stores a portable manifest at:
 ```text
 /home/remote/.config/envr/repos.json
 ```
+
+After a successful connection, the client caches the instance ID, IP, RAM,
+region, SSH host key, and its device key. Later `up` calls first try that exact
+IP with strict host-key checking and key-only authentication. A successful
+cached SSH connection proceeds even if the Vultr API is unavailable. A short,
+best-effort API request may add newly registered envr device public keys to the
+server, but failure never blocks the established SSH session.
 
 For every repository, the manifest contains:
 
@@ -357,9 +366,10 @@ Stopping is not exposed because Vultr continues billing stopped instances.
 - Repository keys are dedicated credentials, not the user’s primary SSH key.
 - Git-host access occurs only from the VPS. Its first Git host key is accepted
   into a VPS-local known-hosts file; changed keys are rejected thereafter.
-- The provider default password is used only for fallback access and one-time
-  device enrollment. Temporary askpass files are mode `600` and deleted
-  immediately.
+- When available, the provider default password is used only for fallback
+  access and one-time device enrollment. Temporary askpass files are mode
+  `600` and deleted immediately. Normal SSH probes are key-only and
+  noninteractive.
 - Password login and direct root login remain enabled intentionally for
   cross-device recovery. UFW, fail2ban, short VPS lifetime, and a strong
   provider password reduce but do not eliminate Internet-facing risk.

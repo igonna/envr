@@ -9,6 +9,7 @@ import contextlib
 import fcntl
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -358,9 +359,13 @@ class VultrAPI:
         return decoded or str(fallback)
 
     def get(
-        self, resource: str, *, query: dict[str, str | int] | None = None
+        self,
+        resource: str,
+        *,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
     ) -> dict[str, Any]:
-        return self.request("GET", resource, query=query)
+        return self.request("GET", resource, query=query, timeout=timeout)
 
     def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", resource, payload=payload)
@@ -445,6 +450,74 @@ class Envr:
     def save_state(self, value: dict[str, Any]) -> None:
         value["schema"] = SCHEMA_VERSION
         atomic_write_json(self.state_path, value)
+
+    def save_instance_state(
+        self,
+        instance: dict[str, Any],
+        *,
+        ram_gb: int | None = None,
+        region: str | None = None,
+    ) -> None:
+        instance_id = str(instance.get("id") or "")
+        if not instance_id:
+            raise EnvrError("cannot cache an instance without an ID")
+        existing = self.state()
+        if existing.get("instance_id") != instance_id:
+            existing = {}
+        main_ip = str(instance.get("main_ip") or existing.get("main_ip") or "")
+        value: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "instance_id": instance_id,
+            "ram_gb": (
+                ram_gb
+                if ram_gb is not None
+                else int(instance.get("ram") or 0) // 1024
+            ),
+            "region": region or instance.get("region") or existing.get("region"),
+        }
+        if main_ip and main_ip != "0.0.0.0":
+            try:
+                address = ipaddress.ip_address(main_ip)
+            except ValueError as error:
+                raise EnvrError("Vultr returned an invalid instance IP address") from error
+            if address.version != 4:
+                raise EnvrError("envr requires a public IPv4 address")
+            value["main_ip"] = main_ip
+        self.save_state(value)
+        password = str(instance.get("default_password") or "").strip()
+        if password:
+            atomic_write_text(self.password_path, password + "\n")
+
+    def cached_instance(self, ram_gb: int) -> dict[str, Any] | None:
+        state = self.state()
+        instance_id = str(state.get("instance_id") or "")
+        main_ip = str(state.get("main_ip") or "")
+        try:
+            cached_ram_gb = int(state.get("ram_gb") or 0)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not instance_id
+            or not main_ip
+            or cached_ram_gb != ram_gb
+            or not self.vps_key.is_file()
+            or not self.vps_known_hosts.is_file()
+        ):
+            return None
+        try:
+            address = ipaddress.ip_address(main_ip)
+        except ValueError:
+            return None
+        if address.version != 4:
+            return None
+        return {
+            "id": instance_id,
+            "main_ip": main_ip,
+            "ram": ram_gb * 1024,
+            "region": state.get("region"),
+            "status": "active",
+            "power_status": "running",
+        }
 
     def clear_instance_state(self) -> None:
         with contextlib.suppress(FileNotFoundError):
@@ -657,9 +730,9 @@ class Envr:
         return str(created["id"])
 
     def managed_vultr_ssh_keys(
-        self, api: VultrAPI
+        self, api: VultrAPI, *, timeout: int = 30
     ) -> list[dict[str, Any]]:
-        response = api.get("ssh-keys", query={"per_page": 500})
+        response = api.get("ssh-keys", query={"per_page": 500}, timeout=timeout)
         keys = response.get("ssh_keys")
         if not isinstance(keys, list):
             raise EnvrError("Vultr API returned an invalid SSH-key list")
@@ -706,14 +779,7 @@ class Envr:
                 return None
             raise EnvrError("envr-codex is not running")
         instance = instances[0]
-        self.save_state(
-            {
-                "schema": SCHEMA_VERSION,
-                "instance_id": instance.get("id"),
-                "ram_gb": int(instance.get("ram", 0)) // 1024,
-                "region": instance.get("region"),
-            }
-        )
+        self.save_instance_state(instance)
         return instance
 
     def plan_catalog(self, api: VultrAPI) -> dict[str, dict[str, Any]]:
@@ -927,14 +993,7 @@ runcmd:
                 else:
                     raise
 
-            self.save_state(
-                {
-                    "schema": SCHEMA_VERSION,
-                    "instance_id": instance["id"],
-                    "ram_gb": ram_gb,
-                    "region": region,
-                }
-            )
+            self.save_instance_state(instance, ram_gb=ram_gb, region=region)
             try:
                 active = self.wait_for_instance(api, str(instance["id"]))
                 self.wait_for_ssh(active)
@@ -985,14 +1044,7 @@ runcmd:
                     and ip
                     and ip != "0.0.0.0"
                 ):
-                    self.save_state(
-                        {
-                            "schema": SCHEMA_VERSION,
-                            "instance_id": instance_id,
-                            "ram_gb": int(instance.get("ram", 0)) // 1024,
-                            "region": instance.get("region"),
-                        }
-                    )
+                    self.save_instance_state(instance)
                     return instance
             time.sleep(5)
         status = (
@@ -1000,7 +1052,12 @@ runcmd:
         ) if last else "unknown"
         raise EnvrError(f"instance did not become active (last status: {status})")
 
-    def ssh_options(self, *, connect_timeout: int = SSH_CONNECT_TIMEOUT) -> list[str]:
+    def ssh_options(
+        self,
+        *,
+        connect_timeout: int = SSH_CONNECT_TIMEOUT,
+        strict_host_key_checking: str = "accept-new",
+    ) -> list[str]:
         ensure_private_dir(self.vps_known_hosts.parent)
         self.vps_known_hosts.touch(mode=0o600, exist_ok=True)
         self.vps_known_hosts.chmod(0o600)
@@ -1010,7 +1067,9 @@ runcmd:
             "-o",
             "IdentitiesOnly=yes",
             "-o",
-            "StrictHostKeyChecking=accept-new",
+            "BatchMode=yes",
+            "-o",
+            f"StrictHostKeyChecking={strict_host_key_checking}",
             "-o",
             f"UserKnownHostsFile={self.vps_known_hosts}",
             "-o",
@@ -1059,7 +1118,20 @@ runcmd:
     def enroll_device_key(
         self, api: VultrAPI, instance: dict[str, Any]
     ) -> None:
-        password = self.instance_password(api, instance)
+        try:
+            password = self.instance_password(api, instance)
+        except EnvrError:
+            if not sys.stdin.isatty():
+                raise EnvrError(
+                    "this device key is not authorized on the running VPS; "
+                    "retry interactively with the root SSH password, or run "
+                    "envr up once from an already-authorized device"
+                ) from None
+            password = getpass.getpass(
+                f"Root SSH password for {instance.get('main_ip')}: "
+            ).strip()
+            if not password:
+                raise EnvrError("root SSH password cannot be empty") from None
         public_key = self.ensure_vps_key()
         self.ensure_layout()
         secret_fd, secret_name = tempfile.mkstemp(
@@ -1111,6 +1183,7 @@ runcmd:
                 command,
             ]
             run(ssh, env=environment, quiet=True, timeout=60)
+            atomic_write_text(self.password_path, password + "\n")
         finally:
             with contextlib.suppress(FileNotFoundError):
                 secret_path.unlink()
@@ -1127,6 +1200,7 @@ runcmd:
             instance, "true", check=False, quiet=True, timeout=15
         )
         if result.returncode == 0:
+            self.sync_managed_device_keys(api, instance)
             return
         print("Authorizing this device on the running VPS...")
         self.enroll_device_key(api, instance)
@@ -1135,6 +1209,63 @@ runcmd:
         )
         if result.returncode != 0:
             raise EnvrError("the device SSH key was installed but login still failed")
+        self.sync_managed_device_keys(api, instance)
+
+    def sync_managed_device_keys(
+        self,
+        api: VultrAPI,
+        instance: dict[str, Any],
+        *,
+        api_timeout: int = 30,
+    ) -> None:
+        public_keys: list[str] = []
+        for key in self.managed_vultr_ssh_keys(api, timeout=api_timeout):
+            public_key = str(key.get("ssh_key") or "").strip()
+            if (
+                not public_key
+                or "\n" in public_key
+                or "\r" in public_key
+                or not public_key.startswith(("ssh-", "ecdsa-", "sk-"))
+            ):
+                raise EnvrError("Vultr returned an invalid managed SSH public key")
+            public_keys.append(public_key)
+        if not public_keys:
+            return
+        encoded_keys = base64.b64encode(
+            ("\n".join(public_keys) + "\n").encode()
+        ).decode()
+        script = r"""set -euo pipefail
+install -d -m 700 "$HOME/.ssh"
+touch "$HOME/.ssh/authorized_keys"
+chmod 600 "$HOME/.ssh/authorized_keys"
+printf '%s' "$1" | base64 -d | while IFS= read -r key; do
+    test -n "$key" || continue
+    grep -qxF "$key" "$HOME/.ssh/authorized_keys" ||
+        printf '%s\n' "$key" >> "$HOME/.ssh/authorized_keys"
+done
+"""
+        self.remote_script(
+            instance,
+            script,
+            [encoded_keys],
+            quiet=True,
+            timeout=30,
+        )
+
+    def try_cached_device_key_sync(self, instance: dict[str, Any]) -> None:
+        if not self.token_path.is_file():
+            return
+        try:
+            token = self.token_path.read_text(encoding="utf-8").strip()
+            if not token:
+                return
+            self.sync_managed_device_keys(
+                VultrAPI(token),
+                instance,
+                api_timeout=5,
+            )
+        except (OSError, EnvrError, subprocess.TimeoutExpired):
+            return
 
     def remote_command(
         self,
@@ -1147,8 +1278,16 @@ runcmd:
         timeout: int | None = None,
         tty: bool = False,
         quiet: bool = False,
+        connect_timeout: int = SSH_CONNECT_TIMEOUT,
+        strict_host_key_checking: str = "accept-new",
     ) -> subprocess.CompletedProcess[str]:
-        ssh = ["ssh", *self.ssh_options()]
+        ssh = [
+            "ssh",
+            *self.ssh_options(
+                connect_timeout=connect_timeout,
+                strict_host_key_checking=strict_host_key_checking,
+            ),
+        ]
         if tty:
             ssh.append("-tt")
         ssh.extend([self.ssh_target(instance), command])
@@ -1582,12 +1721,48 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
             except EnvrError as error:
                 eprint(f"Warning: could not refresh the local envr cache: {error}")
 
+    def prepare_existing_instance(
+        self,
+        instance: dict[str, Any],
+        folder: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        self.wait_for_cloud_init(instance)
+        self.ensure_remote_runtime(instance)
+        synchronized = self.sync_from_server(instance)
+        if not synchronized:
+            self.install_cached_auth(instance)
+        repository = self.repository(folder) if folder is not None else None
+        if repository is not None:
+            self.ensure_remote_repository(instance, repository)
+        return instance, repository
+
     def up(
         self, ram_gb: int, folder: str | None
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if ram_gb not in PLAN_IDS:
             raise EnvrError("RAM must be one of: 1, 2, 4, 8")
         ensure_commands(("ssh", "scp", "ssh-keygen"))
+
+        cached = self.cached_instance(ram_gb)
+        if cached is not None:
+            try:
+                reachable = self.remote_command(
+                    cached,
+                    "true",
+                    check=False,
+                    quiet=True,
+                    timeout=7,
+                    connect_timeout=5,
+                    strict_host_key_checking="yes",
+                )
+            except subprocess.TimeoutExpired:
+                reachable = None
+            if reachable is not None and reachable.returncode == 0:
+                print(f"Using cached VPS at {cached['main_ip']}...")
+                prepared = self.prepare_existing_instance(cached, folder)
+                self.try_cached_device_key_sync(cached)
+                return prepared
+
         api = self.api()
         api.get("account")
         instances = self.managed_instances(api)
@@ -1604,26 +1779,12 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
                     f"existing envr VPS has {current_ram} GB; requested {ram_gb} GB. "
                     "Run envr destroy before changing size."
                 )
-            self.save_state(
-                {
-                    "schema": SCHEMA_VERSION,
-                    "instance_id": instance.get("id"),
-                    "ram_gb": current_ram,
-                    "region": instance.get("region"),
-                }
-            )
+            self.save_instance_state(instance, ram_gb=current_ram)
             if instance.get("power_status") == "stopped":
                 api.request("POST", f"instances/{instance.get('id')}/start")
             instance = self.wait_for_instance(api, str(instance.get("id")))
             self.ensure_device_access(api, instance)
-            self.wait_for_cloud_init(instance)
-            self.ensure_remote_runtime(instance)
-            synchronized = self.sync_from_server(instance)
-            if not synchronized:
-                self.install_cached_auth(instance)
-            repository = self.repository(folder) if folder is not None else None
-            if repository is not None:
-                self.ensure_remote_repository(instance, repository)
+            return self.prepare_existing_instance(instance, folder)
         else:
             repository = self.repository(folder) if folder is not None else None
             instance = self.create_instance(api, ram_gb, repository)

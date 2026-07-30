@@ -40,6 +40,11 @@ Create or reconnect to the VPS and open a normal shell in the general workspace:
 envr up 4
 ```
 
+After the first successful connection on a device, `envr up` tries its cached
+IP and trusted SSH host key before contacting Vultr. If the VPS is reachable,
+an API outage does not prevent reconnection. Stale or untrusted cached
+connections fail closed and fall back to live Vultr discovery.
+
 The normal prompt is short:
 
 ```text
@@ -65,8 +70,13 @@ disposable and isolated for that purpose.
 
 To join from another Mac, Linux machine, or Android phone, install `envr`, enter
 the same Vultr API token, and run the same command. `envr` discovers the
-running VPS, authorizes that device, synchronizes the repository and Codex
-cache, and opens a shell in the selected directory.
+running VPS and registers that device's public key. If Vultr does not expose
+the running VPS password, `envr` asks once for its root SSH password. It
+installs the new device's public key and immediately reconnects key-only.
+Alternatively, run `envr up` once from a device that already has access; it
+securely synchronizes all registered envr public keys. On connection, the new
+device immediately receives the current repository configuration, dedicated
+Git keys, and Codex auth cache from the VPS.
 
 Inspect the Vultr account, instance, live price, IP, and Vultr-generated
 fallback root password:

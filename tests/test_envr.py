@@ -429,10 +429,108 @@ class LifecycleLogicTests(unittest.TestCase):
             app = envr.Envr(Path(temporary))
             options = app.ssh_options()
             self.assertIn("StrictHostKeyChecking=accept-new", options)
+            self.assertIn("BatchMode=yes", options)
             self.assertEqual(
                 app.ssh_target({"main_ip": "192.0.2.1"}),
                 "remote@192.0.2.1",
             )
+
+    def test_up_uses_trusted_cached_vps_without_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            envr.atomic_write_text(app.vps_key, "private-key")
+            envr.atomic_write_text(app.vps_known_hosts, "trusted-host-key")
+            app.save_instance_state(
+                {
+                    "id": "instance-id",
+                    "main_ip": "192.0.2.10",
+                    "ram": 1024,
+                    "region": "fra",
+                }
+            )
+            app.api = mock.Mock(side_effect=AssertionError("API must not be required"))
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            expected = (
+                {"id": "instance-id", "main_ip": "192.0.2.10"},
+                None,
+            )
+            app.prepare_existing_instance = mock.Mock(return_value=expected)
+            app.try_cached_device_key_sync = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = app.up(1, None)
+
+            self.assertEqual(result, expected)
+            app.api.assert_not_called()
+            probe = app.remote_command.call_args
+            self.assertEqual(probe.kwargs["strict_host_key_checking"], "yes")
+            self.assertEqual(probe.kwargs["connect_timeout"], 5)
+            app.prepare_existing_instance.assert_called_once()
+            app.try_cached_device_key_sync.assert_called_once()
+
+    def test_instance_cache_preserves_ip_and_password_securely(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.save_instance_state(
+                {
+                    "id": "instance-id",
+                    "main_ip": "192.0.2.10",
+                    "ram": 1024,
+                    "region": "fra",
+                    "default_password": "SecretPassword123",
+                }
+            )
+
+            self.assertEqual(app.state()["main_ip"], "192.0.2.10")
+            self.assertEqual(app.password_path.read_text(), "SecretPassword123\n")
+            self.assertEqual(app.password_path.stat().st_mode & 0o777, 0o600)
+
+    def test_authorized_device_syncs_all_registered_device_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.managed_vultr_ssh_keys = mock.Mock(
+                return_value=[
+                    {"ssh_key": "ssh-ed25519 AAAAFIRST device-one"},
+                    {"ssh_key": "ssh-ed25519 AAAASECOND device-two"},
+                ]
+            )
+            app.remote_script = mock.Mock()
+            instance = {"id": "instance-id", "main_ip": "192.0.2.10"}
+
+            app.sync_managed_device_keys(mock.Mock(), instance)
+
+            arguments = app.remote_script.call_args.args[2]
+            synchronized = base64.b64decode(arguments[0]).decode()
+            self.assertEqual(
+                synchronized,
+                "ssh-ed25519 AAAAFIRST device-one\n"
+                "ssh-ed25519 AAAASECOND device-two\n",
+            )
+            script = app.remote_script.call_args.args[1]
+            self.assertIn("authorized_keys", script)
+            self.assertIn("grep -qxF", script)
+
+    def test_existing_device_access_synchronizes_registered_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.ensure_vps_key = mock.Mock(return_value="ssh-ed25519 AAAATEST")
+            app.ensure_vultr_ssh_key = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            app.sync_managed_device_keys = mock.Mock()
+            api = mock.Mock()
+            instance = {"id": "instance-id", "main_ip": "192.0.2.10"}
+
+            app.ensure_device_access(api, instance)
+
+            app.sync_managed_device_keys.assert_called_once_with(api, instance)
+            self.assertEqual(app.remote_command.call_args.kwargs["timeout"], 15)
 
     def test_device_enrollment_keeps_password_out_of_command_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -453,6 +551,36 @@ class LifecycleLogicTests(unittest.TestCase):
 
             flattened = " ".join(str(value) for value in execute.call_args.args[0])
             self.assertNotIn("SecretPassword123", flattened)
+            self.assertFalse(any(app.root.glob(".askpass*")))
+
+    def test_device_enrollment_prompts_once_when_api_omits_password(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.instance_password = mock.Mock(
+                side_effect=envr.EnvrError("password unavailable")
+            )
+            app.ensure_vps_key = mock.Mock(
+                return_value="ssh-ed25519 AAAATEST device"
+            )
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+            terminal = mock.Mock()
+            terminal.isatty.return_value = True
+            with (
+                mock.patch.object(envr.sys, "stdin", terminal),
+                mock.patch.object(
+                    envr.getpass,
+                    "getpass",
+                    return_value="TypedPassword123",
+                ) as prompt,
+                mock.patch.object(envr, "run", return_value=completed),
+            ):
+                app.enroll_device_key(
+                    mock.Mock(),
+                    {"id": "instance-id", "main_ip": "192.0.2.10"},
+                )
+
+            prompt.assert_called_once()
+            self.assertEqual(app.password_path.read_text(), "TypedPassword123\n")
             self.assertFalse(any(app.root.glob(".askpass*")))
 
     def test_destroy_can_confirm_after_unreachable_ssh(self) -> None:
