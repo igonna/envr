@@ -9,6 +9,7 @@ from Android Termux, macOS, or Linux. The normal interface remains:
 
 ```bash
 envr git
+envr relay
 envr up 4
 envr up 4 repository-folder
 envr status
@@ -16,9 +17,9 @@ envr port-open 443
 envr destroy
 ```
 
-There is no `init`, `connect`, `shell`, or envr authentication-maintenance command.
-Setup, reconnection, device enrollment, and credential synchronization happen
-inside the commands above.
+There is no `init`, `connect`, `shell`, separate relay-edit/delete, or envr
+authentication-maintenance command. Setup, reconnection, device enrollment,
+and credential synchronization happen inside the commands above.
 
 ## One account, one VPS
 
@@ -98,6 +99,46 @@ Removing a device key from the Vultr account prevents it from being included
 in future VPS instances. A key already installed on a running VPS must also be
 removed there, or the disposable VPS can simply be destroyed and recreated.
 
+## Optional SSH relay
+
+`envr relay` configures one optional IPv4 SSH relay. With no existing
+configuration it asks for:
+
+```text
+Relay IP:
+SSH port [22]:
+SSH user:
+```
+
+OpenSSH itself then asks for the relay password and host-key confirmation. The
+interactive setup has no artificial response timeout. `envr` generates a
+dedicated Ed25519 identity and installs only its public key with
+`restrict,port-forwarding,command="/bin/false"`. The password is never read,
+stored, placed in an argument, or logged by `envr`.
+
+When configured, the same command displays the IP, user, port, and
+`Password: not stored (key-only)`, then offers only `E`dit, `D`elete, or
+`Q`uit. Editing is transactional: the old configuration remains active unless
+key installation and a certificate-validated TLS connection to the Vultr API
+through the candidate relay both succeed. Deletion is confirmed and removes
+the local relay configuration, identity, host keys, and control sockets.
+
+Relay configuration is fail-closed. Every VPS SSH/SCP operation receives one
+centralized ProxyCommand; all Vultr API calls use an SSH Unix-socket forward
+to a current IPv4 address for `api.vultr.com:443`. IPv4 is deliberate because
+the Vultr API allowlist may permit broad IPv4 but reject the relay's otherwise
+preferred IPv6 address. TLS still validates the `api.vultr.com` hostname and
+certificate on the client, so DNS cannot expose the token or impersonate the
+API. There is no direct fallback while a relay is configured. Direct and
+relayed VPS transports use different control-socket names so one mode can
+never accidentally reuse the other.
+
+The relay receives no Vultr API token, VPS private key, recovery password,
+Codex auth, Git private key, repository file, or terminal plaintext. It sees
+the client address, destinations, timing, and traffic volume. Agent forwarding
+is disabled. Package downloads and Git traffic initiated by the VPS do not
+pass through the relay.
+
 ## Server-authoritative synchronization
 
 While it exists, the VPS is authoritative for repositories and current Codex
@@ -155,9 +196,10 @@ envr status
 envr up 4 envr
 ```
 
-`status` is API-only and works before SSH enrollment. `up` enrolls the phone,
-downloads the server manifest, resolves `envr`, and opens a normal shell in
-that repository.
+`status` is API-only and works before SSH enrollment. When configured, its API
+requests also use the relay. `up` enrolls the phone, downloads the server
+manifest, resolves `envr`, and attaches to that repository's persistent tmux
+session.
 
 If no VPS exists, repository configuration must already be cached locally or
 the user must run `envr git`. Once a VPS has been destroyed, a completely new
@@ -177,6 +219,11 @@ The default private state directory is:
 │       ├── id_ed25519
 │       └── id_ed25519.pub
 ├── ssh/
+│   ├── id_ed25519
+│   ├── id_ed25519.pub
+│   └── known_hosts
+├── relay/
+│   ├── config.json
 │   ├── id_ed25519
 │   ├── id_ed25519.pub
 │   └── known_hosts
@@ -246,7 +293,7 @@ verify requested RAM
 → repair missing runtime helpers/packages if needed
 → synchronize server metadata and credentials locally
 → when supplied, resolve and verify the repository from the VPS
-→ open a normal interactive shell in the selected directory
+→ attach to the selected persistent tmux session
 ```
 
 If no VPS exists:
@@ -261,7 +308,7 @@ when supplied, require its saved configuration locally
 → restore Codex authentication
 → when supplied, upload its dedicated key and clone/verify it from the VPS
 → print one concise repository-ready message
-→ open a normal interactive shell in the selected directory
+→ attach to the selected persistent tmux session
 ```
 
 An existing repository is never pulled, reset, cleaned, overwritten, or
@@ -309,9 +356,20 @@ firewall rules.
 
 ## Remote shell and Codex
 
-`envr up` never launches Codex. It opens a normal login shell in the general
-workspace or selected repository. Cached Codex authentication is still
-restored before connection.
+`envr up` never launches Codex. It attaches to a normal shell in a persistent,
+per-workspace tmux session. Cached Codex authentication is still restored
+before connection.
+
+```text
+no repository       → envr-workspace in /home/remote/envr
+repository "project" → envr-repo-project in /home/remote/envr/project
+```
+
+`tmux new-session -A` permits multiple devices to attach without terminating
+another client. SSH loss, relay loss, Android suspension, and network changes
+detach the client while the remote session and its processes continue. The
+user can detach deliberately with `Ctrl-b d`. Sessions do not survive VPS
+reboot, process termination, out-of-memory failure, or instance destruction.
 
 The remote helper has exactly two operations:
 
@@ -337,8 +395,8 @@ before destruction.
 
 ## `envr status`
 
-`status` uses only the Vultr API and can run before a device has SSH access. It
-shows:
+`status` uses only the Vultr API and can run before a device has SSH access.
+When a relay is configured, the API request is tunneled through it. It shows:
 
 ```text
 account balance, pending charges, available prepaid credit
@@ -385,7 +443,8 @@ Stopping is not exposed because Vultr continues billing stopped instances.
 ## Security boundaries
 
 - The Vultr API token is entered independently on each trusted client,
-  validated before being saved, and never passed to an external process.
+  validated before being saved, never passed to an external process, and
+  remains protected by end-to-end TLS through an optional relay.
 - API access must be permitted for the client’s public IP range. Broad IPv4
   access may be necessary for mobile networks, so Vultr account 2FA and token
   rotation are important.
@@ -426,7 +485,8 @@ configure repo on macOS
 → create VPS
 → status/connect from a fresh Termux installation
 → verify automatic device enrollment and cache synchronization
-→ verify both devices open a normal shell in the selected directory
+→ configure relay and verify status plus VPS SSH use it without direct fallback
+→ interrupt SSH and verify both devices reattach to the persistent tmux session
 → verify scodex auth and scodex resume
 → open a port
 → destroy from Android

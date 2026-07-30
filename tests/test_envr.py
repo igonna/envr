@@ -173,6 +173,198 @@ class APITests(unittest.TestCase):
             self.assertEqual(app.token_path.read_text(), "new-token\n")
 
 
+class RelayTests(unittest.TestCase):
+    def test_relay_api_resolution_requires_ipv4(self) -> None:
+        answers = [
+            (
+                envr.socket.AF_INET,
+                envr.socket.SOCK_STREAM,
+                6,
+                "",
+                ("203.0.113.25", 443),
+            )
+        ]
+        with mock.patch.object(
+            envr.socket,
+            "getaddrinfo",
+            return_value=answers,
+        ) as resolve:
+            self.assertEqual(envr.Envr.relay_api_ipv4(), "203.0.113.25")
+        self.assertEqual(resolve.call_args.kwargs["family"], envr.socket.AF_INET)
+
+    def test_unix_https_handler_uses_only_public_connection_arguments(self) -> None:
+        handler = envr.UnixSocketHTTPSHandler(Path("/tmp/envr-test-api.sock"))
+        handler.do_open = mock.Mock(return_value="response")
+        request = envr.urllib.request.Request(
+            "https://api.vultr.com/v2/account"
+        )
+
+        result = handler.https_open(request)
+
+        self.assertEqual(result, "response")
+        connection_factory = handler.do_open.call_args.args[0]
+        connection = connection_factory(
+            "api.vultr.com",
+            timeout=10,
+            context=handler._context,
+        )
+        self.assertIsInstance(connection, envr.UnixSocketHTTPSConnection)
+        self.assertTrue(connection._context.check_hostname)
+        self.assertEqual(
+            handler.do_open.call_args.kwargs,
+            {"context": handler._context},
+        )
+
+    def test_relay_configuration_requires_safe_ipv4_port_and_user(self) -> None:
+        relay = envr.RelayConfig.from_dict(
+            {"host": "192.0.2.40", "port": "2222", "user": "tunnel-user"}
+        )
+        self.assertEqual(relay.target, "tunnel-user@192.0.2.40")
+        self.assertEqual(relay.port, 2222)
+        invalid = (
+            {"host": "relay.example", "port": 22, "user": "relay"},
+            {"host": "192.0.2.40", "port": 0, "user": "relay"},
+            {"host": "192.0.2.40", "port": 22, "user": "-oProxyCommand=x"},
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(envr.EnvrError):
+                envr.RelayConfig.from_dict(value)
+
+    def test_relay_menu_is_the_only_edit_delete_interface(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            relay = envr.RelayConfig("192.0.2.40", 22, "relay")
+            envr.atomic_write_json(app.relay_config_path, relay.as_dict())
+            output = io.StringIO()
+            with (
+                mock.patch("builtins.input", return_value="q"),
+                contextlib.redirect_stdout(output),
+            ):
+                app.relay_menu()
+            rendered = output.getvalue()
+            self.assertIn("IP:       192.0.2.40", rendered)
+            self.assertIn("User:     relay", rendered)
+            self.assertIn("Password: not stored", rendered)
+
+    def test_relay_setup_saves_only_after_key_and_forward_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.ensure_relay_key = mock.Mock(return_value="ssh-ed25519 AAAATEST")
+            app.install_relay_key = mock.Mock()
+            app.verify_relay = mock.Mock()
+            answers = iter(("192.0.2.40", "", "relay"))
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                mock.patch("builtins.input", side_effect=lambda _prompt: next(answers)),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                app.configure_relay()
+            relay = app.relay_config()
+            self.assertEqual(relay, envr.RelayConfig("192.0.2.40", 22, "relay"))
+            app.install_relay_key.assert_called_once_with(
+                relay, "ssh-ed25519 AAAATEST"
+            )
+            app.verify_relay.assert_called_once_with(relay)
+            self.assertEqual(app.relay_config_path.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_relay_edit_preserves_the_working_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            existing = envr.RelayConfig("192.0.2.40", 22, "relay")
+            envr.atomic_write_json(app.relay_config_path, existing.as_dict())
+            app.ensure_relay_key = mock.Mock(return_value="ssh-ed25519 AAAATEST")
+            app.install_relay_key = mock.Mock()
+            app.verify_relay = mock.Mock(
+                side_effect=envr.EnvrError("candidate relay failed")
+            )
+            answers = iter(("192.0.2.41", "", "other"))
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                mock.patch("builtins.input", side_effect=lambda _prompt: next(answers)),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(envr.EnvrError, "candidate relay failed"),
+            ):
+                app.configure_relay(existing)
+            self.assertEqual(app.relay_config(), existing)
+
+    def test_relay_key_install_is_forwarding_only_and_password_is_not_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            relay = envr.RelayConfig("192.0.2.40", 22, "relay")
+            with (
+                mock.patch.object(envr, "run") as run_command,
+                mock.patch.object(envr.getpass, "getpass") as password_reader,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                app.install_relay_key(relay, "ssh-ed25519 AAAATEST comment")
+            command = run_command.call_args.args[0]
+            key_input = run_command.call_args.kwargs["input_data"]
+            self.assertIn(
+                "PreferredAuthentications=password,keyboard-interactive",
+                command,
+            )
+            self.assertIn("PubkeyAuthentication=no", command)
+            self.assertIn("StrictHostKeyChecking=ask", command)
+            self.assertNotIn("timeout", run_command.call_args.kwargs)
+            password_reader.assert_not_called()
+            self.assertIn('restrict,port-forwarding,command="/bin/false"', key_input)
+
+    def test_relay_applies_to_vps_ssh_and_uses_separate_control_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            relay = envr.RelayConfig("192.0.2.40", 2222, "relay")
+            envr.atomic_write_json(app.relay_config_path, relay.as_dict())
+            envr.atomic_write_text(app.relay_key, "private")
+            options = app.ssh_options()
+            joined = " ".join(options)
+            self.assertIn("ProxyCommand=", joined)
+            self.assertIn("relay@192.0.2.40", joined)
+            self.assertIn("-W %h:%p", joined)
+            proxy = next(
+                value for value in options if value.startswith("ProxyCommand=")
+            )
+            self.assertIn("%h:%p", proxy)
+            self.assertNotIn("%C", proxy)
+
+            changed = envr.RelayConfig("192.0.2.41", 2222, "relay")
+            envr.atomic_write_json(app.relay_config_path, changed.as_dict())
+            changed_options = app.ssh_options()
+            old_control = next(
+                value for value in options if value.startswith("ControlPath=")
+            )
+            new_control = next(
+                value
+                for value in changed_options
+                if value.startswith("ControlPath=")
+            )
+            self.assertNotEqual(old_control, new_control)
+
+    def test_configured_relay_with_missing_key_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            relay = envr.RelayConfig("192.0.2.40", 22, "relay")
+            envr.atomic_write_json(app.relay_config_path, relay.as_dict())
+            with self.assertRaisesRegex(envr.EnvrError, "relay private key is missing"):
+                app.ssh_options()
+
+    def test_vultr_api_receives_relay_opener_without_token_exposure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            relay = envr.RelayConfig("192.0.2.40", 22, "relay")
+            envr.atomic_write_json(app.relay_config_path, relay.as_dict())
+            envr.atomic_write_text(app.token_path, "secret-token\n")
+            opener = mock.Mock()
+            app.ensure_api_tunnel = mock.Mock(return_value=opener)
+            api = app.api()
+            self.assertIs(api.opener, opener)
+            self.assertEqual(api.token, "secret-token")
+            app.ensure_api_tunnel.assert_called_once_with(relay)
+
+    def test_parser_exposes_relay_without_subcommands(self) -> None:
+        namespace = envr.build_parser().parse_args(["relay"])
+        self.assertEqual(namespace.command, "relay")
+
+
 class LifecycleLogicTests(unittest.TestCase):
     def test_retryable_region_errors(self) -> None:
         self.assertTrue(
@@ -227,7 +419,7 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertIn("test -f /var/lib/envr-ready", command)
             self.assertIn("command -v codex", command)
 
-    def test_connection_opens_plain_shell_in_repository(self) -> None:
+    def test_connection_attaches_persistent_repository_tmux(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             app.remote_command = mock.Mock(
@@ -239,13 +431,14 @@ class LifecycleLogicTests(unittest.TestCase):
                 {"folder": "envr", "identity": "igonna-envr"},
             )
             command = app.remote_command.call_args_list[0].args[1]
-            self.assertIn(f"cd {envr.REMOTE_ROOT}/envr", command)
-            self.assertIn('exec "${SHELL:-/bin/bash}" -l', command)
+            self.assertIn("exec tmux new-session -A", command)
+            self.assertIn("-s envr-repo-envr", command)
+            self.assertIn(f"-c {envr.REMOTE_ROOT}/envr", command)
             self.assertNotIn("codex login", command)
             self.assertNotIn("exec codex", command)
-            self.assertNotIn("tmux", command)
+            self.assertTrue(app.remote_command.call_args_list[0].kwargs["tty"])
 
-    def test_workspace_shell_needs_no_repository(self) -> None:
+    def test_workspace_tmux_needs_no_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             app.remote_command = mock.Mock(
@@ -254,7 +447,9 @@ class LifecycleLogicTests(unittest.TestCase):
             app.sync_from_server = mock.Mock(return_value=False)
             app.connect_shell({"main_ip": "192.0.2.1"}, None)
             command = app.remote_command.call_args_list[0].args[1]
-            self.assertIn(f"cd {envr.REMOTE_ROOT}", command)
+            self.assertIn("exec tmux new-session -A", command)
+            self.assertIn("-s envr-workspace", command)
+            self.assertIn(f"-c {envr.REMOTE_ROOT}", command)
             self.assertNotIn("codex login", command)
             self.assertNotIn("exec codex", command)
 
@@ -434,10 +629,11 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertIn("BatchMode=yes", options)
             self.assertIn("ControlMaster=auto", options)
             self.assertIn("ControlPersist=300", options)
-            self.assertIn(
-                f"ControlPath={app.ssh_root / 'control-%C'}",
-                options,
+            control_path = next(
+                value for value in options if value.startswith("ControlPath=")
             )
+            self.assertTrue(control_path.startswith(f"ControlPath={app.ssh_root}/c-"))
+            self.assertNotIn("%", control_path)
             self.assertEqual(app.scp_options(), options)
             self.assertEqual(
                 app.ssh_target({"main_ip": "192.0.2.1"}),
@@ -748,6 +944,9 @@ class LifecycleLogicTests(unittest.TestCase):
             app.ensure_vps_key = mock.Mock(
                 return_value="ssh-ed25519 AAAATEST device"
             )
+            app.ssh_proxy_options = mock.Mock(
+                return_value=["-o", "ProxyCommand=relay"]
+            )
             completed = SimpleNamespace(returncode=0, stdout="", stderr="")
             with mock.patch.object(envr, "run", return_value=completed) as execute:
                 app.enroll_device_key(
@@ -761,6 +960,7 @@ class LifecycleLogicTests(unittest.TestCase):
 
             flattened = " ".join(str(value) for value in execute.call_args.args[0])
             self.assertNotIn("SecretPassword123", flattened)
+            self.assertIn("ProxyCommand=relay", flattened)
             self.assertFalse(any(app.root.glob(".askpass*")))
 
     def test_device_enrollment_prompts_once_when_api_omits_password(self) -> None:

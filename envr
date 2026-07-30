@@ -9,6 +9,7 @@ import contextlib
 import fcntl
 import getpass
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -18,17 +19,19 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, NamedTuple, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
 
 
-VERSION = "0.3.7"
+VERSION = "0.4.1"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -52,6 +55,7 @@ SSH_CONNECT_TIMEOUT = 10
 INSTANCE_TIMEOUT = 600
 CLOUD_INIT_TIMEOUT = 900
 DELETE_TIMEOUT = 300
+RELAY_API_HOST = "api.vultr.com"
 
 SCODEX_SCRIPT = """#!/bin/sh
 set -eu
@@ -291,12 +295,206 @@ def validate_text_field(label: str, value: str) -> str:
     return value
 
 
+def ssh_failure_detail(stderr: str) -> str:
+    lines = [
+        "".join(
+            character if character.isprintable() else " "
+            for character in line
+        ).strip()
+        for line in stderr.splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return ""
+    return f" ({lines[-1][:300]})"
+
+
+class RelayConfig(NamedTuple):
+    host: str
+    port: int
+    user: str
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> RelayConfig:
+        host = str(value.get("host") or "").strip()
+        user = str(value.get("user") or "").strip()
+        try:
+            port = int(value.get("port"))
+        except (TypeError, ValueError) as error:
+            raise EnvrError("relay configuration has an invalid SSH port") from error
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as error:
+            raise EnvrError("relay IP address is invalid") from error
+        if address.version != 4:
+            raise EnvrError("envr currently requires an IPv4 relay address")
+        if not 1 <= port <= 65535:
+            raise EnvrError("relay SSH port must be between 1 and 65535")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", user):
+            raise EnvrError("relay SSH user is invalid")
+        return cls(host=str(address), port=port, user=user)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": SCHEMA_VERSION,
+            "host": self.host,
+            "port": self.port,
+            "user": self.user,
+        }
+
+    @property
+    def target(self) -> str:
+        return f"{self.user}@{self.host}"
+
+
+class UnixSocketHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS whose TCP stream is supplied by an SSH Unix-socket forward."""
+
+    def __init__(self, host: str, socket_path: Path, **kwargs: Any):
+        self.socket_path = socket_path
+        super().__init__(host, **kwargs)
+
+    def connect(self) -> None:
+        raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        raw_socket.settimeout(self.timeout)
+        try:
+            raw_socket.connect(str(self.socket_path))
+            self.sock = self._context.wrap_socket(
+                raw_socket,
+                server_hostname=self.host,
+            )
+        except BaseException:
+            raw_socket.close()
+            raise
+
+
+class UnixSocketHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, socket_path: Path):
+        super().__init__(context=ssl.create_default_context())
+        self.socket_path = socket_path
+
+    def https_open(self, request: urllib.request.Request) -> Any:
+        def connection(host: str, **kwargs: Any) -> UnixSocketHTTPSConnection:
+            return UnixSocketHTTPSConnection(host, self.socket_path, **kwargs)
+
+        return self.do_open(
+            connection,
+            request,
+            context=self._context,
+        )
+
+
+class RelayAPITunnel:
+    """One temporary, end-to-end TLS transport through the SSH relay."""
+
+    def __init__(
+        self,
+        ssh_options: Sequence[str],
+        target: str,
+        api_ipv4: str,
+    ):
+        self.ssh_options = list(ssh_options)
+        self.target = target
+        self.api_ipv4 = api_ipv4
+        self.process: subprocess.Popen[str] | None = None
+        self.temporary_directory: Path | None = None
+        self.socket_path: Path | None = None
+
+    def start(self) -> urllib.request.OpenerDirector:
+        if self.process is not None or self.socket_path is not None:
+            raise EnvrError("relay API tunnel is already running")
+        self.temporary_directory = Path(tempfile.mkdtemp(prefix="envr-api-"))
+        self.temporary_directory.chmod(0o700)
+        self.socket_path = self.temporary_directory / "api.sock"
+        command = [
+            "ssh",
+            *self.ssh_options,
+            "-N",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-L",
+            f"{self.socket_path}:{self.api_ipv4}:443",
+            self.target,
+        ]
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if self.socket_path.exists():
+                return urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}),
+                    UnixSocketHTTPSHandler(self.socket_path),
+                )
+            return_code = self.process.poll()
+            if return_code is not None:
+                detail = (
+                    self.process.stderr.read() if self.process.stderr else ""
+                ).strip()
+                suffix = ssh_failure_detail(detail)
+                self.close()
+                raise EnvrError(f"could not establish the relay API tunnel{suffix}")
+            time.sleep(0.05)
+        self.close()
+        raise EnvrError("timed out establishing the relay API tunnel")
+
+    def verify_tls(self) -> None:
+        if self.socket_path is None:
+            raise EnvrError("relay API tunnel is not running")
+        raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        raw_socket.settimeout(10)
+        try:
+            raw_socket.connect(str(self.socket_path))
+            context = ssl.create_default_context()
+            with context.wrap_socket(
+                raw_socket,
+                server_hostname=RELAY_API_HOST,
+            ):
+                pass
+        except (OSError, ssl.SSLError) as error:
+            raw_socket.close()
+            raise EnvrError(
+                f"relay cannot securely reach {RELAY_API_HOST}: {error}"
+            ) from error
+
+    def close(self) -> None:
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=3)
+            if self.process.stderr is not None:
+                self.process.stderr.close()
+            self.process = None
+        if self.socket_path is not None:
+            with contextlib.suppress(FileNotFoundError):
+                self.socket_path.unlink()
+            self.socket_path = None
+        if self.temporary_directory is not None:
+            with contextlib.suppress(FileNotFoundError):
+                self.temporary_directory.rmdir()
+            self.temporary_directory = None
+
+
 class VultrAPI:
-    def __init__(self, token: str, base_url: str | None = None):
+    def __init__(
+        self,
+        token: str,
+        base_url: str | None = None,
+        opener: urllib.request.OpenerDirector | None = None,
+    ):
         self.token = token
         self.base_url = (base_url or os.environ.get("ENVR_VULTR_API") or API_BASE).rstrip(
             "/"
         )
+        self.opener = opener
 
     def request(
         self,
@@ -321,7 +519,10 @@ class VultrAPI:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            open_request = (
+                self.opener.open if self.opener is not None else urllib.request.urlopen
+            )
+            with open_request(request, timeout=timeout) as response:
                 content = response.read()
         except urllib.error.HTTPError as error:
             try:
@@ -385,7 +586,13 @@ class Envr:
         self.vps_key = self.ssh_root / "id_ed25519"
         self.vps_public_key = self.ssh_root / "id_ed25519.pub"
         self.vps_known_hosts = self.ssh_root / "known_hosts"
-        self.ssh_control_path = self.ssh_root / "control-%C"
+        self.relay_root = self.root / "relay"
+        self.relay_config_path = self.relay_root / "config.json"
+        self.relay_key = self.relay_root / "id_ed25519"
+        self.relay_public_key = self.relay_root / "id_ed25519.pub"
+        self.relay_known_hosts = self.relay_root / "known_hosts"
+        self._api_tunnel: RelayAPITunnel | None = None
+        self._api_opener: urllib.request.OpenerDirector | None = None
         self.repos_path = self.root / "repos.json"
         self.state_path = self.root / "state.json"
         self.password_path = self.root / "instance-password"
@@ -405,6 +612,7 @@ class Envr:
             "state.json",
             "instance-password",
             "client-id",
+            "relay",
         )
         candidates = [name for name in names if (legacy / name).exists()]
         if not candidates:
@@ -427,6 +635,8 @@ class Envr:
         ensure_private_dir(self.git_root)
         ensure_private_dir(self.ssh_root)
         ensure_private_dir(self.auth_path.parent)
+        if self.relay_root.exists():
+            ensure_private_dir(self.relay_root)
 
     def management_tag(self) -> str:
         return MANAGEMENT_TAG
@@ -565,10 +775,287 @@ class Envr:
             self.state_path.unlink()
         with contextlib.suppress(FileNotFoundError):
             self.password_path.unlink()
-        for control_socket in self.ssh_root.glob("control-*"):
-            with contextlib.suppress(FileNotFoundError):
-                control_socket.unlink()
+        for pattern in ("control-*", "c-*"):
+            for control_socket in self.ssh_root.glob(pattern):
+                with contextlib.suppress(FileNotFoundError):
+                    control_socket.unlink()
         fsync_directory(self.root)
+
+    def relay_config(self) -> RelayConfig | None:
+        if not self.relay_config_path.exists():
+            return None
+        value = load_json(self.relay_config_path)
+        return RelayConfig.from_dict(value)
+
+    def ensure_relay_key(self) -> str:
+        ensure_commands(("ssh", "ssh-keygen"))
+        ensure_private_dir(self.relay_root)
+        if not self.relay_key.exists() or not self.relay_public_key.exists():
+            with tempfile.TemporaryDirectory(dir=self.root) as temporary_directory:
+                temporary_key = Path(temporary_directory) / "id_ed25519"
+                run(
+                    [
+                        "ssh-keygen",
+                        "-q",
+                        "-t",
+                        "ed25519",
+                        "-N",
+                        "",
+                        "-C",
+                        f"envr-relay:{platform.node() or 'device'}",
+                        "-f",
+                        str(temporary_key),
+                    ]
+                )
+                atomic_write(self.relay_key, temporary_key.read_bytes())
+                atomic_write(
+                    self.relay_public_key,
+                    temporary_key.with_suffix(".pub").read_bytes(),
+                )
+        self.relay_key.chmod(0o600)
+        self.relay_public_key.chmod(0o600)
+        return self.relay_public_key.read_text(encoding="utf-8").strip()
+
+    def relay_ssh_options(
+        self,
+        relay: RelayConfig | None = None,
+    ) -> list[str]:
+        relay = relay or self.relay_config()
+        if relay is None:
+            raise EnvrError("SSH relay is not configured")
+        ensure_private_dir(self.relay_root)
+        self.relay_known_hosts.touch(mode=0o600, exist_ok=True)
+        self.relay_known_hosts.chmod(0o600)
+        relay_identity = hashlib.sha256(
+            f"{relay.user}@{relay.host}:{relay.port}".encode()
+        ).hexdigest()[:12]
+        control_path = self.relay_root / f"c-{relay_identity}"
+        return [
+            "-p",
+            str(relay.port),
+            "-i",
+            str(self.relay_key),
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={self.relay_known_hosts}",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "RequestTTY=no",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=300",
+            "-o",
+            f"ControlPath={control_path}",
+            "-o",
+            f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+        ]
+
+    def install_relay_key(self, relay: RelayConfig, public_key: str) -> None:
+        ensure_private_dir(self.relay_root)
+        self.relay_known_hosts.touch(mode=0o600, exist_ok=True)
+        self.relay_known_hosts.chmod(0o600)
+        restricted_key = (
+            'restrict,port-forwarding,command="/bin/false" ' + public_key.strip()
+        )
+        remote_install = (
+            "set -eu; "
+            "IFS= read -r key; "
+            'umask 077; mkdir -p "$HOME/.ssh"; '
+            'chmod 700 "$HOME/.ssh"; '
+            'touch "$HOME/.ssh/authorized_keys"; '
+            'chmod 600 "$HOME/.ssh/authorized_keys"; '
+            'grep -qxF "$key" "$HOME/.ssh/authorized_keys" || '
+            'printf "%s\\n" "$key" >> "$HOME/.ssh/authorized_keys"'
+        )
+        print("Enter the relay SSH password once. It will not be stored.")
+        run(
+            [
+                "ssh",
+                "-T",
+                "-p",
+                str(relay.port),
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=password,keyboard-interactive",
+                "-o",
+                "PubkeyAuthentication=no",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "StrictHostKeyChecking=ask",
+                "-o",
+                f"UserKnownHostsFile={self.relay_known_hosts}",
+                "-o",
+                f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+                relay.target,
+                remote_install,
+            ],
+            input_data=restricted_key + "\n",
+        )
+
+    @staticmethod
+    def relay_api_ipv4() -> str:
+        try:
+            answers = socket.getaddrinfo(
+                RELAY_API_HOST,
+                443,
+                family=socket.AF_INET,
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as error:
+            raise EnvrError(
+                f"could not resolve an IPv4 address for {RELAY_API_HOST}: {error}"
+            ) from error
+        addresses = [
+            str(answer[4][0])
+            for answer in answers
+            if answer[4] and answer[4][0]
+        ]
+        if not addresses:
+            raise EnvrError(
+                f"{RELAY_API_HOST} did not resolve to an IPv4 address"
+            )
+        return addresses[0]
+
+    def verify_relay(self, relay: RelayConfig) -> None:
+        tunnel = RelayAPITunnel(
+            self.relay_ssh_options(relay),
+            relay.target,
+            self.relay_api_ipv4(),
+        )
+        try:
+            tunnel.start()
+            tunnel.verify_tls()
+        finally:
+            tunnel.close()
+
+    def configure_relay(self, existing: RelayConfig | None = None) -> None:
+        ensure_commands(("ssh", "ssh-keygen"))
+        default_host = existing.host if existing is not None else ""
+        default_port = existing.port if existing is not None else 22
+        default_user = existing.user if existing is not None else ""
+        host_prompt = f"Relay IP [{default_host}]: " if default_host else "Relay IP: "
+        user_prompt = (
+            f"SSH user [{default_user}]: " if default_user else "SSH user: "
+        )
+        host = input(host_prompt).strip() or default_host
+        port_text = input(f"SSH port [{default_port}]: ").strip()
+        user = input(user_prompt).strip() or default_user
+        candidate = RelayConfig.from_dict(
+            {
+                "host": host,
+                "port": port_text or default_port,
+                "user": user,
+            }
+        )
+        public_key = self.ensure_relay_key()
+        self.install_relay_key(candidate, public_key)
+        print("Verifying secure forwarding...")
+        self.verify_relay(candidate)
+        atomic_write_json(self.relay_config_path, candidate.as_dict())
+        print(f"Relay ready: {candidate.target}:{candidate.port}")
+
+    def delete_relay(self, relay: RelayConfig) -> None:
+        self.close_api_tunnel()
+        run(
+            [
+                "ssh",
+                *self.relay_ssh_options(relay),
+                "-O",
+                "exit",
+                relay.target,
+            ],
+            check=False,
+            quiet=True,
+            timeout=5,
+        )
+        for path in (
+            self.relay_config_path,
+            self.relay_key,
+            self.relay_public_key,
+            self.relay_known_hosts,
+        ):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        for pattern in ("control-*", "c-*"):
+            for control_socket in self.relay_root.glob(pattern):
+                with contextlib.suppress(FileNotFoundError):
+                    control_socket.unlink()
+        for pattern in ("control-relay-*", "c-*"):
+            for control_socket in self.ssh_root.glob(pattern):
+                with contextlib.suppress(FileNotFoundError):
+                    control_socket.unlink()
+        with contextlib.suppress(FileNotFoundError, OSError):
+            self.relay_root.rmdir()
+        fsync_directory(self.root)
+        print("Relay configuration deleted. envr will connect directly.")
+
+    def relay_menu(self) -> None:
+        relay = self.relay_config()
+        if relay is None:
+            self.configure_relay()
+            return
+        while True:
+            print("\nRelay")
+            print(f"  IP:       {relay.host}")
+            print(f"  User:     {relay.user}")
+            print(f"  Port:     {relay.port}")
+            print("  Password: not stored (key-only)")
+            choice = input("\n[E] Edit  [D] Delete  [Q] Quit: ").strip().lower()
+            if choice in {"", "q"}:
+                return
+            if choice == "e":
+                self.configure_relay(relay)
+                return
+            if choice == "d":
+                if prompt_yes_no("Delete the local relay configuration?"):
+                    self.delete_relay(relay)
+                    return
+                continue
+            print("Choose E, D, or Q.")
+
+    def ensure_api_tunnel(self, relay: RelayConfig) -> urllib.request.OpenerDirector:
+        if self._api_opener is not None:
+            return self._api_opener
+        ensure_commands(("ssh",))
+        custom_api = os.environ.get("ENVR_VULTR_API")
+        if custom_api:
+            parsed = urllib.parse.urlsplit(custom_api)
+            if parsed.scheme != "https" or parsed.hostname != RELAY_API_HOST:
+                raise EnvrError(
+                    "a custom Vultr API endpoint cannot use the SSH relay"
+                )
+        tunnel = RelayAPITunnel(
+            self.relay_ssh_options(relay),
+            relay.target,
+            self.relay_api_ipv4(),
+        )
+        try:
+            opener = tunnel.start()
+        except BaseException:
+            tunnel.close()
+            raise
+        self._api_tunnel = tunnel
+        self._api_opener = opener
+        return opener
+
+    def close_api_tunnel(self) -> None:
+        if self._api_tunnel is not None:
+            self._api_tunnel.close()
+        self._api_tunnel = None
+        self._api_opener = None
 
     def api_token(self) -> str:
         self.ensure_layout()
@@ -587,7 +1074,9 @@ class Envr:
             self.token_path.read_text(encoding="utf-8").strip()
         )
         token = self.api_token()
-        api = VultrAPI(token)
+        relay = self.relay_config()
+        opener = self.ensure_api_tunnel(relay) if relay is not None else None
+        api = VultrAPI(token, opener=opener)
         if not saved:
             print("Verifying Vultr API token...")
             api.get("account")
@@ -1100,6 +1589,7 @@ runcmd:
 
     def ssh_options(
         self,
+        instance: dict[str, Any] | None = None,
         *,
         connect_timeout: int = SSH_CONNECT_TIMEOUT,
         strict_host_key_checking: str = "accept-new",
@@ -1107,7 +1597,22 @@ runcmd:
         ensure_private_dir(self.vps_known_hosts.parent)
         self.vps_known_hosts.touch(mode=0o600, exist_ok=True)
         self.vps_known_hosts.chmod(0o600)
-        return [
+        relay = self.relay_config()
+        instance_ip = str(
+            (instance or {}).get("main_ip")
+            or self.state().get("main_ip")
+            or "unknown"
+        )
+        transport_identity = "direct"
+        if relay is not None:
+            transport_identity = (
+                f"relay:{relay.user}@{relay.host}:{relay.port}"
+            )
+        connection_identity = hashlib.sha256(
+            f"{REMOTE_USER}@{instance_ip}|{transport_identity}".encode()
+        ).hexdigest()[:16]
+        control_path = self.ssh_root / f"c-{connection_identity}"
+        options = [
             "-i",
             str(self.vps_key),
             "-o",
@@ -1123,7 +1628,7 @@ runcmd:
             "-o",
             "ControlPersist=300",
             "-o",
-            f"ControlPath={self.ssh_control_path}",
+            f"ControlPath={control_path}",
             "-o",
             f"ConnectTimeout={connect_timeout}",
             "-o",
@@ -1131,6 +1636,27 @@ runcmd:
             "-o",
             "ServerAliveCountMax=3",
         ]
+        options.extend(self.ssh_proxy_options(relay))
+        return options
+
+    def ssh_proxy_options(
+        self, relay: RelayConfig | None = None
+    ) -> list[str]:
+        relay = relay if relay is not None else self.relay_config()
+        if relay is None:
+            return []
+        if not self.relay_key.is_file():
+            raise EnvrError(
+                "relay private key is missing; run envr relay and choose Edit"
+            )
+        proxy_command = [
+            "ssh",
+            *self.relay_ssh_options(relay),
+            "-W",
+            "%h:%p",
+            relay.target,
+        ]
+        return ["-o", f"ProxyCommand={shlex.join(proxy_command)}"]
 
     def ssh_target(self, instance: dict[str, Any]) -> str:
         ip = str(instance.get("main_ip", ""))
@@ -1305,6 +1831,7 @@ runcmd:
             ssh = [
                 "ssh",
                 "-T",
+                *self.ssh_proxy_options(),
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "-o",
@@ -1368,7 +1895,7 @@ runcmd:
             )
         )
         if not authentication_failed:
-            detail = self.ssh_failure_detail(result.stderr or "")
+            detail = ssh_failure_detail(result.stderr or "")
             if "host identification has changed" in failure:
                 raise EnvrError(
                     f"the VPS SSH host key changed; refusing to connect{detail}"
@@ -1435,20 +1962,6 @@ runcmd:
             raise EnvrError("the device SSH key was installed but login still failed")
         self.sync_managed_device_keys(api, instance)
 
-    @staticmethod
-    def ssh_failure_detail(stderr: str) -> str:
-        lines = [
-            "".join(
-                character if character.isprintable() else " "
-                for character in line
-            ).strip()
-            for line in stderr.splitlines()
-            if line.strip()
-        ]
-        if not lines:
-            return ""
-        return f" ({lines[-1][:300]})"
-
     def sync_managed_device_keys(
         self,
         api: VultrAPI,
@@ -1498,7 +2011,7 @@ done
             if not token:
                 return
             self.sync_managed_device_keys(
-                VultrAPI(token),
+                self.api(),
                 instance,
                 api_timeout=5,
             )
@@ -1522,6 +2035,7 @@ done
         ssh = [
             "ssh",
             *self.ssh_options(
+                instance,
                 connect_timeout=connect_timeout,
                 strict_host_key_checking=strict_host_key_checking,
             ),
@@ -1590,8 +2104,10 @@ done
             detail = result.stderr.strip() if result.stderr else "cloud-init failed"
             raise EnvrError(detail)
 
-    def scp_options(self) -> list[str]:
-        return self.ssh_options()
+    def scp_options(
+        self, instance: dict[str, Any] | None = None
+    ) -> list[str]:
+        return self.ssh_options(instance)
 
     def copy_to_remote(
         self, instance: dict[str, Any], local: Path, remote: str
@@ -1599,7 +2115,7 @@ done
         run(
             [
                 "scp",
-                *self.scp_options(),
+                *self.scp_options(instance),
                 str(local),
                 f"{self.ssh_target(instance)}:{remote}",
             ],
@@ -1681,7 +2197,7 @@ chmod 600 {REMOTE_HOME}/.codex/config.toml
             run(
                 [
                     "scp",
-                    *self.scp_options(),
+                    *self.scp_options(instance),
                     f"{self.ssh_target(instance)}:{REMOTE_HOME}/.codex/auth.json",
                     str(temporary),
                 ],
@@ -1786,7 +2302,7 @@ PY
             run(
                 [
                     "scp",
-                    *self.scp_options(),
+                    *self.scp_options(instance),
                     f"{self.ssh_target(instance)}:{REMOTE_REPOS}",
                     str(manifest_path),
                 ],
@@ -1831,7 +2347,7 @@ PY
                 run(
                     [
                         "scp",
-                        *self.scp_options(),
+                        *self.scp_options(instance),
                         f"{self.ssh_target(instance)}:"
                         f"{REMOTE_HOME}/.ssh/envr/{folder}",
                         str(candidate),
@@ -1943,14 +2459,16 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         if repository is None:
             display_name = "workspace"
             target = REMOTE_ROOT
+            session = "envr-workspace"
         else:
             display_name = str(repository["folder"])
             target = f"{REMOTE_ROOT}/{display_name}"
+            session = f"envr-repo-{display_name}"
         command = (
-            f"cd {shlex.quote(target)} && "
-            'exec "${SHELL:-/bin/bash}" -l'
+            "exec tmux new-session -A "
+            f"-s {shlex.quote(session)} -c {shlex.quote(target)}"
         )
-        print(f"Connecting to {display_name}. Exit the shell to disconnect.")
+        print(f"Connecting to {display_name}. Detach safely with Ctrl-b d.")
         try:
             self.remote_command(instance, command, tty=True, check=False)
         finally:
@@ -2318,6 +2836,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("git", help="configure one Git repository")
+    subparsers.add_parser("relay", help="configure the optional SSH relay")
 
     up = subparsers.add_parser("up", help="create or reconnect to the VPS")
     up.add_argument("ram", type=int, choices=sorted(PLAN_IDS))
@@ -2345,6 +2864,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if namespace.command == "git":
                 app.configure_git()
                 return 0
+            if namespace.command == "relay":
+                app.relay_menu()
+                return 0
             if namespace.command == "up":
                 attachment = app.up(namespace.ram, namespace.repository_folder)
             elif namespace.command == "status":
@@ -2356,6 +2878,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 app.destroy()
                 return 0
         if attachment is not None:
+            app.close_api_tunnel()
             app.connect_shell(*attachment)
             return 0
     except KeyboardInterrupt:
@@ -2364,6 +2887,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except (EnvrError, subprocess.TimeoutExpired) as error:
         eprint(f"envr: error: {error}")
         return 1
+    finally:
+        app.close_api_tunnel()
     return 1
 
 

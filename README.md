@@ -11,6 +11,7 @@ cycle remains before calling it production-ready.
 
 ```bash
 envr git
+envr relay
 envr up 4
 envr up 4 repository-folder
 envr status
@@ -34,7 +35,8 @@ This stores the repository configuration and dedicated key locally but does
 not contact the Git host. Clone and access verification happen only from the
 disposable VPS during `envr up`.
 
-Create or reconnect to the VPS and open a normal shell in the general workspace:
+Create or reconnect to the VPS and attach to a persistent shell in the general
+workspace:
 
 ```bash
 envr up 4
@@ -49,6 +51,16 @@ The normal prompt is short:
 
 ```text
 remote@envr:~/envr$
+```
+
+The shell runs inside `tmux`. A lost SSH connection, Android suspension, relay
+failure, or network change detaches the client without stopping remote work.
+Detach deliberately with `Ctrl-b d`; the next identical `up` attaches again.
+The general workspace and every repository use separate sessions:
+
+```text
+envr-workspace
+envr-repo-REPOSITORY_FOLDER
 ```
 
 Select a configured repository when needed:
@@ -96,6 +108,39 @@ repository synchronization, and the interactive shell reuse that connection
 instead of repeatedly crossing an unreliable or filtered network path.
 Transient failures of the initial safe key probe are retried up to three times;
 authentication, host-key, and local-key failures are never blindly retried.
+
+## Optional SSH relay
+
+When the direct path to Vultr is filtered or unreliable, configure one stable
+SSH server:
+
+```bash
+envr relay
+```
+
+The first setup asks for its IPv4 address, SSH port, and user. OpenSSH asks for
+the relay password once while installing a dedicated forwarding-only public
+key; the password is never received or stored by `envr`. The relay host key is
+confirmed once and then pinned.
+
+If a relay already exists, the same command shows:
+
+```text
+Relay
+  IP:       192.0.2.40
+  User:     relay
+  Port:     22
+  Password: not stored (key-only)
+
+[E] Edit  [D] Delete  [Q] Quit:
+```
+
+There are no separate relay-edit or relay-delete commands. With a relay
+configured, all `envr` traffic to Vultr uses it: the Vultr HTTPS API travels
+through an IPv4 SSH forward with end-to-end hostname-validated TLS, and VPS
+SSH/SCP uses an end-to-end SSH connection through the relay. There is no
+silent direct fallback. Git clones and package downloads initiated by the VPS
+remain direct from the VPS.
 
 Inspect the Vultr account, instance, live price, IP, and envr-managed recovery
 root password:
@@ -151,6 +196,12 @@ automatically migrated on first use.
 Each device stores only its API token, device SSH key, and a synchronized cache
 of repository credentials and Codex authentication. Repository working trees,
 shell tools, builds, and containers remain on the VPS.
+
+An optional relay receives no Vultr token, VPS private key, recovery password,
+Codex authentication, Git key, or repository data. It can observe connection
+destinations, timing, and traffic volume, but the Vultr API remains protected
+by TLS and VPS sessions remain protected by their inner SSH connection. SSH
+agent forwarding is disabled.
 
 The VPS is hardened during its initial cloud-init run. Later `envr` commands do
 not reset its firewall. Automatic backups, snapshots, and additional storage
