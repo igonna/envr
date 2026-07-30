@@ -90,6 +90,11 @@ cached SSH connection proceeds even if the Vultr API is unavailable. A short,
 best-effort API request may add newly registered envr device public keys to the
 server, but failure never blocks the established SSH session.
 
+Successful `status` discovery also refreshes this connection cache. When
+upgrading an older installation whose state predates cached IPs, envr may
+recover the address only when its private known-hosts file contains exactly one
+unambiguous IPv4 host.
+
 For every repository, the manifest contains:
 
 ```text

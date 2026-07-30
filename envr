@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -498,11 +498,23 @@ class Envr:
             return None
         if (
             not instance_id
-            or not main_ip
             or cached_ram_gb != ram_gb
             or not self.vps_key.is_file()
             or not self.vps_known_hosts.is_file()
         ):
+            return None
+        if not main_ip:
+            main_ip = self.single_known_host_ip() or ""
+            if main_ip:
+                self.save_instance_state(
+                    {
+                        "id": instance_id,
+                        "main_ip": main_ip,
+                        "ram": ram_gb * 1024,
+                        "region": state.get("region"),
+                    }
+                )
+        if not main_ip:
             return None
         try:
             address = ipaddress.ip_address(main_ip)
@@ -518,6 +530,33 @@ class Envr:
             "status": "active",
             "power_status": "running",
         }
+
+    def single_known_host_ip(self) -> str | None:
+        try:
+            lines = self.vps_known_hosts.read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, OSError, UnicodeError):
+            return None
+        addresses: set[str] = set()
+        for line in lines:
+            fields = line.strip().split()
+            if not fields or fields[0].startswith("#"):
+                continue
+            host_field_index = 1 if fields[0].startswith("@") else 0
+            if len(fields) <= host_field_index:
+                continue
+            for host in fields[host_field_index].split(","):
+                candidate = host
+                if host.startswith("[") and "]:" in host:
+                    candidate = host[1 : host.index("]:")]
+                try:
+                    address = ipaddress.ip_address(candidate)
+                except ValueError:
+                    continue
+                if address.version == 4:
+                    addresses.add(str(address))
+        if len(addresses) == 1:
+            return addresses.pop()
+        return None
 
     def clear_instance_state(self) -> None:
         with contextlib.suppress(FileNotFoundError):
@@ -1797,6 +1836,8 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         if not isinstance(account, dict):
             raise EnvrError("Vultr API returned invalid account information")
         instances = self.managed_instances(api)
+        if len(instances) == 1:
+            self.save_instance_state(instances[0])
         plans = self.plan_catalog(api)
 
         balance = float(account.get("balance", 0))

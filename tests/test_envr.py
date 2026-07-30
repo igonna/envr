@@ -490,6 +490,28 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(app.password_path.read_text(), "SecretPassword123\n")
             self.assertEqual(app.password_path.stat().st_mode & 0o777, 0o600)
 
+    def test_legacy_cache_recovers_ip_from_single_trusted_known_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            envr.atomic_write_text(app.vps_key, "private-key")
+            envr.atomic_write_text(
+                app.vps_known_hosts,
+                "192.0.2.10 ssh-ed25519 AAAATRUSTED\n",
+            )
+            app.save_state(
+                {
+                    "instance_id": "instance-id",
+                    "ram_gb": 1,
+                    "region": "fra",
+                }
+            )
+
+            cached = app.cached_instance(1)
+
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["main_ip"], "192.0.2.10")
+            self.assertEqual(app.state()["main_ip"], "192.0.2.10")
+
     def test_authorized_device_syncs_all_registered_device_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -840,6 +862,45 @@ class LifecycleLogicTests(unittest.TestCase):
                 result = app.status()
             self.assertEqual(result, 0)
             self.assertIn("envr-codex: not running", output.getvalue())
+
+    def test_status_caches_the_single_instance_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            fake_api = mock.Mock()
+            fake_api.get.side_effect = [
+                {"account": {"balance": 10, "pending_charges": 1}},
+                {
+                    "instances": [
+                        {
+                            "id": "instance-id",
+                            "label": envr.LABEL,
+                            "tags": [envr.MANAGEMENT_TAG],
+                            "main_ip": "192.0.2.10",
+                            "ram": 1024,
+                            "region": "fra",
+                            "plan": "vc2-1c-1gb",
+                            "default_password": "SecretPassword123",
+                        }
+                    ]
+                },
+                {
+                    "plans": [
+                        {
+                            "id": "vc2-1c-1gb",
+                            "hourly_cost": 0.007,
+                            "monthly_cost": 5,
+                        }
+                    ]
+                },
+            ]
+            app.api = mock.Mock(return_value=fake_api)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = app.status()
+
+            self.assertEqual(result, 0)
+            self.assertEqual(app.state()["instance_id"], "instance-id")
+            self.assertEqual(app.state()["main_ip"], "192.0.2.10")
 
 
 class ParserTests(unittest.TestCase):
