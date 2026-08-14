@@ -4,8 +4,7 @@
 VPS from Android Termux. It prepares Git repositories, remote shells, Codex
 authentication, development tools, and safe instance cleanup.
 
-Status: implemented and locally tested; one funded-account Vultr validation
-cycle remains before calling it production-ready.
+Status: implemented, locally tested, and validated with a funded Vultr resize.
 
 ## Interface
 
@@ -13,8 +12,6 @@ cycle remains before calling it production-ready.
 envr git
 envr relay
 envr up 4
-envr up 4 repository-folder
-envr up 16 repository-folder
 envr go
 envr go repository-folder
 envr resize 4
@@ -37,19 +34,28 @@ envr git
 
 This stores the repository configuration and dedicated key locally but does
 not contact the Git host. Clone and access verification happen only from the
-disposable VPS during `envr up`.
+disposable VPS during the first `envr go repository-folder`.
 
-Create or reconnect to the VPS and attach to a persistent shell in the general
-workspace:
+Create the VPS once:
 
 ```bash
 envr up 4
 ```
 
-After the first successful connection on a device, `envr up` tries its cached
-IP and trusted SSH host key before contacting Vultr. If the VPS is reachable,
-an API outage does not prevent reconnection. Stale or untrusted cached
-connections fail closed and fall back to live Vultr discovery.
+`up` performs initial bootstrap and exits. If setup was interrupted, repeating
+the same command resumes that VPS. Once it is healthy, `up` refuses and points
+to `go` or `resize`; it never becomes a second connection or resizing path.
+
+Connect afterward:
+
+```bash
+envr go                    # last selected workspace
+envr go repository-folder  # clone if absent, otherwise attach immediately
+```
+
+`go` tries the cached IP and trusted SSH host key before contacting Vultr. If
+the VPS is reachable, an API outage does not prevent reconnection. Stale or
+untrusted cached connections fail closed and fall back to live discovery.
 
 The normal prompt is short:
 
@@ -59,7 +65,7 @@ remote@envr:~/envr$
 
 The shell runs inside `tmux`. A lost SSH connection, Android suspension, relay
 failure, or network change detaches the client without stopping remote work.
-Detach deliberately with `Ctrl-b d`; the next identical `up` attaches again.
+Detach deliberately with `Ctrl-b d`; the next identical `go` attaches again.
 Mouse mode is enabled for every session so Termux swipe scrolling enters tmux
 history instead of sending shell Up/Down keys.
 The general workspace and every repository use separate sessions:
@@ -69,23 +75,11 @@ envr-workspace
 envr-repo-REPOSITORY_FOLDER
 ```
 
-Select a configured repository when needed:
-
-```bash
-envr up 4 repository-folder
-```
-
-After creation, reconnect without repeating the VPS size:
-
-```bash
-envr go                    # last selected workspace
-envr go repository-folder  # a specific repository
-```
-
 `go` never creates or resizes a VPS. It tries the trusted local SSH cache first,
-does not repeat bootstrap or Git-host verification, and uses the Vultr API only
-as a fallback. If no VPS exists, it tells you to run
-`envr up RAM [repository]`.
+does not repeat bootstrap or Git-host verification for an existing repository,
+and uses the Vultr API only as a fallback. If the selected repository is absent,
+that one call uploads its configured key, clones, verifies, and attaches. If no
+VPS exists, it tells you to run `envr up RAM`.
 
 `envr` never starts Codex automatically. Inside the remote shell:
 
@@ -103,12 +97,10 @@ the same Vultr API token, and run the same command. `envr` discovers the
 running VPS and registers that device's public key. If Vultr does not expose
 the running VPS password, `envr` asks once for its root SSH password. It
 installs the new device's public key and immediately reconnects key-only.
-Alternatively, run `envr up` once from a device that already has access; it
-securely synchronizes all registered envr public keys. On connection, the new
-device immediately receives the current repository configuration, dedicated
-Git keys, and Codex auth cache from the VPS.
+On disconnection, the new device receives the current repository configuration,
+dedicated Git keys, and Codex auth cache from the VPS.
 
-Every successful `up` also establishes one strong recovery password for that
+Initial `up` establishes one strong recovery password for that
 VPS, synchronizes it to the connected device with mode `600`, and durably
 records the IP, device key, and trusted SSH host key. An authorized device can
 show the recovery password with `envr status`; a new device enters it once,
@@ -120,18 +112,16 @@ key. TCP reachability, SSH handshake closure/reset, host-key verification, and
 local private-key failures are reported separately with the final sanitized
 SSH diagnostic.
 
-Within one `up`, SSH and SCP share a private OpenSSH control connection. Once
-one key-authenticated handshake succeeds, package checks, credential and
-repository synchronization, and the interactive shell reuse that connection
-instead of repeatedly crossing an unreliable or filtered network path.
+Within one `go`, SSH and SCP share a private OpenSSH control connection. Once
+one key-authenticated handshake succeeds, workspace selection, the interactive
+shell, and the cache refresh after disconnect reuse that connection instead of
+repeatedly crossing an unreliable or filtered network path.
 Transient failures of the initial safe key probe are retried up to three times;
 authentication, host-key, and local-key failures are never blindly retried.
 
-Every successful reconnect also repairs the repository-local
-`core.sshCommand` for every repository already registered on
-the VPS. Keys under `~/.ssh/envr` are never loaded globally or placed in an
-agent; each repository remains bound only to its own dedicated key. This
-repair does not clone, pull, or contact a Git host.
+Keys under `~/.ssh/envr` are never loaded globally or placed in an agent; each
+repository remains bound only to its own dedicated key. Initial setup and
+resize validation repair these repository-local bindings when necessary.
 
 ## Optional SSH relay
 
@@ -193,7 +183,8 @@ passes checksum, repository-key, metadata, and destination-SSH validation.
 Only then is the new VPS promoted and the old one deleted. If the command is
 interrupted, rerunning the same `envr resize RAM` safely restarts an
 uncommitted copy or finishes an already validated promotion. `status` exposes
-an incomplete resize and `destroy` refuses to run until it is resolved.
+an incomplete resize and `destroy` refuses to run until it is resolved. Resize
+then exits; `envr go` reconnects to the preserved last workspace.
 
 Open a service port when needed:
 

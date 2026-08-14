@@ -606,6 +606,9 @@ class LifecycleLogicTests(unittest.TestCase):
             app.install_cached_auth = mock.Mock()
             app.ensure_remote_repository = mock.Mock()
             app.set_last_workspace = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
             api = mock.Mock()
             api.post.side_effect = [
                 envr.ApiError(400, "regional capacity unavailable"),
@@ -613,9 +616,7 @@ class LifecycleLogicTests(unittest.TestCase):
             ]
 
             with contextlib.redirect_stdout(io.StringIO()):
-                result = app.create_instance(
-                    api, 4, {"folder": "envr", "url": "git@example:owner/envr.git"}
-                )
+                result = app.create_instance(api, 4)
 
             self.assertEqual(result, active)
             self.assertEqual(api.post.call_count, 2)
@@ -633,6 +634,7 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertTrue(decoded.startswith("#cloud-config"))
             self.assertIn("AAAATEST", decoded)
             self.assertIn("AAAAPHONE", decoded)
+            app.ensure_remote_repository.assert_not_called()
 
     def test_setup_timeout_after_creation_never_creates_another_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -668,7 +670,7 @@ class LifecycleLogicTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
                 self.assertRaisesRegex(envr.EnvrError, "remains running"),
             ):
-                app.create_instance(api, 1, None)
+                app.create_instance(api, 1)
 
             api.post.assert_called_once()
 
@@ -691,7 +693,7 @@ class LifecycleLogicTests(unittest.TestCase):
                 "remote@192.0.2.1",
             )
 
-    def test_up_uses_trusted_cached_vps_without_api(self) -> None:
+    def test_up_refuses_healthy_cached_vps_without_api(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             envr.atomic_write_text(app.vps_key, "private-key")
@@ -708,26 +710,23 @@ class LifecycleLogicTests(unittest.TestCase):
             app.remote_command = mock.Mock(
                 return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
             )
-            expected = (
-                {"id": "instance-id", "main_ip": "192.0.2.10"},
-                None,
-            )
-            app.prepare_existing_instance = mock.Mock(return_value=expected)
+            app.initial_setup_complete = mock.Mock(return_value=True)
+            app.resume_initial_setup = mock.Mock()
             app.try_cached_device_key_sync = mock.Mock()
 
             with (
                 mock.patch.object(envr, "ensure_commands"),
                 contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(envr.EnvrError, "use envr go"),
             ):
-                result = app.up(1, None)
+                app.up(1)
 
-            self.assertEqual(result, expected)
             app.api.assert_not_called()
             probe = app.remote_command.call_args
             self.assertEqual(probe.kwargs["strict_host_key_checking"], "yes")
             self.assertEqual(probe.kwargs["connect_timeout"], 5)
-            app.prepare_existing_instance.assert_called_once()
-            app.try_cached_device_key_sync.assert_called_once()
+            app.resume_initial_setup.assert_not_called()
+            app.try_cached_device_key_sync.assert_not_called()
 
     def test_up_retries_transient_cached_handshake_without_api(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -756,11 +755,8 @@ class LifecycleLogicTests(unittest.TestCase):
                     SimpleNamespace(returncode=0, stdout="", stderr=""),
                 ]
             )
-            expected = (
-                {"id": "instance-id", "main_ip": "192.0.2.10"},
-                None,
-            )
-            app.prepare_existing_instance = mock.Mock(return_value=expected)
+            app.initial_setup_complete = mock.Mock(return_value=False)
+            app.resume_initial_setup = mock.Mock()
             app.try_cached_device_key_sync = mock.Mock()
 
             with (
@@ -768,11 +764,13 @@ class LifecycleLogicTests(unittest.TestCase):
                 mock.patch.object(envr.time, "sleep"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                result = app.up(1, None)
+                result = app.up(1)
 
-            self.assertEqual(result, expected)
+            self.assertIsNone(result)
             self.assertEqual(app.remote_command.call_count, 2)
             app.api.assert_not_called()
+            app.resume_initial_setup.assert_called_once()
+            app.try_cached_device_key_sync.assert_called_once()
 
     def test_go_uses_cached_vps_and_last_workspace_without_api(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -792,9 +790,16 @@ class LifecycleLogicTests(unittest.TestCase):
                 return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
             )
             app.last_workspace = mock.Mock(return_value="bet1")
+            app.require_initial_setup_complete = mock.Mock()
             app.refuse_incomplete_resize = mock.Mock()
             app.record_successful_connection = mock.Mock()
-            app.prepare_existing_instance = mock.Mock(
+            app.sync_from_server = mock.Mock(
+                side_effect=AssertionError("existing repository must stay fast")
+            )
+            app.ensure_remote_repository = mock.Mock(
+                side_effect=AssertionError("existing repository must not be cloned")
+            )
+            app.resume_initial_setup = mock.Mock(
                 side_effect=AssertionError("go must not run up maintenance")
             )
             app.wait_for_cloud_init = mock.Mock(
@@ -810,11 +815,31 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(result[0]["id"], "instance-id")
             self.assertEqual(result[1], {"folder": "bet1"})
             app.api.assert_not_called()
+            app.require_initial_setup_complete.assert_called_once()
             app.last_workspace.assert_called_once()
             app.refuse_incomplete_resize.assert_called_once()
             app.record_successful_connection.assert_called_once()
-            app.prepare_existing_instance.assert_not_called()
+            app.resume_initial_setup.assert_not_called()
             app.wait_for_cloud_init.assert_not_called()
+            app.sync_from_server.assert_not_called()
+            app.ensure_remote_repository.assert_not_called()
+
+    def test_up_creates_without_repository_and_does_not_attach(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = mock.Mock()
+            app.api = mock.Mock(return_value=api)
+            app.all_instances = mock.Mock(return_value=[])
+            app.create_instance = mock.Mock(return_value={"id": "new"})
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = app.up(4)
+
+            self.assertIsNone(result)
+            app.create_instance.assert_called_once_with(api, 4)
 
     def test_go_without_vps_never_creates_one(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -832,6 +857,27 @@ class LifecycleLogicTests(unittest.TestCase):
                 app.go("bet1")
 
             app.create_instance.assert_not_called()
+
+    def test_go_refuses_interrupted_initial_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            cached = {
+                "id": "instance-id",
+                "main_ip": "192.0.2.10",
+                "ram": 4096,
+            }
+            app.probe_cached_instance = mock.Mock(return_value=cached)
+            app.initial_setup_complete = mock.Mock(return_value=False)
+            app.prepare_go_instance = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(envr.EnvrError, "envr up 4"),
+            ):
+                app.go(None)
+
+            app.prepare_go_instance.assert_not_called()
 
     def test_instance_cache_preserves_ip_and_password_securely(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1261,7 +1307,7 @@ class LifecycleLogicTests(unittest.TestCase):
                 ["current", "legacy"],
             )
 
-    def test_existing_vps_syncs_repository_before_local_lookup(self) -> None:
+    def test_go_clones_configured_repository_only_when_remote_path_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             instance = {
@@ -1273,18 +1319,11 @@ class LifecycleLogicTests(unittest.TestCase):
                 "label": envr.LABEL,
                 "tags": [envr.MANAGEMENT_TAG],
             }
-            api = mock.Mock()
-            app.api = mock.Mock(return_value=api)
-            app.all_instances = mock.Mock(return_value=[instance])
-            app.managed_instances = mock.Mock(return_value=[instance])
-            app.wait_for_instance = mock.Mock(return_value=instance)
-            app.ensure_device_access = mock.Mock()
-            app.wait_for_cloud_init = mock.Mock()
-            app.ensure_remote_runtime = mock.Mock()
-            app.ensure_recovery_password = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=10, stdout="", stderr="")
+            )
             app.record_successful_connection = mock.Mock()
             app.ensure_remote_repository = mock.Mock()
-            app.repair_remote_repository_bindings = mock.Mock()
             app.refuse_incomplete_resize = mock.Mock()
             app.set_last_workspace = mock.Mock()
 
@@ -1312,17 +1351,14 @@ class LifecycleLogicTests(unittest.TestCase):
                 return True
 
             app.sync_from_server = mock.Mock(side_effect=synchronize)
-            with (
-                mock.patch.object(envr, "ensure_commands"),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                selected_instance, repository = app.up(4, "envr")
+            selected_instance, repository = app.prepare_go_instance(instance, "envr")
             self.assertEqual(selected_instance["id"], "instance-id")
             self.assertEqual(repository["folder"], "envr")
             app.sync_from_server.assert_called_once_with(instance)
-            app.repair_remote_repository_bindings.assert_called_once_with(instance)
+            app.ensure_remote_repository.assert_called_once_with(instance, repository)
+            app.set_last_workspace.assert_called_once_with(instance, "envr")
 
-    def test_existing_vps_opens_workspace_without_repository_config(self) -> None:
+    def test_up_refuses_healthy_api_discovered_vps(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             instance = {
@@ -1339,25 +1375,43 @@ class LifecycleLogicTests(unittest.TestCase):
             app.managed_instances = mock.Mock(return_value=[instance])
             app.wait_for_instance = mock.Mock(return_value=instance)
             app.ensure_device_access = mock.Mock()
-            app.wait_for_cloud_init = mock.Mock()
-            app.ensure_remote_runtime = mock.Mock()
-            app.ensure_recovery_password = mock.Mock()
-            app.record_successful_connection = mock.Mock()
-            app.sync_from_server = mock.Mock(return_value=False)
-            app.install_cached_auth = mock.Mock()
-            app.ensure_remote_repository = mock.Mock()
-            app.repair_remote_repository_bindings = mock.Mock()
-            app.refuse_incomplete_resize = mock.Mock()
-            app.set_last_workspace = mock.Mock()
+            app.initial_setup_complete = mock.Mock(return_value=True)
+            app.resume_initial_setup = mock.Mock()
             with (
                 mock.patch.object(envr, "ensure_commands"),
                 contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(envr.EnvrError, "use envr go"),
             ):
-                selected_instance, repository = app.up(1, None)
-            self.assertEqual(selected_instance["id"], "instance-id")
-            self.assertIsNone(repository)
-            app.ensure_remote_repository.assert_not_called()
-            app.repair_remote_repository_bindings.assert_called_once_with(instance)
+                app.up(1)
+            app.resume_initial_setup.assert_not_called()
+
+    def test_up_does_not_start_stopped_existing_vps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            instance = {
+                "id": "instance-id",
+                "main_ip": "192.0.2.10",
+                "ram": 1024,
+                "region": "fra",
+                "power_status": "stopped",
+                "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG],
+            }
+            api = mock.Mock()
+            app.api = mock.Mock(return_value=api)
+            app.all_instances = mock.Mock(return_value=[instance])
+            app.managed_instances = mock.Mock(return_value=[instance])
+            app.wait_for_instance = mock.Mock()
+            app.ensure_device_access = mock.Mock()
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(envr.EnvrError, "use envr go"),
+            ):
+                app.up(1)
+            api.request.assert_not_called()
+            app.wait_for_instance.assert_not_called()
+            app.ensure_device_access.assert_not_called()
 
     def test_server_manifest_refreshes_local_repository_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1601,6 +1655,96 @@ class ResizeTests(unittest.TestCase):
             script = app.remote_script.call_args.args[1]
             self.assertIn("pgrep -u remote -af '[c]odex'", script)
 
+    def test_resize_marker_records_role_and_target_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock()
+
+            app.set_resize_marker({"id": "new"}, 16, role="target")
+
+            self.assertEqual(
+                app.remote_script.call_args.args[2], ("target", "16")
+            )
+            self.assertIn("printf '%s:%s", app.remote_script.call_args.args[1])
+
+    def test_legacy_resize_marker_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(
+                    returncode=0, stdout="4\n", stderr=""
+                )
+            )
+
+            self.assertEqual(
+                app.resize_marker_state({"id": "old"}), ("unknown", None)
+            )
+
+    def test_same_size_resize_does_not_create_or_attach(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance("old", envr.LABEL, 4096, "192.0.2.10")
+            app.api = mock.Mock(return_value=mock.Mock())
+            app.resize_roles = mock.Mock(return_value=([source], [], []))
+            app.ensure_device_access = mock.Mock()
+            app.wait_for_cloud_init = mock.Mock()
+            app.create_instance = mock.Mock()
+            app.resize_marker_state = mock.Mock(return_value=None)
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(output := io.StringIO()),
+            ):
+                result = app.resize(4)
+
+            self.assertIsNone(result)
+            self.assertIn("Connect with envr go", output.getvalue())
+            app.create_instance.assert_not_called()
+
+    def test_post_delete_resize_marker_is_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance("new", envr.LABEL, 4096, "192.0.2.20")
+            app.api = mock.Mock(return_value=mock.Mock())
+            app.resize_roles = mock.Mock(return_value=([source], [], []))
+            app.ensure_device_access = mock.Mock()
+            app.wait_for_cloud_init = mock.Mock()
+            app.resize_marker_state = mock.Mock(return_value=("target", 4))
+            app.remote_command = mock.Mock()
+            app.clear_resize_marker = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(output := io.StringIO()),
+            ):
+                result = app.resize(4)
+
+            self.assertIsNone(result)
+            app.clear_resize_marker.assert_called_once_with(source)
+            self.assertIn("Resize cleanup complete", output.getvalue())
+
+    def test_same_size_source_marker_is_not_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance("old", envr.LABEL, 16384, "192.0.2.10")
+            app.api = mock.Mock(return_value=mock.Mock())
+            app.resize_roles = mock.Mock(return_value=([source], [], []))
+            app.ensure_device_access = mock.Mock()
+            app.wait_for_cloud_init = mock.Mock()
+            app.resize_marker_state = mock.Mock(return_value=("source", 4))
+            app.clear_resize_marker = mock.Mock()
+            app.create_instance = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(envr.EnvrError, "run envr resize 4"),
+            ):
+                app.resize(16)
+
+            app.clear_resize_marker.assert_not_called()
+            app.create_instance.assert_not_called()
+
     def test_success_promotes_only_after_validation_then_deletes_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -1634,9 +1778,14 @@ class ResizeTests(unittest.TestCase):
             )
             app.validate_resize_target = mock.Mock()
             app.ensure_recovery_password = mock.Mock()
-            app.clear_resize_marker = mock.Mock()
+            events: list[str] = []
+            app.clear_resize_marker = mock.Mock(
+                side_effect=lambda _instance: events.append("clear")
+            )
             app.repair_remote_repository_bindings = mock.Mock()
-            app.delete_instance = mock.Mock()
+            app.delete_instance = mock.Mock(
+                side_effect=lambda _api, _instance: events.append("delete")
+            )
 
             with (
                 mock.patch.object(envr, "ensure_commands"),
@@ -1645,7 +1794,7 @@ class ResizeTests(unittest.TestCase):
             ):
                 attachment = app.resize(4)
 
-            self.assertEqual(attachment, (target, None))
+            self.assertIsNone(attachment)
             self.assertIn("Not preserved: Git-ignored files", output.getvalue())
             app.validate_resize_target.assert_called_once_with(target)
             self.assertEqual(
@@ -1658,6 +1807,11 @@ class ResizeTests(unittest.TestCase):
                 ],
             )
             app.delete_instance.assert_called_once_with(api, source)
+            self.assertEqual(events, ["delete", "clear"])
+            self.assertEqual(
+                app.set_resize_marker.call_args_list,
+                [mock.call(source, 4), mock.call(target, 4, role="target")],
+            )
             self.assertEqual(app.state()["instance_id"], "new")
             create_kwargs = app.create_instance.call_args.kwargs
             self.assertEqual(create_kwargs["label"], envr.RESIZE_TARGET_LABEL)
@@ -1728,8 +1882,7 @@ class ResizeTests(unittest.TestCase):
             api = mock.Mock()
             app.api = mock.Mock(return_value=api)
             app.resize_roles = mock.Mock(return_value=([], [target], [source]))
-            expected = (target, None)
-            app.finish_resize = mock.Mock(return_value=expected)
+            app.finish_resize = mock.Mock()
             app.create_instance = mock.Mock()
 
             with (
@@ -1738,7 +1891,7 @@ class ResizeTests(unittest.TestCase):
             ):
                 result = app.resize(4)
 
-            self.assertEqual(result, expected)
+            self.assertIsNone(result)
             app.finish_resize.assert_called_once_with(api, target, source)
             app.create_instance.assert_not_called()
 
@@ -1792,7 +1945,7 @@ class ParserTests(unittest.TestCase):
             envr.main(["help"])
         self.assertEqual(raised.exception.code, 0)
 
-    def test_up_requires_ram_but_repository_is_optional(self) -> None:
+    def test_up_requires_only_ram(self) -> None:
         parser = envr.build_parser()
         self.assertEqual(envr.PLAN_IDS[16], "vc2-6c-16gb")
         with contextlib.redirect_stderr(io.StringIO()):
@@ -1802,10 +1955,9 @@ class ParserTests(unittest.TestCase):
                 parser.parse_args(["up", "3", "repo"])
         namespace = parser.parse_args(["up", "4"])
         self.assertEqual(namespace.ram, 4)
-        self.assertIsNone(namespace.repository_folder)
-        namespace = parser.parse_args(["up", "16", "repo"])
-        self.assertEqual(namespace.ram, 16)
-        self.assertEqual(namespace.repository_folder, "repo")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["up", "16", "repo"])
 
     def test_port_is_parsed_as_integer(self) -> None:
         namespace = envr.build_parser().parse_args(["port-open", "443"])

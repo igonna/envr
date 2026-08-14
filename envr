@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -48,6 +48,7 @@ REMOTE_REPOS = f"{REMOTE_CONFIG_ROOT}/repos.json"
 REMOTE_RECOVERY_PASSWORD = f"{REMOTE_CONFIG_ROOT}/recovery-password"
 REMOTE_LAST_WORKSPACE = f"{REMOTE_CONFIG_ROOT}/last-workspace"
 REMOTE_RESIZE_MARKER = f"{REMOTE_CONFIG_ROOT}/resize-in-progress"
+REMOTE_INITIAL_READY = f"{REMOTE_CONFIG_ROOT}/initial-ready"
 REGIONS = ("fra", "ams", "waw")
 PLAN_IDS = {
     1: "vc2-1c-1gb",
@@ -1491,7 +1492,6 @@ runcmd:
         self,
         api: VultrAPI,
         ram_gb: int,
-        repository: dict[str, Any] | None,
         *,
         label: str = LABEL,
         cache_state: bool = True,
@@ -1593,13 +1593,15 @@ runcmd:
                     self.ensure_remote_runtime(active)
                     self.ensure_recovery_password(active)
                     self.install_cached_auth(active)
-                    if repository is not None:
-                        self.ensure_remote_repository(active, repository)
-                    self.set_last_workspace(
-                        active,
-                        str(repository["folder"]) if repository is not None else None,
-                    )
+                    self.set_last_workspace(active, None)
                     self.record_successful_connection(active)
+                    self.remote_command(
+                        active,
+                        f"touch {shlex.quote(REMOTE_INITIAL_READY)} && "
+                        f"chmod 600 {shlex.quote(REMOTE_INITIAL_READY)}",
+                        quiet=True,
+                        timeout=30,
+                    )
                 except (EnvrError, subprocess.TimeoutExpired) as error:
                     raise EnvrError(
                         f"VPS {active.get('id')} is running and billable, but "
@@ -2591,15 +2593,30 @@ trap - EXIT
         return value
 
     def refuse_incomplete_resize(self, instance: dict[str, Any]) -> None:
+        if self.resize_marker_exists(instance):
+            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
+
+    def resize_marker_state(
+        self, instance: dict[str, Any]
+    ) -> tuple[str, int | None] | None:
         result = self.remote_command(
             instance,
-            f"test -e {shlex.quote(REMOTE_RESIZE_MARKER)}",
+            f"test -s {shlex.quote(REMOTE_RESIZE_MARKER)} && "
+            f"cat {shlex.quote(REMOTE_RESIZE_MARKER)}",
+            capture=True,
             check=False,
             quiet=True,
             timeout=15,
         )
-        if result.returncode == 0:
-            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
+        if result.returncode != 0:
+            return None
+        match = re.fullmatch(r"(source|target):([0-9]+)", result.stdout.strip())
+        if match is None:
+            return ("unknown", None)
+        return (match.group(1), int(match.group(2)))
+
+    def resize_marker_exists(self, instance: dict[str, Any]) -> bool:
+        return self.resize_marker_state(instance) is not None
 
     def connect_shell(
         self,
@@ -2631,11 +2648,7 @@ trap - EXIT
             except EnvrError as error:
                 eprint(f"Warning: could not refresh the local envr cache: {error}")
 
-    def prepare_existing_instance(
-        self,
-        instance: dict[str, Any],
-        folder: str | None,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    def resume_initial_setup(self, instance: dict[str, Any]) -> None:
         self.refuse_incomplete_resize(instance)
         self.wait_for_cloud_init(instance)
         self.ensure_remote_runtime(instance)
@@ -2644,12 +2657,15 @@ trap - EXIT
         if not synchronized:
             self.install_cached_auth(instance)
         self.repair_remote_repository_bindings(instance)
-        repository = self.repository(folder) if folder is not None else None
-        if repository is not None:
-            self.ensure_remote_repository(instance, repository)
-        self.set_last_workspace(instance, folder)
+        self.set_last_workspace(instance, None)
         self.record_successful_connection(instance)
-        return instance, repository
+        self.remote_command(
+            instance,
+            f"touch {shlex.quote(REMOTE_INITIAL_READY)} && "
+            f"chmod 600 {shlex.quote(REMOTE_INITIAL_READY)}",
+            quiet=True,
+            timeout=30,
+        )
 
     def probe_cached_instance(self, ram_gb: int | None) -> dict[str, Any] | None:
         cached = self.cached_instance(ram_gb)
@@ -2680,16 +2696,27 @@ trap - EXIT
             return None
         return cached
 
-    def reconnect_cached(
-        self, ram_gb: int, folder: str | None
-    ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
-        cached = self.probe_cached_instance(ram_gb)
-        if cached is None:
-            return None
-        print(f"Using cached VPS at {cached['main_ip']}...")
-        prepared = self.prepare_existing_instance(cached, folder)
-        self.try_cached_device_key_sync(cached)
-        return prepared
+    def initial_setup_complete(self, instance: dict[str, Any]) -> bool:
+        result = self.remote_command(
+            instance,
+            f"test -e {shlex.quote(REMOTE_INITIAL_READY)} || {{ "
+            "test -e /var/lib/envr-ready && "
+            "command -v tmux >/dev/null && command -v codex >/dev/null && "
+            "command -v scodex >/dev/null && "
+            f"test -d {shlex.quote(REMOTE_ROOT)} && "
+            f"test -s {shlex.quote(REMOTE_RECOVERY_PASSWORD)}; }}",
+            check=False,
+            quiet=True,
+            timeout=15,
+        )
+        return result.returncode == 0
+
+    def require_initial_setup_complete(self, instance: dict[str, Any]) -> None:
+        if not self.initial_setup_complete(instance):
+            ram_gb = self.instance_ram_gb(instance)
+            raise EnvrError(
+                f"initial setup is incomplete; run envr up {ram_gb} to resume it"
+            )
 
     def prepare_go_instance(
         self, instance: dict[str, Any], folder: str | None
@@ -2704,31 +2731,52 @@ trap - EXIT
                 raise EnvrError(f"invalid repository folder: {folder!r}")
             result = self.remote_command(
                 instance,
-                f"git -C {shlex.quote(f'{REMOTE_ROOT}/{folder}')} "
-                "rev-parse --git-dir >/dev/null 2>&1",
+                f"target={shlex.quote(f'{REMOTE_ROOT}/{folder}')}; "
+                "test -e \"$target\" || exit 10; "
+                "git -C \"$target\" rev-parse --git-dir >/dev/null 2>&1 "
+                "|| exit 11",
                 check=False,
                 quiet=True,
                 timeout=15,
             )
-            if result.returncode != 0:
+            if result.returncode == 10:
+                self.sync_from_server(instance)
+                configured = self.repository(folder)
+                self.ensure_remote_repository(instance, configured)
+                repository = configured
+            elif result.returncode != 0:
                 raise EnvrError(f"repository is not available on the VPS: {folder}")
-            repository = {"folder": folder}
+            else:
+                repository = {"folder": folder}
             if explicitly_selected:
                 self.set_last_workspace(instance, folder)
         self.record_successful_connection(instance)
         return instance, repository
 
-    def up(
-        self, ram_gb: int, folder: str | None
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    def up(self, ram_gb: int) -> None:
         if ram_gb not in PLAN_IDS:
             supported = ", ".join(str(size) for size in sorted(PLAN_IDS))
             raise EnvrError(f"RAM must be one of: {supported}")
         ensure_commands(("ssh", "scp", "ssh-keygen"))
 
-        cached = self.reconnect_cached(ram_gb, folder)
+        cached = self.probe_cached_instance(None)
         if cached is not None:
-            return cached
+            current_ram = self.instance_ram_gb(cached)
+            if self.initial_setup_complete(cached):
+                raise EnvrError(
+                    f"envr VPS already exists ({current_ram} GB); "
+                    "use envr go or envr resize RAM"
+                )
+            if current_ram != ram_gb:
+                raise EnvrError(
+                    f"incomplete envr VPS has {current_ram} GB; "
+                    f"run envr up {current_ram} to resume it"
+                )
+            print(f"Resuming initial setup at {cached['main_ip']}...")
+            self.resume_initial_setup(cached)
+            self.try_cached_device_key_sync(cached)
+            print("VPS ready. Connect with envr go.")
+            return
 
         api = self.api()
         api.get("account")
@@ -2744,21 +2792,28 @@ trap - EXIT
         if instances:
             instance = instances[0]
             current_ram = int(instance.get("ram", 0)) // 1024
-            if current_ram != ram_gb:
-                raise EnvrError(
-                    f"existing envr VPS has {current_ram} GB; requested {ram_gb} GB. "
-                    f"Run envr resize {ram_gb}."
-                )
             self.save_instance_state(instance, ram_gb=current_ram)
             if instance.get("power_status") == "stopped":
-                api.request("POST", f"instances/{instance.get('id')}/start")
+                raise EnvrError(
+                    f"envr VPS already exists ({current_ram} GB) and is stopped; "
+                    "use envr go"
+                )
             instance = self.wait_for_instance(api, str(instance.get("id")))
             self.ensure_device_access(api, instance)
-            return self.prepare_existing_instance(instance, folder)
+            if self.initial_setup_complete(instance):
+                raise EnvrError(
+                    f"envr VPS already exists ({current_ram} GB); "
+                    "use envr go or envr resize RAM"
+                )
+            if current_ram != ram_gb:
+                raise EnvrError(
+                    f"incomplete envr VPS has {current_ram} GB; "
+                    f"run envr up {current_ram} to resume it"
+                )
+            self.resume_initial_setup(instance)
         else:
-            repository = self.repository(folder) if folder is not None else None
-            instance = self.create_instance(api, ram_gb, repository)
-        return instance, repository
+            self.create_instance(api, ram_gb)
+        print("VPS ready. Connect with envr go.")
 
     def go(
         self, folder: str | None
@@ -2767,6 +2822,7 @@ trap - EXIT
         cached = self.probe_cached_instance(None)
         if cached is not None:
             print(f"Using cached VPS at {cached['main_ip']}...")
+            self.require_initial_setup_complete(cached)
             return self.prepare_go_instance(cached, folder)
 
         api = self.api()
@@ -2780,7 +2836,7 @@ trap - EXIT
                 f"conflict: {len(instances)} envr instances exist; run envr status"
             )
         if not instances:
-            raise EnvrError("envr-codex is not running; run envr up RAM [repository]")
+            raise EnvrError("envr-codex is not running; run envr up RAM")
         instance = instances[0]
         current_ram = self.instance_ram_gb(instance)
         self.save_instance_state(instance, ram_gb=current_ram)
@@ -2788,6 +2844,7 @@ trap - EXIT
             api.request("POST", f"instances/{instance.get('id')}/start")
         instance = self.wait_for_instance(api, str(instance.get("id")))
         self.ensure_device_access(api, instance)
+        self.require_initial_setup_complete(instance)
         return self.prepare_go_instance(instance, folder)
 
     @staticmethod
@@ -2844,18 +2901,22 @@ trap - EXIT
         api.patch(f"instances/{instance_id}", {"label": label})
         instance["label"] = label
 
-    def set_resize_marker(self, instance: dict[str, Any], ram_gb: int) -> None:
+    def set_resize_marker(
+        self, instance: dict[str, Any], ram_gb: int, *, role: str = "source"
+    ) -> None:
+        if role not in {"source", "target"}:
+            raise EnvrError(f"invalid resize marker role: {role}")
         script = f"""set -euo pipefail
 install -d -m 700 {shlex.quote(REMOTE_CONFIG_ROOT)}
 temporary=$(mktemp {shlex.quote(REMOTE_CONFIG_ROOT)}/.resize.XXXXXX)
 trap 'rm -f "$temporary"' EXIT
-printf '%s\n' "$1" > "$temporary"
+printf '%s:%s\n' "$1" "$2" > "$temporary"
 chmod 600 "$temporary"
 mv -f "$temporary" {shlex.quote(REMOTE_RESIZE_MARKER)}
 trap - EXIT
 """
         self.remote_script(
-            instance, script, (str(ram_gb),), quiet=True, timeout=30
+            instance, script, (role, str(ram_gb)), quiet=True, timeout=30
         )
 
     def clear_resize_marker(self, instance: dict[str, Any]) -> None:
@@ -3218,24 +3279,27 @@ done
         api: VultrAPI,
         target: dict[str, Any],
         source: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    ) -> None:
         if target.get("label") == RESIZE_TARGET_LABEL:
             self.set_instance_label(api, target, LABEL)
         self.save_instance_state(target, ram_gb=self.instance_ram_gb(target))
         self.ensure_device_access(api, target)
         self.ensure_recovery_password(target)
-        self.clear_resize_marker(target)
         self.repair_remote_repository_bindings(target)
         self.sync_from_server(target)
-        folder = self.last_workspace(target)
-        repository = self.repository(folder) if folder is not None else None
         self.delete_instance(api, source)
+        self.remote_command(
+            target,
+            f"touch {shlex.quote(REMOTE_INITIAL_READY)} && "
+            f"chmod 600 {shlex.quote(REMOTE_INITIAL_READY)}",
+            quiet=True,
+            timeout=30,
+        )
+        self.clear_resize_marker(target)
         print(f"Resize complete: {self.instance_ram_gb(target)} GB.")
-        return target, repository
+        print("Connect with envr go.")
 
-    def resize(
-        self, ram_gb: int
-    ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    def resize(self, ram_gb: int) -> None:
         if ram_gb not in PLAN_IDS:
             supported = ", ".join(str(size) for size in sorted(PLAN_IDS))
             raise EnvrError(f"RAM must be one of: {supported}")
@@ -3260,7 +3324,8 @@ done
                     f"interrupted resize target is {target_ram} GB; "
                     f"run envr resize {target_ram}"
                 )
-            return self.finish_resize(api, targets[0], sources[0])
+            self.finish_resize(api, targets[0], sources[0])
+            return
         if current and sources:
             target_ram = self.instance_ram_gb(current[0])
             if target_ram != ram_gb:
@@ -3268,7 +3333,8 @@ done
                     f"promoted resize target is {target_ram} GB; "
                     f"run envr resize {target_ram} to finish cleanup"
                 )
-            return self.finish_resize(api, current[0], sources[0])
+            self.finish_resize(api, current[0], sources[0])
+            return
         if not current and sources and not targets:
             self.set_instance_label(api, sources[0], LABEL)
             self.clear_resize_marker(sources[0])
@@ -3281,10 +3347,30 @@ done
         current_ram = self.instance_ram_gb(source)
         self.ensure_device_access(api, source)
         self.wait_for_cloud_init(source)
-        folder = self.last_workspace(source)
         if current_ram == ram_gb:
-            print(f"envr VPS is already {ram_gb} GB.")
-            return self.prepare_existing_instance(source, folder)
+            marker = self.resize_marker_state(source)
+            if marker is not None and marker[0] == "target":
+                self.remote_command(
+                    source,
+                    f"touch {shlex.quote(REMOTE_INITIAL_READY)} && "
+                    f"chmod 600 {shlex.quote(REMOTE_INITIAL_READY)}",
+                    quiet=True,
+                    timeout=30,
+                )
+                self.clear_resize_marker(source)
+                print(f"Resize cleanup complete: {ram_gb} GB.")
+                print("Connect with envr go.")
+                return
+            if marker is not None:
+                target_ram = marker[1]
+                detail = (
+                    f"; run envr resize {target_ram}"
+                    if target_ram is not None
+                    else "; inspect envr status before retrying"
+                )
+                raise EnvrError(f"resize is incomplete{detail}")
+            print(f"envr VPS is already {ram_gb} GB. Connect with envr go.")
+            return
 
         transfer_bytes = self.ensure_resize_source_ready(source)
         print(
@@ -3306,11 +3392,11 @@ done
             target = self.create_instance(
                 api,
                 ram_gb,
-                None,
                 label=RESIZE_TARGET_LABEL,
                 cache_state=False,
                 prepare_workspace=False,
             )
+            self.set_resize_marker(target, ram_gb, role="target")
             self.ensure_resize_capacity(target, transfer_bytes)
             token = secrets.token_hex(8)
             public_key, host_key = self.migration_key_and_host(source, target, token)
@@ -3333,7 +3419,8 @@ done
             self.validate_resize_target(target)
             self.set_instance_label(api, source, RESIZE_SOURCE_LABEL)
             promoted = True
-            return self.finish_resize(api, target, source)
+            self.finish_resize(api, target, source)
+            return
         except (EnvrError, subprocess.TimeoutExpired, KeyboardInterrupt):
             if not promoted:
                 try:
@@ -3638,9 +3725,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("git", help="configure one Git repository")
     subparsers.add_parser("relay", help="configure the optional SSH relay")
 
-    up = subparsers.add_parser("up", help="create or reconnect to the VPS")
+    up = subparsers.add_parser("up", help="create the initial VPS")
     up.add_argument("ram", type=int, choices=sorted(PLAN_IDS))
-    up.add_argument("repository_folder", nargs="?")
 
     go = subparsers.add_parser("go", help="reconnect without specifying RAM")
     go.add_argument("repository_folder", nargs="?")
@@ -3680,7 +3766,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 app.relay_menu()
                 return 0
             if namespace.command == "up":
-                attachment = app.up(namespace.ram, namespace.repository_folder)
+                attachment = app.up(namespace.ram)
             elif namespace.command == "go":
                 attachment = app.go(namespace.repository_folder)
             elif namespace.command == "resize":

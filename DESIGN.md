@@ -1,6 +1,6 @@
 # envr design
 
-Status: implemented and locally tested; funded-account live validation pending.
+Status: implemented, locally tested, and funded-account resize validated.
 
 ## Goal
 
@@ -11,7 +11,6 @@ from Android Termux, macOS, or Linux. The normal interface remains:
 envr git
 envr relay
 envr up 4
-envr up 4 repository-folder
 envr go
 envr go repository-folder
 envr resize 4
@@ -64,8 +63,7 @@ find VPS through Vultr API
 → try the device key
 → fail immediately without an interactive password prompt if unauthorized
 → register the device public key in the Vultr account
-→ run envr up once from an already-authorized device
-→ synchronize every registered envr public key to remote authorized_keys
+→ enroll once with the VPS recovery password
 → reconnect as remote with the device key
 ```
 
@@ -73,8 +71,7 @@ If Vultr supplies the instance default password through its API, envr can
 instead enroll the device directly through a temporary SSH askpass file. The
 password never appears in a process argument or log. If Vultr omits it, envr
 asks for it explicitly in the controlling terminal without an SSH probe
-timeout. Trusted-device synchronization remains a passwordless alternative;
-the Vultr web console can provide the password as a manual fallback.
+timeout. The Vultr web console can provide the password as a manual fallback.
 
 After any key-authorized connection, envr creates or retrieves one strong
 per-VPS recovery password, sets it for root through `chpasswd` standard input,
@@ -154,7 +151,7 @@ authentication. It stores a portable manifest at:
 ```
 
 After a successful connection, the client caches the instance ID, IP, RAM,
-region, SSH host key, and its device key. Later `up` calls first try that exact
+region, SSH host key, and its device key. Later `go` calls first try that exact
 IP with strict host-key checking and key-only authentication. A successful
 cached SSH connection proceeds even if the Vultr API is unavailable. A short,
 best-effort API request may add newly registered envr device public keys to the
@@ -198,12 +195,12 @@ This permits the following cross-device flow without copying a local profile:
 
 # On Android
 envr status
-envr up 4 envr
+envr go envr
 ```
 
 `status` is API-only and works before SSH enrollment. When configured, its API
-requests also use the relay. `up` enrolls the phone, downloads the server
-manifest, resolves `envr`, and attaches to that repository's persistent tmux
+requests also use the relay. `go` enrolls the phone, resolves `envr`, and
+attaches to that repository's persistent tmux
 session.
 
 If no VPS exists, repository configuration must already be cached locally or
@@ -282,52 +279,39 @@ Repository access is tested later, only from the disposable VPS.
 The exact grammar is:
 
 ```text
-envr up RAM [REPOSITORY_FOLDER]
+envr up RAM
 ```
 
-`RAM` is required and must be `1`, `2`, `4`, `8`, or `16`. The repository is
-optional. Without it, the shell starts in `/home/remote/envr`.
-
-If a VPS exists:
-
-```text
-verify requested RAM
-→ start it if stopped (billing already continues while stopped)
-→ ensure this device has SSH access
-→ wait for successful cloud-init
-→ repair missing runtime helpers/packages if needed
-→ synchronize server metadata and credentials locally
-→ repair every registered repository's local Git/key binding
-→ when supplied, resolve and verify the repository from the VPS
-→ attach to the selected persistent tmux session
-```
+`RAM` is required and must be `1`, `2`, `4`, `8`, or `16`. `up` owns only
+initial creation and recovery of an interrupted initial deployment. It never
+selects a repository, changes an existing size, or opens an interactive shell.
 
 If no VPS exists:
 
 ```text
-when supplied, require its saved configuration locally
-→ otherwise proceed without Git configuration
-→ query live plan, OS, and regional availability data
+query live plan, OS, and regional availability data
 → ask Vultr to create in fra, then ams, then waw only when creation is rejected
 → include all registered envr device keys
 → wait for active IPv4, SSH, and successful cloud-init
-→ restore Codex authentication
-→ when supplied, upload its dedicated key and clone/verify it from the VPS
-→ print one concise repository-ready message
-→ attach to the selected persistent tmux session
+→ install and validate the standard runtime
+→ restore cached Codex authentication when present
+→ create the recovery password and durable initial-ready marker
+→ exit with the instruction to run envr go
 ```
 
-An existing repository is never pulled, reset, cleaned, overwritten, or
-switched automatically. Its `origin` must match the configured URL.
+If creation was interrupted before the durable initial-ready condition:
 
-Repository private keys in `~/.ssh/envr` are deliberately not loaded into a
-global SSH agent and are not discovered by OpenSSH automatically. On every
-successful `up`, envr reads the validated server manifest and idempotently
-repairs each existing repository's local `core.sshCommand` so it points to
-that repository's dedicated key and managed
-known-hosts file. The repair performs no clone, pull, fetch, or Git-host
-connection. Selecting a repository additionally uploads its cached key and
-verifies live access before attachment.
+```text
+repeat envr up with the original RAM
+→ locate the same VPS through trusted cache or API
+→ finish bootstrap without creating a replacement
+→ record initial-ready
+→ exit with the instruction to run envr go
+```
+
+A healthy existing VPS makes `up` fail with the two valid choices: `envr go`
+to connect or `envr resize RAM` to change its size. A different RAM cannot be
+used while initial setup is incomplete; the original size must finish first.
 
 Regional fallback is permitted only before Vultr returns an instance ID. Once
 an instance exists, `envr` never deletes it or creates a replacement because
@@ -337,14 +321,22 @@ leaves that single instance intact.
 
 ## `envr go`
 
-`envr go [REPOSITORY_FOLDER]` is reconnect-only. With a repository it selects
-that repository's persistent tmux session; without one it reads the last
-workspace saved on the VPS. It tries the trusted cached IP, host key, and
-device key before using the API. The reconnect path does not rerun cloud-init,
-runtime repair, credential restoration, or Git-host verification. It may start
-an existing stopped VPS, but it never creates, replaces, or resizes one. With
-no managed VPS it fails with the single instruction to run
-`envr up RAM [repository]`.
+`envr go [REPOSITORY_FOLDER]` owns all interactive connection and workspace
+selection. With no argument it reads the last workspace saved on the VPS. With
+a repository already present, it validates only that local Git directory and
+attaches immediately without a Git-host request. If the configured repository
+path is absent, it synchronizes configuration, uploads that repository's
+dedicated key, clones and verifies it from the VPS, records it as the last
+workspace, and attaches.
+
+An existing path is never pulled, reset, cleaned, overwritten, or switched;
+its absence is the only condition that permits cloning. Repository private
+keys remain repository-local and are never loaded into a global SSH agent.
+
+`go` tries the trusted cached IP, host key, and device key before using the API.
+It may start an existing stopped VPS, but it never creates, replaces, or
+resizes one. With no managed VPS it fails with the single instruction to run
+`envr up RAM`.
 
 ## `envr resize`
 
@@ -385,7 +377,7 @@ fresh envr bootstrap and current Codex CLI.
 Codex must not be running. `resize` refuses before creating a target when a
 Codex process is found, then checks again immediately before cutover. The old
 tmux server is stopped before the final copy. Process memory and tmux sessions
-cannot move between VPSs; after attachment to a fresh destination tmux,
+cannot move between VPSs; after `envr go` creates a fresh destination tmux,
 `scodex resume` uses the copied Codex session history.
 
 The transaction is:
@@ -409,7 +401,7 @@ verify one source and requested live plan
 → promote and cache the target
 → create the target's new recovery password
 → delete the source
-→ attach in the last selected workspace
+→ exit with the instruction to run envr go
 ```
 
 The temporary migration identity is removed from both machines. Repository
@@ -422,7 +414,10 @@ is deleted only after transfer and destination validation. The labels
 `envr-codex-resize-target` and `envr-codex-resize-source` make interruption
 recovery deterministic: rerunning the same command discards an uncommitted
 target, completes a validated promotion, or restores a lone retired source.
-`up` refuses when the source marker says resize is incomplete, `status` shows
+The source and target also carry role-specific resize markers; the promoted
+target keeps its marker until old-source deletion is confirmed, preventing a
+second device from mistaking incomplete cleanup for a finished resize.
+`go` refuses when the source marker says resize is incomplete, `status` shows
 the migration roles, and `destroy` refuses until resize is resolved.
 
 ## VPS bootstrap
@@ -461,9 +456,9 @@ firewall rules.
 
 ## Remote shell and Codex
 
-`envr up` never launches Codex. It attaches to a normal shell in a persistent,
+`envr go` never launches Codex. It attaches to a normal shell in a persistent,
 per-workspace tmux session. Cached Codex authentication is still restored
-before connection.
+during initial creation and refreshed locally after disconnection.
 
 ```text
 no repository       → envr-workspace in /home/remote/envr
