@@ -1981,5 +1981,43 @@ class ParserTests(unittest.TestCase):
                 envr.build_parser().parse_args(["resize", "3"])
 
 
+class MainDispatchTests(unittest.TestCase):
+    def test_successful_up_without_attachment_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = mock.Mock()
+            app.root = Path(temporary)
+            app.up.return_value = None
+            with mock.patch.object(envr, "Envr", return_value=app):
+                result = envr.main(["up", "4"])
+
+            self.assertEqual(result, 0)
+            app.up.assert_called_once_with(4)
+            app.connect_shell.assert_not_called()
+
+    def test_successful_resize_without_attachment_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = mock.Mock()
+            app.root = Path(temporary)
+            app.resize.return_value = None
+            with mock.patch.object(envr, "Envr", return_value=app):
+                result = envr.main(["resize", "16"])
+
+            self.assertEqual(result, 0)
+            app.resize.assert_called_once_with(16)
+            app.connect_shell.assert_not_called()
+
+    def test_go_is_the_only_command_that_attaches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = mock.Mock()
+            app.root = Path(temporary)
+            attachment = ({"id": "instance-id"}, {"folder": "envr"})
+            app.go.return_value = attachment
+            with mock.patch.object(envr, "Envr", return_value=app):
+                result = envr.main(["go", "envr"])
+
+            self.assertEqual(result, 0)
+            app.go.assert_called_once_with("envr")
+            app.connect_shell.assert_called_once_with(*attachment)
+
 if __name__ == "__main__":
     unittest.main()

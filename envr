@@ -3783,6 +3783,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             app.close_api_tunnel()
             app.connect_shell(*attachment)
             return 0
+        return 0
     except KeyboardInterrupt:
         eprint("\nenvr: interrupted")
         return 130
@@ -3791,7 +3792,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 1
     finally:
         app.close_api_tunnel()
-    return 1
 
 
 if __name__ == "__main__":
