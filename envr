@@ -31,10 +31,12 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.4.1"
+VERSION = "0.6.0"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
+RESIZE_TARGET_LABEL = "envr-codex-resize-target"
+RESIZE_SOURCE_LABEL = "envr-codex-resize-source"
 MANAGEMENT_TAG = "envr-managed"
 DEVICE_KEY_PREFIX = "envr-device-"
 REMOTE_USER = "remote"
@@ -44,12 +46,15 @@ REMOTE_ROOT = f"{REMOTE_HOME}/envr"
 REMOTE_CONFIG_ROOT = f"{REMOTE_HOME}/.config/envr"
 REMOTE_REPOS = f"{REMOTE_CONFIG_ROOT}/repos.json"
 REMOTE_RECOVERY_PASSWORD = f"{REMOTE_CONFIG_ROOT}/recovery-password"
+REMOTE_LAST_WORKSPACE = f"{REMOTE_CONFIG_ROOT}/last-workspace"
+REMOTE_RESIZE_MARKER = f"{REMOTE_CONFIG_ROOT}/resize-in-progress"
 REGIONS = ("fra", "ams", "waw")
 PLAN_IDS = {
     1: "vc2-1c-1gb",
     2: "vc2-1c-2gb",
     4: "vc2-2c-4gb",
     8: "vc2-4c-8gb",
+    16: "vc2-6c-16gb",
 }
 SSH_CONNECT_TIMEOUT = 10
 INSTANCE_TIMEOUT = 600
@@ -572,6 +577,9 @@ class VultrAPI:
     def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", resource, payload=payload)
 
+    def patch(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.request("PATCH", resource, payload=payload)
+
     def delete(self, resource: str) -> None:
         self.request("DELETE", resource)
 
@@ -700,7 +708,7 @@ class Envr:
         if password:
             atomic_write_text(self.password_path, password + "\n")
 
-    def cached_instance(self, ram_gb: int) -> dict[str, Any] | None:
+    def cached_instance(self, ram_gb: int | None = None) -> dict[str, Any] | None:
         state = self.state()
         instance_id = str(state.get("instance_id") or "")
         main_ip = str(state.get("main_ip") or "")
@@ -710,7 +718,7 @@ class Envr:
             return None
         if (
             not instance_id
-            or cached_ram_gb != ram_gb
+            or (ram_gb is not None and cached_ram_gb != ram_gb)
             or not self.vps_key.is_file()
             or not self.vps_known_hosts.is_file()
         ):
@@ -722,7 +730,7 @@ class Envr:
                     {
                         "id": instance_id,
                         "main_ip": main_ip,
-                        "ram": ram_gb * 1024,
+                        "ram": cached_ram_gb * 1024,
                         "region": state.get("region"),
                     }
                 )
@@ -737,7 +745,7 @@ class Envr:
         return {
             "id": instance_id,
             "main_ip": main_ip,
-            "ram": ram_gb * 1024,
+            "ram": cached_ram_gb * 1024,
             "region": state.get("region"),
             "status": "active",
             "power_status": "running",
@@ -1279,17 +1287,24 @@ class Envr:
         ]
         return sorted(managed, key=lambda key: str(key.get("id")))
 
-    def managed_instances(self, api: VultrAPI) -> list[dict[str, Any]]:
+    def all_instances(self, api: VultrAPI) -> list[dict[str, Any]]:
         response = api.get("instances", query={"per_page": 500})
         instances = response.get("instances")
         if not isinstance(instances, list):
             raise EnvrError("Vultr API returned an invalid instance list")
+        return [instance for instance in instances if isinstance(instance, dict)]
+
+    def managed_instances(self, api: VultrAPI) -> list[dict[str, Any]]:
+        return self.managed_from(self.all_instances(api))
+
+    def managed_from(
+        self, instances: Sequence[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         tag = self.management_tag()
         managed = [
             instance
             for instance in instances
-            if isinstance(instance, dict)
-            and any(
+            if any(
                 str(instance_tag) == tag
                 or str(instance_tag).startswith(tag + "-")
                 for instance_tag in (instance.get("tags") or [])
@@ -1297,6 +1312,27 @@ class Envr:
             and instance.get("label") == LABEL
         ]
         return sorted(managed, key=lambda item: str(item.get("date_created", "")))
+
+    def resize_instances(self, api: VultrAPI) -> list[dict[str, Any]]:
+        return self.resize_from(self.all_instances(api))
+
+    def resize_from(
+        self, instances: Sequence[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        labels = {RESIZE_TARGET_LABEL, RESIZE_SOURCE_LABEL}
+        tag = self.management_tag()
+        return sorted(
+            [
+                instance
+                for instance in instances
+                if instance.get("label") in labels
+                and any(
+                    str(value) == tag or str(value).startswith(tag + "-")
+                    for value in (instance.get("tags") or [])
+                )
+            ],
+            key=lambda item: str(item.get("date_created", "")),
+        )
 
     def resolve_single_instance(
         self, api: VultrAPI, *, allow_none: bool = True
@@ -1456,6 +1492,10 @@ runcmd:
         api: VultrAPI,
         ram_gb: int,
         repository: dict[str, Any] | None,
+        *,
+        label: str = LABEL,
+        cache_state: bool = True,
+        prepare_workspace: bool = True,
     ) -> dict[str, Any]:
         plan_id = PLAN_IDS[ram_gb]
         catalog = self.plan_catalog(api)
@@ -1488,7 +1528,7 @@ runcmd:
                 "region": region,
                 "plan": plan_id,
                 "os_id": os_id,
-                "label": LABEL,
+                "label": label,
                 "hostname": REMOTE_HOSTNAME,
                 "tags": [self.management_tag()],
                 "sshkey_id": key_ids,
@@ -1506,7 +1546,9 @@ runcmd:
                     raise EnvrError("Vultr did not return the created instance ID")
             except ApiError as error:
                 wait_seconds = 20 if error.status == 0 or error.status >= 500 else 0
-                discovered = self.reconcile_creation(api, wait_seconds=wait_seconds)
+                discovered = self.reconcile_creation(
+                    api, label=label, wait_seconds=wait_seconds
+                )
                 if len(discovered) == 1:
                     instance = discovered[0]
                 elif len(discovered) > 1:
@@ -1526,45 +1568,69 @@ runcmd:
                 else:
                     raise
 
-            self.save_instance_state(instance, ram_gb=ram_gb, region=region)
+            if cache_state:
+                self.save_instance_state(instance, ram_gb=ram_gb, region=region)
             try:
-                active = self.wait_for_instance(api, str(instance["id"]))
+                active = self.wait_for_instance(
+                    api, str(instance["id"]), cache_state=cache_state
+                )
                 self.wait_for_ssh(active)
                 self.wait_for_cloud_init(active)
             except (EnvrError, subprocess.TimeoutExpired) as error:
+                resume_command = (
+                    f"envr up {ram_gb}"
+                    if label == LABEL
+                    else f"envr resize {ram_gb}"
+                )
                 raise EnvrError(
                     f"VPS {instance.get('id')} was created and remains running "
                     f"and billable, but setup did not finish: {error}. "
-                    f"Run envr up {ram_gb} to resume it"
+                    f"Run {resume_command} to resume it"
                 ) from error
 
-            try:
-                self.ensure_remote_runtime(active)
-                self.ensure_recovery_password(active)
-                self.install_cached_auth(active)
-                if repository is not None:
-                    self.ensure_remote_repository(active, repository)
-                self.record_successful_connection(active)
-            except (EnvrError, subprocess.TimeoutExpired) as error:
-                raise EnvrError(
-                    f"VPS {active.get('id')} is running and billable, but "
-                    f"workspace setup failed: {error}"
-                ) from error
+            if prepare_workspace:
+                try:
+                    self.ensure_remote_runtime(active)
+                    self.ensure_recovery_password(active)
+                    self.install_cached_auth(active)
+                    if repository is not None:
+                        self.ensure_remote_repository(active, repository)
+                    self.set_last_workspace(
+                        active,
+                        str(repository["folder"]) if repository is not None else None,
+                    )
+                    self.record_successful_connection(active)
+                except (EnvrError, subprocess.TimeoutExpired) as error:
+                    raise EnvrError(
+                        f"VPS {active.get('id')} is running and billable, but "
+                        f"workspace setup failed: {error}"
+                    ) from error
             return active
 
         raise EnvrError(f"all configured regions failed: {last_error}")
 
     def reconcile_creation(
-        self, api: VultrAPI, *, wait_seconds: int
+        self, api: VultrAPI, *, label: str = LABEL, wait_seconds: int
     ) -> list[dict[str, Any]]:
         deadline = time.monotonic() + wait_seconds
         while True:
-            instances = self.managed_instances(api)
+            instances = [
+                instance
+                for instance in self.all_instances(api)
+                if instance.get("label") == label
+                and self.management_tag() in (instance.get("tags") or [])
+            ]
             if instances or time.monotonic() >= deadline:
                 return instances
             time.sleep(2)
 
-    def wait_for_instance(self, api: VultrAPI, instance_id: str) -> dict[str, Any]:
+    def wait_for_instance(
+        self,
+        api: VultrAPI,
+        instance_id: str,
+        *,
+        cache_state: bool = True,
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + INSTANCE_TIMEOUT
         last: dict[str, Any] | None = None
         while time.monotonic() < deadline:
@@ -1579,7 +1645,8 @@ runcmd:
                     and ip
                     and ip != "0.0.0.0"
                 ):
-                    self.save_instance_state(instance)
+                    if cache_state:
+                        self.save_instance_state(instance)
                     return instance
             time.sleep(5)
         status = (
@@ -2451,6 +2518,89 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         self.update_remote_manifest(instance, repository)
         print(f"Repository ready: {folder}")
 
+    def repair_remote_repository_bindings(
+        self, instance: dict[str, Any]
+    ) -> None:
+        script = r"""set -euo pipefail
+manifest=$1
+root=/home/remote/envr
+key_root=/home/remote/.ssh/envr
+known_hosts="$key_root/known_hosts"
+test -s "$manifest" || exit 0
+install -d -m 700 "$key_root"
+touch "$known_hosts"
+chmod 600 "$known_hosts"
+jq -r '.repositories | keys[]' "$manifest" |
+while IFS= read -r folder; do
+    case "$folder" in
+        [A-Za-z0-9]*) ;;
+        *) continue ;;
+    esac
+    case "$folder" in
+        *[!A-Za-z0-9._-]*) continue ;;
+    esac
+    target="$root/$folder"
+    key="$key_root/$folder"
+    test -f "$key" || continue
+    git -C "$target" rev-parse --git-dir >/dev/null 2>&1 || continue
+    chmod 600 "$key"
+    ssh_command="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o UserKnownHostsFile=$known_hosts"
+    git -C "$target" config --local core.sshCommand "$ssh_command"
+done
+"""
+        self.remote_script(
+            instance,
+            script,
+            (REMOTE_REPOS,),
+            quiet=True,
+            timeout=60,
+        )
+
+    def set_last_workspace(
+        self, instance: dict[str, Any], folder: str | None
+    ) -> None:
+        value = folder or "."
+        if value != "." and not FOLDER_RE.fullmatch(value):
+            raise EnvrError(f"invalid repository folder: {value!r}")
+        script = f"""set -euo pipefail
+install -d -m 700 {shlex.quote(REMOTE_CONFIG_ROOT)}
+temporary=$(mktemp {shlex.quote(REMOTE_CONFIG_ROOT)}/.last-workspace.XXXXXX)
+trap 'rm -f "$temporary"' EXIT
+printf '%s\n' "$1" > "$temporary"
+chmod 600 "$temporary"
+mv -f "$temporary" {shlex.quote(REMOTE_LAST_WORKSPACE)}
+trap - EXIT
+"""
+        self.remote_script(instance, script, (value,), quiet=True, timeout=30)
+
+    def last_workspace(self, instance: dict[str, Any]) -> str | None:
+        result = self.remote_command(
+            instance,
+            f"test -s {shlex.quote(REMOTE_LAST_WORKSPACE)} && "
+            f"cat {shlex.quote(REMOTE_LAST_WORKSPACE)}",
+            capture=True,
+            check=False,
+            quiet=True,
+            timeout=30,
+        )
+        value = result.stdout.strip() if result.returncode == 0 else "."
+        if value == ".":
+            return None
+        if not FOLDER_RE.fullmatch(value):
+            raise EnvrError("server last-workspace state is invalid")
+        return value
+
+    def refuse_incomplete_resize(self, instance: dict[str, Any]) -> None:
+        result = self.remote_command(
+            instance,
+            f"test -e {shlex.quote(REMOTE_RESIZE_MARKER)}",
+            check=False,
+            quiet=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
+
     def connect_shell(
         self,
         instance: dict[str, Any],
@@ -2465,8 +2615,12 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
             target = f"{REMOTE_ROOT}/{display_name}"
             session = f"envr-repo-{display_name}"
         command = (
-            "exec tmux new-session -A "
-            f"-s {shlex.quote(session)} -c {shlex.quote(target)}"
+            f"tmux has-session -t {shlex.quote(session)} 2>/dev/null || "
+            f"tmux new-session -d -s {shlex.quote(session)} "
+            f"-c {shlex.quote(target)}; "
+            f"tmux set-option -t {shlex.quote(session)} mouse on; "
+            "tmux set-option -g history-limit 50000; "
+            f"exec tmux attach-session -t {shlex.quote(session)}"
         )
         print(f"Connecting to {display_name}. Detach safely with Ctrl-b d.")
         try:
@@ -2482,15 +2636,85 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         instance: dict[str, Any],
         folder: str | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        self.refuse_incomplete_resize(instance)
         self.wait_for_cloud_init(instance)
         self.ensure_remote_runtime(instance)
         self.ensure_recovery_password(instance)
         synchronized = self.sync_from_server(instance)
         if not synchronized:
             self.install_cached_auth(instance)
+        self.repair_remote_repository_bindings(instance)
         repository = self.repository(folder) if folder is not None else None
         if repository is not None:
             self.ensure_remote_repository(instance, repository)
+        self.set_last_workspace(instance, folder)
+        self.record_successful_connection(instance)
+        return instance, repository
+
+    def probe_cached_instance(self, ram_gb: int | None) -> dict[str, Any] | None:
+        cached = self.cached_instance(ram_gb)
+        if cached is None:
+            return None
+        reachable = None
+        for attempt in range(3):
+            try:
+                reachable = self.remote_command(
+                    cached,
+                    "true",
+                    check=False,
+                    quiet=True,
+                    timeout=7,
+                    connect_timeout=5,
+                    strict_host_key_checking="yes",
+                )
+            except subprocess.TimeoutExpired:
+                reachable = None
+            if reachable is not None and reachable.returncode == 0:
+                break
+            failure = (reachable.stderr or "") if reachable is not None else ""
+            if not self.transient_ssh_probe_failure(failure) or attempt == 2:
+                break
+            print("SSH handshake interrupted; retrying...")
+            time.sleep(1)
+        if reachable is None or reachable.returncode != 0:
+            return None
+        return cached
+
+    def reconnect_cached(
+        self, ram_gb: int, folder: str | None
+    ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+        cached = self.probe_cached_instance(ram_gb)
+        if cached is None:
+            return None
+        print(f"Using cached VPS at {cached['main_ip']}...")
+        prepared = self.prepare_existing_instance(cached, folder)
+        self.try_cached_device_key_sync(cached)
+        return prepared
+
+    def prepare_go_instance(
+        self, instance: dict[str, Any], folder: str | None
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        self.refuse_incomplete_resize(instance)
+        explicitly_selected = folder is not None
+        if folder is None:
+            folder = self.last_workspace(instance)
+        repository = None
+        if folder is not None:
+            if not FOLDER_RE.fullmatch(folder):
+                raise EnvrError(f"invalid repository folder: {folder!r}")
+            result = self.remote_command(
+                instance,
+                f"git -C {shlex.quote(f'{REMOTE_ROOT}/{folder}')} "
+                "rev-parse --git-dir >/dev/null 2>&1",
+                check=False,
+                quiet=True,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                raise EnvrError(f"repository is not available on the VPS: {folder}")
+            repository = {"folder": folder}
+            if explicitly_selected:
+                self.set_last_workspace(instance, folder)
         self.record_successful_connection(instance)
         return instance, repository
 
@@ -2498,41 +2722,20 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         self, ram_gb: int, folder: str | None
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if ram_gb not in PLAN_IDS:
-            raise EnvrError("RAM must be one of: 1, 2, 4, 8")
+            supported = ", ".join(str(size) for size in sorted(PLAN_IDS))
+            raise EnvrError(f"RAM must be one of: {supported}")
         ensure_commands(("ssh", "scp", "ssh-keygen"))
 
-        cached = self.cached_instance(ram_gb)
+        cached = self.reconnect_cached(ram_gb, folder)
         if cached is not None:
-            reachable = None
-            for attempt in range(3):
-                try:
-                    reachable = self.remote_command(
-                        cached,
-                        "true",
-                        check=False,
-                        quiet=True,
-                        timeout=7,
-                        connect_timeout=5,
-                        strict_host_key_checking="yes",
-                    )
-                except subprocess.TimeoutExpired:
-                    reachable = None
-                if reachable is not None and reachable.returncode == 0:
-                    break
-                failure = (reachable.stderr or "") if reachable is not None else ""
-                if not self.transient_ssh_probe_failure(failure) or attempt == 2:
-                    break
-                print("SSH handshake interrupted; retrying...")
-                time.sleep(1)
-            if reachable is not None and reachable.returncode == 0:
-                print(f"Using cached VPS at {cached['main_ip']}...")
-                prepared = self.prepare_existing_instance(cached, folder)
-                self.try_cached_device_key_sync(cached)
-                return prepared
+            return cached
 
         api = self.api()
         api.get("account")
-        instances = self.managed_instances(api)
+        inventory = self.all_instances(api)
+        if self.resize_from(inventory):
+            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
+        instances = self.managed_from(inventory)
         if len(instances) > 1:
             raise EnvrError(
                 f"conflict: {len(instances)} envr instances exist; "
@@ -2544,7 +2747,7 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
             if current_ram != ram_gb:
                 raise EnvrError(
                     f"existing envr VPS has {current_ram} GB; requested {ram_gb} GB. "
-                    "Run envr destroy before changing size."
+                    f"Run envr resize {ram_gb}."
                 )
             self.save_instance_state(instance, ram_gb=current_ram)
             if instance.get("power_status") == "stopped":
@@ -2556,6 +2759,36 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
             repository = self.repository(folder) if folder is not None else None
             instance = self.create_instance(api, ram_gb, repository)
         return instance, repository
+
+    def go(
+        self, folder: str | None
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        ensure_commands(("ssh", "scp", "ssh-keygen"))
+        cached = self.probe_cached_instance(None)
+        if cached is not None:
+            print(f"Using cached VPS at {cached['main_ip']}...")
+            return self.prepare_go_instance(cached, folder)
+
+        api = self.api()
+        api.get("account")
+        inventory = self.all_instances(api)
+        if self.resize_from(inventory):
+            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
+        instances = self.managed_from(inventory)
+        if len(instances) > 1:
+            raise EnvrError(
+                f"conflict: {len(instances)} envr instances exist; run envr status"
+            )
+        if not instances:
+            raise EnvrError("envr-codex is not running; run envr up RAM [repository]")
+        instance = instances[0]
+        current_ram = self.instance_ram_gb(instance)
+        self.save_instance_state(instance, ram_gb=current_ram)
+        if instance.get("power_status") == "stopped":
+            api.request("POST", f"instances/{instance.get('id')}/start")
+        instance = self.wait_for_instance(api, str(instance.get("id")))
+        self.ensure_device_access(api, instance)
+        return self.prepare_go_instance(instance, folder)
 
     @staticmethod
     def transient_ssh_probe_failure(stderr: str) -> bool:
@@ -2576,14 +2809,558 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         )
         return not any(marker in failure for marker in non_retryable)
 
+    @staticmethod
+    def instance_ram_gb(instance: dict[str, Any]) -> int:
+        return int(instance.get("ram") or 0) // 1024
+
+    def resize_roles(
+        self, api: VultrAPI
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        instances = self.all_instances(api)
+        tag = self.management_tag()
+        owned = [
+            instance
+            for instance in instances
+            if any(
+                str(value) == tag or str(value).startswith(tag + "-")
+                for value in (instance.get("tags") or [])
+            )
+        ]
+        current = [item for item in owned if item.get("label") == LABEL]
+        targets = [
+            item for item in owned if item.get("label") == RESIZE_TARGET_LABEL
+        ]
+        sources = [
+            item for item in owned if item.get("label") == RESIZE_SOURCE_LABEL
+        ]
+        return current, targets, sources
+
+    def set_instance_label(
+        self, api: VultrAPI, instance: dict[str, Any], label: str
+    ) -> None:
+        instance_id = str(instance.get("id") or "")
+        if not instance_id:
+            raise EnvrError("cannot relabel an instance without an ID")
+        api.patch(f"instances/{instance_id}", {"label": label})
+        instance["label"] = label
+
+    def set_resize_marker(self, instance: dict[str, Any], ram_gb: int) -> None:
+        script = f"""set -euo pipefail
+install -d -m 700 {shlex.quote(REMOTE_CONFIG_ROOT)}
+temporary=$(mktemp {shlex.quote(REMOTE_CONFIG_ROOT)}/.resize.XXXXXX)
+trap 'rm -f "$temporary"' EXIT
+printf '%s\n' "$1" > "$temporary"
+chmod 600 "$temporary"
+mv -f "$temporary" {shlex.quote(REMOTE_RESIZE_MARKER)}
+trap - EXIT
+"""
+        self.remote_script(
+            instance, script, (str(ram_gb),), quiet=True, timeout=30
+        )
+
+    def clear_resize_marker(self, instance: dict[str, Any]) -> None:
+        self.remote_command(
+            instance,
+            f"rm -f {shlex.quote(REMOTE_RESIZE_MARKER)}",
+            quiet=True,
+            check=False,
+            timeout=30,
+        )
+
+    def ensure_resize_source_ready(self, instance: dict[str, Any]) -> int:
+        script = r"""set -euo pipefail
+if pgrep -u remote -af '[c]odex' >/dev/null; then
+    echo CODEX_RUNNING
+    exit 20
+fi
+for path in /home/remote/envr /home/remote/.codex /home/remote/.ssh/envr; do
+    test -d "$path" || continue
+    if find "$path" -xdev \( -type b -o -type c -o -type p -o -type s \) \
+        -print -quit | grep -q .; then
+        echo SPECIAL_FILE
+        exit 21
+    fi
+done
+total=0
+for path in \
+    /home/remote/envr \
+    /home/remote/.codex \
+    /home/remote/.ssh/envr \
+    /home/remote/.config/envr/repos.json \
+    /home/remote/.config/envr/last-workspace; do
+    test -e "$path" || continue
+    size=$(du -sb -- "$path" | awk '{print $1}')
+    total=$((total + size))
+done
+printf '%s\n' "$total"
+"""
+        result = self.remote_script(
+            instance, script, (), capture=True, check=False, timeout=120
+        )
+        detail = result.stdout.strip()
+        if result.returncode == 20 or detail == "CODEX_RUNNING":
+            raise EnvrError(
+                "Codex is still running. Exit Codex and detach from tmux, "
+                "then run resize again"
+            )
+        if result.returncode == 21 or detail == "SPECIAL_FILE":
+            raise EnvrError("a preserved directory contains a special file")
+        if result.returncode != 0 or not detail.isdigit():
+            raise EnvrError("could not measure the resize data")
+        return int(detail)
+
+    def ensure_resize_capacity(
+        self, target: dict[str, Any], transfer_bytes: int
+    ) -> None:
+        result = self.remote_command(
+            target,
+            "df -PB1 /home/remote | awk 'NR == 2 {print $4}'",
+            capture=True,
+            quiet=True,
+            timeout=30,
+        )
+        available = result.stdout.strip()
+        if not available.isdigit():
+            raise EnvrError("could not determine destination free space")
+        required = transfer_bytes + 1024**3
+        if int(available) < required:
+            raise EnvrError(
+                "preserved data does not fit on the requested VPS "
+                "with the required 1 GB safety margin"
+            )
+
+    def migration_key_and_host(
+        self,
+        source: dict[str, Any],
+        target: dict[str, Any],
+        token: str,
+    ) -> tuple[str, str]:
+        key = f"{REMOTE_CONFIG_ROOT}/.resize-key-{token}"
+        self.remote_command(
+            target,
+            f"install -d -m 700 {shlex.quote(REMOTE_CONFIG_ROOT)} && "
+            f"ssh-keygen -q -t ed25519 -N '' -C {shlex.quote('envr-resize-' + token)} "
+            f"-f {shlex.quote(key)}",
+            quiet=True,
+            timeout=30,
+        )
+        public = self.remote_command(
+            target,
+            f"cat {shlex.quote(key + '.pub')}",
+            capture=True,
+            quiet=True,
+            timeout=30,
+        ).stdout.strip()
+        if not public.startswith("ssh-ed25519 ") or "\n" in public:
+            raise EnvrError("destination produced an invalid migration key")
+        host_key = self.remote_command(
+            source,
+            "cat /etc/ssh/ssh_host_ed25519_key.pub",
+            capture=True,
+            quiet=True,
+            timeout=30,
+        ).stdout.strip()
+        if not host_key.startswith("ssh-ed25519 ") or "\n" in host_key:
+            raise EnvrError("source has an invalid SSH host key")
+        return public, host_key
+
+    def authorize_resize_target(
+        self,
+        source: dict[str, Any],
+        target: dict[str, Any],
+        public_key: str,
+        token: str,
+    ) -> None:
+        target_ip = str(target.get("main_ip") or "")
+        try:
+            if ipaddress.ip_address(target_ip).version != 4:
+                raise ValueError
+        except ValueError as error:
+            raise EnvrError("resize target does not have a valid IPv4 address") from error
+        script = r"""set -euo pipefail
+ip=$1
+key=$2
+marker=$3
+install -d -m 700 /home/remote/.ssh
+touch /home/remote/.ssh/authorized_keys
+chmod 600 /home/remote/.ssh/authorized_keys
+printf '\n' >> /home/remote/.ssh/authorized_keys
+printf 'restrict,from="%s" %s %s\n' "$ip" "$key" "$marker" \
+    >> /home/remote/.ssh/authorized_keys
+"""
+        self.remote_script(
+            source,
+            script,
+            (target_ip, public_key, f"envr-resize-{token}"),
+            quiet=True,
+            timeout=30,
+        )
+
+    def cleanup_resize_access(
+        self,
+        source: dict[str, Any],
+        target: dict[str, Any],
+        token: str,
+    ) -> None:
+        marker = f"envr-resize-{token}"
+        script = r"""set -euo pipefail
+path=/home/remote/.ssh/authorized_keys
+test -f "$path" || exit 0
+temporary=$(mktemp /home/remote/.ssh/.authorized_keys.XXXXXX)
+trap 'rm -f "$temporary"' EXIT
+grep -Fv -- "$1" "$path" > "$temporary" || true
+chmod 600 "$temporary"
+mv -f "$temporary" "$path"
+trap - EXIT
+"""
+        with contextlib.suppress(EnvrError, subprocess.TimeoutExpired):
+            self.remote_script(source, script, (marker,), quiet=True, timeout=30)
+        excludes = f"{REMOTE_CONFIG_ROOT}/.resize-excludes-{token}"
+        with contextlib.suppress(EnvrError, subprocess.TimeoutExpired):
+            self.remote_command(
+                source,
+                f"rm -f {shlex.quote(excludes)}",
+                quiet=True,
+                check=False,
+                timeout=30,
+            )
+        key = f"{REMOTE_CONFIG_ROOT}/.resize-key-{token}"
+        with contextlib.suppress(EnvrError, subprocess.TimeoutExpired):
+            self.remote_command(
+                target,
+                f"rm -f {shlex.quote(key)} {shlex.quote(key + '.pub')} "
+                f"{shlex.quote(key + '.known_hosts')} "
+                f"{shlex.quote(key + '.excludes')}",
+                quiet=True,
+                check=False,
+                timeout=30,
+            )
+
+    def prepare_resize_excludes(
+        self, source: dict[str, Any], token: str
+    ) -> None:
+        excludes = f"{REMOTE_CONFIG_ROOT}/.resize-excludes-{token}"
+        script = r"""set -euo pipefail
+root=$1
+output=$2
+config=${output%/*}
+temporary=$(mktemp "$config/.resize-excludes.XXXXXX")
+ignored_list=""
+trap 'rm -f "$temporary" ${ignored_list:+"$ignored_list"}' EXIT
+: > "$temporary"
+shopt -s nullglob
+for repository in \
+    "$root"/* \
+    "$root"/.[!.]* \
+    "$root"/..?*; do
+    test -d "$repository" || continue
+    git -C "$repository" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
+    folder=${repository##*/}
+    ignored_list=$(mktemp "$config/.resize-ignored.XXXXXX")
+    git -C "$repository" ls-files \
+        --others --ignored --exclude-standard --directory -z > "$ignored_list"
+    while IFS= read -r -d '' ignored; do
+        printf '/%s/%s\0' "$folder" "$ignored" >> "$temporary"
+    done < "$ignored_list"
+    rm -f "$ignored_list"
+    ignored_list=""
+done
+chmod 600 "$temporary"
+mv -f "$temporary" "$output"
+trap - EXIT
+"""
+        self.remote_script(
+            source, script, (REMOTE_ROOT, excludes), quiet=True, timeout=300
+        )
+
+    def transfer_resize_data(
+        self,
+        source: dict[str, Any],
+        target: dict[str, Any],
+        host_key: str,
+        token: str,
+    ) -> None:
+        source_ip = str(source.get("main_ip") or "")
+        try:
+            if ipaddress.ip_address(source_ip).version != 4:
+                raise ValueError
+        except ValueError as error:
+            raise EnvrError("resize source does not have a valid IPv4 address") from error
+        key = f"{REMOTE_CONFIG_ROOT}/.resize-key-{token}"
+        known_hosts = key + ".known_hosts"
+        source_excludes = f"{REMOTE_CONFIG_ROOT}/.resize-excludes-{token}"
+        host_fields = host_key.split()
+        known_host_line = f"{source_ip} {host_fields[0]} {host_fields[1]}"
+        setup = r"""set -euo pipefail
+printf '%s\n' "$1" > "$2"
+chmod 600 "$2"
+install -d -m 755 /home/remote/envr
+install -d -m 700 /home/remote/.codex /home/remote/.ssh/envr /home/remote/.config/envr
+"""
+        self.remote_script(
+            target, setup, (known_host_line, known_hosts), quiet=True, timeout=30
+        )
+        script = r"""set -euo pipefail
+source_ip=$1
+key=$2
+known_hosts=$3
+source_excludes=$4
+local_excludes="${key}.excludes"
+ssh_command="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts -o ConnectTimeout=10"
+rsync -a --no-owner --no-group -e "$ssh_command" \
+    "remote@${source_ip}:${source_excludes}" "$local_excludes"
+sync_dir() {
+    source=$1
+    destination=$2
+    excludes=${3:-}
+    if test -n "$excludes"; then
+        rsync -aH --no-owner --no-group --delete --from0 \
+            --exclude-from="$excludes" --rsync-path="sudo -n rsync" \
+            -e "$ssh_command" \
+            "remote@${source_ip}:${source}/" "${destination}/"
+    else
+        rsync -aH --no-owner --no-group --delete \
+            --rsync-path="sudo -n rsync" -e "$ssh_command" \
+            "remote@${source_ip}:${source}/" "${destination}/"
+    fi
+}
+sync_file() {
+    source=$1
+    destination=$2
+    if ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes \
+        -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+        -o ConnectTimeout=10 "remote@$source_ip" "test -f '$source'"; then
+        rsync -a --no-owner --no-group --rsync-path="sudo -n rsync" \
+            -e "$ssh_command" \
+            "remote@${source_ip}:${source}" "$destination"
+    else
+        rm -f "$destination"
+    fi
+}
+sync_dir /home/remote/envr /home/remote/envr "$local_excludes"
+sync_dir /home/remote/.codex /home/remote/.codex
+sync_dir /home/remote/.ssh/envr /home/remote/.ssh/envr
+sync_file /home/remote/.config/envr/repos.json /home/remote/.config/envr/repos.json
+sync_file /home/remote/.config/envr/last-workspace /home/remote/.config/envr/last-workspace
+verify_dir() {
+    source=$1
+    destination=$2
+    excludes=${3:-}
+    if test -n "$excludes"; then
+        output=$(rsync -aHnci --no-owner --no-group --delete --from0 \
+            --exclude-from="$excludes" --rsync-path="sudo -n rsync" \
+            -e "$ssh_command" \
+            "remote@${source_ip}:${source}/" "${destination}/")
+    else
+        output=$(rsync -aHnci --no-owner --no-group --delete \
+            --rsync-path="sudo -n rsync" -e "$ssh_command" \
+            "remote@${source_ip}:${source}/" "${destination}/")
+    fi
+    test -z "$output"
+}
+verify_file() {
+    source=$1
+    destination=$2
+    if test -f "$destination"; then
+        output=$(rsync -anci --no-owner --no-group \
+            --rsync-path="sudo -n rsync" -e "$ssh_command" \
+            "remote@${source_ip}:${source}" "$destination")
+        test -z "$output"
+    fi
+}
+verify_dir /home/remote/envr /home/remote/envr "$local_excludes"
+verify_dir /home/remote/.codex /home/remote/.codex
+verify_dir /home/remote/.ssh/envr /home/remote/.ssh/envr
+verify_file /home/remote/.config/envr/repos.json /home/remote/.config/envr/repos.json
+verify_file /home/remote/.config/envr/last-workspace /home/remote/.config/envr/last-workspace
+"""
+        self.remote_script(
+            target,
+            script,
+            (source_ip, key, known_hosts, source_excludes),
+            quiet=True,
+            timeout=1800,
+        )
+
+    def validate_resize_target(self, target: dict[str, Any]) -> None:
+        self.sync_from_server(target)
+        script = r"""set -euo pipefail
+test -d /home/remote/envr
+test -d /home/remote/.codex
+test -d /home/remote/.ssh/envr
+manifest=/home/remote/.config/envr/repos.json
+test -f "$manifest" || exit 0
+jq -e '.schema == 1 and (.repositories | type == "object")' "$manifest" >/dev/null
+jq -r '.repositories | keys[]' "$manifest" |
+while IFS= read -r folder; do
+    git -C "/home/remote/envr/$folder" rev-parse --git-dir >/dev/null
+    key="/home/remote/.ssh/envr/$folder"
+    test -s "$key"
+    chmod 600 "$key"
+    ssh-keygen -y -P '' -f "$key" >/dev/null
+done
+"""
+        self.remote_script(target, script, (), quiet=True, timeout=120)
+        self.repair_remote_repository_bindings(target)
+        probe = self.remote_command(
+            target,
+            "true",
+            check=False,
+            quiet=True,
+            timeout=15,
+            strict_host_key_checking="yes",
+        )
+        if probe.returncode != 0:
+            raise EnvrError("destination SSH validation failed")
+
+    def finish_resize(
+        self,
+        api: VultrAPI,
+        target: dict[str, Any],
+        source: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if target.get("label") == RESIZE_TARGET_LABEL:
+            self.set_instance_label(api, target, LABEL)
+        self.save_instance_state(target, ram_gb=self.instance_ram_gb(target))
+        self.ensure_device_access(api, target)
+        self.ensure_recovery_password(target)
+        self.clear_resize_marker(target)
+        self.repair_remote_repository_bindings(target)
+        self.sync_from_server(target)
+        folder = self.last_workspace(target)
+        repository = self.repository(folder) if folder is not None else None
+        self.delete_instance(api, source)
+        print(f"Resize complete: {self.instance_ram_gb(target)} GB.")
+        return target, repository
+
+    def resize(
+        self, ram_gb: int
+    ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+        if ram_gb not in PLAN_IDS:
+            supported = ", ".join(str(size) for size in sorted(PLAN_IDS))
+            raise EnvrError(f"RAM must be one of: {supported}")
+        ensure_commands(("ssh", "scp", "ssh-keygen"))
+        api = self.api()
+        api.get("account")
+        current, targets, sources = self.resize_roles(api)
+        if any(len(role) > 1 for role in (current, targets, sources)):
+            raise EnvrError("ambiguous resize state; run envr status")
+        if current and targets and sources:
+            raise EnvrError("ambiguous resize state has three managed VPSs")
+
+        if current and not sources and targets:
+            print("Removing an incomplete resize target...")
+            self.delete_instance(api, targets[0])
+            self.clear_resize_marker(current[0])
+            targets = []
+        if not current and sources and targets:
+            target_ram = self.instance_ram_gb(targets[0])
+            if target_ram != ram_gb:
+                raise EnvrError(
+                    f"interrupted resize target is {target_ram} GB; "
+                    f"run envr resize {target_ram}"
+                )
+            return self.finish_resize(api, targets[0], sources[0])
+        if current and sources:
+            target_ram = self.instance_ram_gb(current[0])
+            if target_ram != ram_gb:
+                raise EnvrError(
+                    f"promoted resize target is {target_ram} GB; "
+                    f"run envr resize {target_ram} to finish cleanup"
+                )
+            return self.finish_resize(api, current[0], sources[0])
+        if not current and sources and not targets:
+            self.set_instance_label(api, sources[0], LABEL)
+            self.clear_resize_marker(sources[0])
+            current = sources
+            sources = []
+        if len(current) != 1 or targets or sources:
+            raise EnvrError("envr-codex is not running or resize state is incomplete")
+
+        source = current[0]
+        current_ram = self.instance_ram_gb(source)
+        self.ensure_device_access(api, source)
+        self.wait_for_cloud_init(source)
+        folder = self.last_workspace(source)
+        if current_ram == ram_gb:
+            print(f"envr VPS is already {ram_gb} GB.")
+            return self.prepare_existing_instance(source, folder)
+
+        transfer_bytes = self.ensure_resize_source_ready(source)
+        print(
+            f"Resize envr from {current_ram} GB to {ram_gb} GB?\n\n"
+            "Preserved: workspace, Codex state, repository keys\n"
+            "Rebuilt: operating system and standard envr tools\n"
+            "Not preserved: Git-ignored files, custom packages, VPNs, "
+            "containers, services, or firewall rules"
+        )
+        if not prompt_yes_no("Continue?"):
+            print("Cancelled.")
+            return None
+
+        self.sync_from_server(source)
+        self.set_resize_marker(source, ram_gb)
+        target: dict[str, Any] | None = None
+        promoted = False
+        try:
+            target = self.create_instance(
+                api,
+                ram_gb,
+                None,
+                label=RESIZE_TARGET_LABEL,
+                cache_state=False,
+                prepare_workspace=False,
+            )
+            self.ensure_resize_capacity(target, transfer_bytes)
+            token = secrets.token_hex(8)
+            public_key, host_key = self.migration_key_and_host(source, target, token)
+            try:
+                self.prepare_resize_excludes(source, token)
+                self.authorize_resize_target(source, target, public_key, token)
+                transfer_bytes = self.ensure_resize_source_ready(source)
+                self.ensure_resize_capacity(target, transfer_bytes)
+                self.remote_command(
+                    source,
+                    "tmux kill-server 2>/dev/null || true",
+                    quiet=True,
+                    timeout=30,
+                )
+                print("Transferring workspace and Codex state...")
+                self.transfer_resize_data(source, target, host_key, token)
+            finally:
+                self.cleanup_resize_access(source, target, token)
+            print("Validating the new VPS...")
+            self.validate_resize_target(target)
+            self.set_instance_label(api, source, RESIZE_SOURCE_LABEL)
+            promoted = True
+            return self.finish_resize(api, target, source)
+        except (EnvrError, subprocess.TimeoutExpired, KeyboardInterrupt):
+            if not promoted:
+                try:
+                    rollback_current, rollback_targets, rollback_sources = (
+                        self.resize_roles(api)
+                    )
+                    if not rollback_sources and len(rollback_current) == 1:
+                        for candidate in rollback_targets:
+                            self.delete_instance(api, candidate)
+                        self.clear_resize_marker(source)
+                except (EnvrError, subprocess.TimeoutExpired):
+                    eprint(
+                        "Warning: resize cleanup could not be confirmed; "
+                        f"run envr resize {ram_gb} again"
+                    )
+            raise
+
     def status(self) -> int:
         api = self.api()
         account_response = api.get("account")
         account = account_response.get("account")
         if not isinstance(account, dict):
             raise EnvrError("Vultr API returned invalid account information")
-        instances = self.managed_instances(api)
-        if len(instances) == 1:
+        inventory = self.all_instances(api)
+        instances = self.managed_from(inventory)
+        resizing = self.resize_from(inventory)
+        if len(instances) == 1 and not resizing:
             self.save_instance_state(instances[0])
         plans = self.plan_catalog(api)
 
@@ -2614,9 +3391,23 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         else:
             print("  Credit runway:    n/a")
 
+        if resizing:
+            print("\nResize: incomplete")
+            for instance in resizing:
+                role = (
+                    "source"
+                    if instance.get("label") == RESIZE_SOURCE_LABEL
+                    else "target"
+                )
+                print(
+                    f"  {role.capitalize()}: {self.instance_ram_gb(instance)} GB · "
+                    f"{instance.get('main_ip', '')} · {instance.get('status', '')}"
+                )
+            print("  Resume with: envr resize RAM")
+
         if not instances:
             print("\nenvr-codex: not running")
-            return 0
+            return 2 if resizing else 0
 
         conflict = len(instances) > 1
         if conflict:
@@ -2644,14 +3435,20 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
                 print(f"  Price:      ${float(hourly):.3f}/hour · ${monthly}/month")
             else:
                 print("  Price:      unavailable")
-        return 2 if conflict else 0
+        return 2 if conflict or resizing else 0
 
     def port_open(self, port: int) -> None:
         if not 1 <= port <= 65535:
             raise EnvrError("port must be an integer from 1 through 65535")
         ensure_commands(("ssh", "ssh-keygen"))
         api = self.api()
-        instance = self.resolve_single_instance(api)
+        inventory = self.all_instances(api)
+        if self.resize_from(inventory):
+            raise EnvrError("resize is incomplete; finish it before opening ports")
+        instances = self.managed_from(inventory)
+        if len(instances) > 1:
+            raise EnvrError("multiple envr VPSs exist; run envr status")
+        instance = instances[0] if instances else None
         if instance is None:
             raise EnvrError(
                 "envr-codex is not running. Start it with "
@@ -2742,7 +3539,7 @@ fi
         api.delete(f"instances/{instance_id}")
         deadline = time.monotonic() + DELETE_TIMEOUT
         while time.monotonic() < deadline:
-            instances = self.managed_instances(api)
+            instances = self.all_instances(api)
             if not any(item.get("id") == instance_id for item in instances):
                 self.remove_known_host(str(instance.get("main_ip", "")))
                 return
@@ -2762,7 +3559,10 @@ fi
     def destroy(self) -> None:
         ensure_commands(("ssh", "scp", "ssh-keygen"))
         api = self.api()
-        instances = self.managed_instances(api)
+        inventory = self.all_instances(api)
+        if self.resize_from(inventory):
+            raise EnvrError("resize is incomplete; finish it before destroy")
+        instances = self.managed_from(inventory)
         if not instances:
             print("envr-codex: not running")
             self.clear_instance_state()
@@ -2842,6 +3642,14 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("ram", type=int, choices=sorted(PLAN_IDS))
     up.add_argument("repository_folder", nargs="?")
 
+    go = subparsers.add_parser("go", help="reconnect without specifying RAM")
+    go.add_argument("repository_folder", nargs="?")
+
+    resize = subparsers.add_parser(
+        "resize", help="move the environment to a fresh VPS size"
+    )
+    resize.add_argument("ram", type=int, choices=sorted(PLAN_IDS))
+
     subparsers.add_parser("status", help="show account and VPS status")
 
     port_open = subparsers.add_parser("port-open", help="open one TCP/UDP port")
@@ -2856,6 +3664,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         eprint("envr requires Python 3.10 or newer")
         return 1
     parser = build_parser()
+    if arguments is None and sys.argv[1:] == ["help"]:
+        arguments = ["--help"]
+    elif arguments is not None and list(arguments) == ["help"]:
+        arguments = ["--help"]
     namespace = parser.parse_args(arguments)
     app = Envr()
     try:
@@ -2869,6 +3681,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 return 0
             if namespace.command == "up":
                 attachment = app.up(namespace.ram, namespace.repository_folder)
+            elif namespace.command == "go":
+                attachment = app.go(namespace.repository_folder)
+            elif namespace.command == "resize":
+                attachment = app.resize(namespace.ram)
             elif namespace.command == "status":
                 return app.status()
             elif namespace.command == "port-open":

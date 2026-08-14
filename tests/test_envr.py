@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -122,6 +123,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         type(self).received_payload = json.loads(self.rfile.read(length))
         self.do_GET()
 
+    def do_PATCH(self) -> None:  # noqa: N802
+        self.do_POST()
+
     def log_message(self, _format: str, *_args: object) -> None:
         return
 
@@ -157,6 +161,11 @@ class APITests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 503)
         self.assertEqual(raised.exception.message, "capacity unavailable")
         self.assertTrue(envr.Envr.retryable_region_error(raised.exception))
+
+    def test_patch_uses_update_instance_method_and_json(self) -> None:
+        response = self.api.patch("instances/example", {"label": "new-label"})
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(ApiHandler.received_payload, {"label": "new-label"})
 
     def test_new_token_is_validated_before_it_is_saved(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -431,9 +440,18 @@ class LifecycleLogicTests(unittest.TestCase):
                 {"folder": "envr", "identity": "igonna-envr"},
             )
             command = app.remote_command.call_args_list[0].args[1]
-            self.assertIn("exec tmux new-session -A", command)
-            self.assertIn("-s envr-repo-envr", command)
+            self.assertIn("tmux has-session -t envr-repo-envr", command)
+            self.assertIn("tmux new-session -d -s envr-repo-envr", command)
             self.assertIn(f"-c {envr.REMOTE_ROOT}/envr", command)
+            self.assertIn(
+                "tmux set-option -t envr-repo-envr mouse on",
+                command,
+            )
+            self.assertIn("tmux set-option -g history-limit 50000", command)
+            self.assertIn(
+                "exec tmux attach-session -t envr-repo-envr",
+                command,
+            )
             self.assertNotIn("codex login", command)
             self.assertNotIn("exec codex", command)
             self.assertTrue(app.remote_command.call_args_list[0].kwargs["tty"])
@@ -447,9 +465,17 @@ class LifecycleLogicTests(unittest.TestCase):
             app.sync_from_server = mock.Mock(return_value=False)
             app.connect_shell({"main_ip": "192.0.2.1"}, None)
             command = app.remote_command.call_args_list[0].args[1]
-            self.assertIn("exec tmux new-session -A", command)
-            self.assertIn("-s envr-workspace", command)
+            self.assertIn("tmux has-session -t envr-workspace", command)
+            self.assertIn("tmux new-session -d -s envr-workspace", command)
             self.assertIn(f"-c {envr.REMOTE_ROOT}", command)
+            self.assertIn(
+                "tmux set-option -t envr-workspace mouse on",
+                command,
+            )
+            self.assertIn(
+                "exec tmux attach-session -t envr-workspace",
+                command,
+            )
             self.assertNotIn("codex login", command)
             self.assertNotIn("exec codex", command)
 
@@ -510,6 +536,30 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertIn('git ls-remote "$url"', script)
             self.assertIn("Repository ready: envr", output.getvalue())
 
+    def test_reconnect_repairs_registered_repository_key_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            instance = {"main_ip": "192.0.2.1"}
+
+            app.repair_remote_repository_bindings(instance)
+
+            script = app.remote_script.call_args.args[1]
+            arguments = app.remote_script.call_args.args[2]
+            self.assertEqual(arguments, (envr.REMOTE_REPOS,))
+            self.assertIn("test -s \"$manifest\" || exit 0", script)
+            self.assertIn("key_root=/home/remote/.ssh/envr", script)
+            self.assertIn("chmod 600 \"$key\"", script)
+            self.assertIn(
+                'git -C "$target" config --local core.sshCommand',
+                script,
+            )
+            self.assertNotIn("git clone", script)
+            self.assertNotIn("git pull", script)
+            self.assertNotIn("git ls-remote", script)
+
     def test_create_payload_and_regional_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -555,6 +605,7 @@ class LifecycleLogicTests(unittest.TestCase):
             app.record_successful_connection = mock.Mock()
             app.install_cached_auth = mock.Mock()
             app.ensure_remote_repository = mock.Mock()
+            app.set_last_workspace = mock.Mock()
             api = mock.Mock()
             api.post.side_effect = [
                 envr.ApiError(400, "regional capacity unavailable"),
@@ -723,6 +774,65 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(app.remote_command.call_count, 2)
             app.api.assert_not_called()
 
+    def test_go_uses_cached_vps_and_last_workspace_without_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            envr.atomic_write_text(app.vps_key, "private-key")
+            envr.atomic_write_text(app.vps_known_hosts, "trusted-host-key")
+            app.save_instance_state(
+                {
+                    "id": "instance-id",
+                    "main_ip": "192.0.2.10",
+                    "ram": 16384,
+                    "region": "fra",
+                }
+            )
+            app.api = mock.Mock(side_effect=AssertionError("API must not be required"))
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            app.last_workspace = mock.Mock(return_value="bet1")
+            app.refuse_incomplete_resize = mock.Mock()
+            app.record_successful_connection = mock.Mock()
+            app.prepare_existing_instance = mock.Mock(
+                side_effect=AssertionError("go must not run up maintenance")
+            )
+            app.wait_for_cloud_init = mock.Mock(
+                side_effect=AssertionError("go must not wait for cloud-init")
+            )
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = app.go(None)
+
+            self.assertEqual(result[0]["id"], "instance-id")
+            self.assertEqual(result[1], {"folder": "bet1"})
+            app.api.assert_not_called()
+            app.last_workspace.assert_called_once()
+            app.refuse_incomplete_resize.assert_called_once()
+            app.record_successful_connection.assert_called_once()
+            app.prepare_existing_instance.assert_not_called()
+            app.wait_for_cloud_init.assert_not_called()
+
+    def test_go_without_vps_never_creates_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = mock.Mock()
+            api.get.return_value = {"account": {}}
+            app.api = mock.Mock(return_value=api)
+            app.all_instances = mock.Mock(return_value=[])
+            app.create_instance = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                self.assertRaisesRegex(envr.EnvrError, "envr up RAM"),
+            ):
+                app.go("bet1")
+
+            app.create_instance.assert_not_called()
+
     def test_instance_cache_preserves_ip_and_password_securely(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -798,7 +908,10 @@ class LifecycleLogicTests(unittest.TestCase):
                 ]
             )
             app.remote_script = mock.Mock()
-            instance = {"id": "instance-id", "main_ip": "192.0.2.10"}
+            instance = {
+                "id": "instance-id",
+                "main_ip": "192.0.2.10",
+            }
 
             app.sync_managed_device_keys(mock.Mock(), instance)
 
@@ -823,7 +936,10 @@ class LifecycleLogicTests(unittest.TestCase):
             )
             app.sync_managed_device_keys = mock.Mock()
             api = mock.Mock()
-            instance = {"id": "instance-id", "main_ip": "192.0.2.10"}
+            instance = {
+                "id": "instance-id",
+                "main_ip": "192.0.2.10",
+            }
 
             app.ensure_device_access(api, instance)
 
@@ -1061,8 +1177,14 @@ class LifecycleLogicTests(unittest.TestCase):
     def test_destroy_can_confirm_after_unreachable_ssh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
-            instance = {"id": "instance-id", "main_ip": "192.0.2.10"}
+            instance = {
+                "id": "instance-id",
+                "main_ip": "192.0.2.10",
+                "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG],
+            }
             app.api = mock.Mock(return_value=mock.Mock())
+            app.all_instances = mock.Mock(return_value=[instance])
             app.managed_instances = mock.Mock(return_value=[instance])
             app.ensure_device_access = mock.Mock(
                 side_effect=envr.subprocess.TimeoutExpired(["ssh"], 15)
@@ -1148,9 +1270,12 @@ class LifecycleLogicTests(unittest.TestCase):
                 "ram": 4096,
                 "region": "fra",
                 "power_status": "running",
+                "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG],
             }
             api = mock.Mock()
             app.api = mock.Mock(return_value=api)
+            app.all_instances = mock.Mock(return_value=[instance])
             app.managed_instances = mock.Mock(return_value=[instance])
             app.wait_for_instance = mock.Mock(return_value=instance)
             app.ensure_device_access = mock.Mock()
@@ -1159,6 +1284,9 @@ class LifecycleLogicTests(unittest.TestCase):
             app.ensure_recovery_password = mock.Mock()
             app.record_successful_connection = mock.Mock()
             app.ensure_remote_repository = mock.Mock()
+            app.repair_remote_repository_bindings = mock.Mock()
+            app.refuse_incomplete_resize = mock.Mock()
+            app.set_last_workspace = mock.Mock()
 
             def synchronize(_instance: dict[str, object]) -> bool:
                 key_dir = app.git_root / "envr"
@@ -1192,6 +1320,7 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(selected_instance["id"], "instance-id")
             self.assertEqual(repository["folder"], "envr")
             app.sync_from_server.assert_called_once_with(instance)
+            app.repair_remote_repository_bindings.assert_called_once_with(instance)
 
     def test_existing_vps_opens_workspace_without_repository_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1202,8 +1331,11 @@ class LifecycleLogicTests(unittest.TestCase):
                 "ram": 1024,
                 "region": "fra",
                 "power_status": "running",
+                "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG],
             }
             app.api = mock.Mock(return_value=mock.Mock())
+            app.all_instances = mock.Mock(return_value=[instance])
             app.managed_instances = mock.Mock(return_value=[instance])
             app.wait_for_instance = mock.Mock(return_value=instance)
             app.ensure_device_access = mock.Mock()
@@ -1214,6 +1346,9 @@ class LifecycleLogicTests(unittest.TestCase):
             app.sync_from_server = mock.Mock(return_value=False)
             app.install_cached_auth = mock.Mock()
             app.ensure_remote_repository = mock.Mock()
+            app.repair_remote_repository_bindings = mock.Mock()
+            app.refuse_incomplete_resize = mock.Mock()
+            app.set_last_workspace = mock.Mock()
             with (
                 mock.patch.object(envr, "ensure_commands"),
                 contextlib.redirect_stdout(io.StringIO()),
@@ -1222,6 +1357,7 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(selected_instance["id"], "instance-id")
             self.assertIsNone(repository)
             app.ensure_remote_repository.assert_not_called()
+            app.repair_remote_repository_bindings.assert_called_once_with(instance)
 
     def test_server_manifest_refreshes_local_repository_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1360,9 +1496,305 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(app.state()["main_ip"], "192.0.2.10")
 
 
+class ResizeTests(unittest.TestCase):
+    def instance(self, identifier: str, label: str, ram: int, ip: str) -> dict:
+        return {
+            "id": identifier,
+            "label": label,
+            "tags": [envr.MANAGEMENT_TAG],
+            "ram": ram,
+            "main_ip": ip,
+            "status": "active",
+            "power_status": "running",
+        }
+
+    def test_transfer_contains_only_the_minimal_preserved_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock()
+            source = self.instance("old", envr.LABEL, 16384, "192.0.2.10")
+            target = self.instance(
+                "new", envr.RESIZE_TARGET_LABEL, 4096, "192.0.2.20"
+            )
+
+            app.transfer_resize_data(
+                source,
+                target,
+                "ssh-ed25519 AAAASOURCE source",
+                "token",
+            )
+
+            transfer_script = app.remote_script.call_args_list[1].args[1]
+            self.assertIn("sync_dir /home/remote/envr", transfer_script)
+            self.assertIn("sync_dir /home/remote/.codex", transfer_script)
+            self.assertIn("sync_dir /home/remote/.ssh/envr", transfer_script)
+            self.assertIn(".config/envr/repos.json", transfer_script)
+            self.assertIn(".config/envr/last-workspace", transfer_script)
+            self.assertIn("--exclude-from=\"$excludes\"", transfer_script)
+            self.assertIn("--from0", transfer_script)
+            self.assertIn('--rsync-path="sudo -n rsync"', transfer_script)
+            self.assertIn("--no-owner --no-group", transfer_script)
+            self.assertNotIn("recovery-password", transfer_script)
+            self.assertNotIn("apt", transfer_script)
+            self.assertNotIn("/etc/", transfer_script)
+            self.assertNotIn("/var/", transfer_script)
+            self.assertIn("rsync -aHnci --no-owner --no-group", transfer_script)
+
+    def test_resize_excludes_only_git_ignored_untracked_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock()
+
+            app.prepare_resize_excludes({"id": "old"}, "token")
+
+            script = app.remote_script.call_args.args[1]
+            self.assertIn("git -C \"$repository\" ls-files", script)
+            self.assertIn("--others --ignored --exclude-standard", script)
+            self.assertIn("--directory -z", script)
+            self.assertNotIn("git clean", script)
+
+    def test_resize_git_exclusion_manifest_uses_exact_git_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            workspace = base / "workspace"
+            repository = workspace / "repo"
+            config = base / "config"
+            repository.mkdir(parents=True)
+            config.mkdir()
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            (repository / ".gitignore").write_text("*.cache\n", encoding="utf-8")
+            (repository / "tracked.cache").write_text("tracked\n", encoding="utf-8")
+            (repository / "ignored.cache").write_text("ignored\n", encoding="utf-8")
+            (repository / "work.txt").write_text("work\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "-f", "tracked.cache"],
+                check=True,
+            )
+            app = envr.Envr(base / "state")
+            app.remote_script = mock.Mock()
+            app.prepare_resize_excludes({"id": "old"}, "token")
+            script = app.remote_script.call_args.args[1]
+            output = config / "excludes"
+
+            subprocess.run(
+                ["bash", "-s", "--", str(workspace), str(output)],
+                input=script,
+                text=True,
+                check=True,
+            )
+
+            excluded = output.read_bytes().split(b"\0")
+            self.assertIn(b"/repo/ignored.cache", excluded)
+            self.assertNotIn(b"/repo/tracked.cache", excluded)
+            self.assertNotIn(b"/repo/work.txt", excluded)
+
+    def test_resize_refuses_while_codex_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock(
+                return_value=SimpleNamespace(
+                    returncode=20, stdout="CODEX_RUNNING\n", stderr=""
+                )
+            )
+            with self.assertRaisesRegex(envr.EnvrError, "Codex is still running"):
+                app.ensure_resize_source_ready({"id": "old"})
+            script = app.remote_script.call_args.args[1]
+            self.assertIn("pgrep -u remote -af '[c]odex'", script)
+
+    def test_success_promotes_only_after_validation_then_deletes_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance("old", envr.LABEL, 16384, "192.0.2.10")
+            target = self.instance(
+                "new", envr.RESIZE_TARGET_LABEL, 4096, "192.0.2.20"
+            )
+            api = mock.Mock()
+            app.api = mock.Mock(return_value=api)
+            app.resize_roles = mock.Mock(return_value=([source], [], []))
+            app.ensure_device_access = mock.Mock()
+            app.wait_for_cloud_init = mock.Mock()
+            app.last_workspace = mock.Mock(return_value=None)
+            app.ensure_resize_source_ready = mock.Mock(return_value=1024)
+            app.sync_from_server = mock.Mock(return_value=True)
+            app.set_resize_marker = mock.Mock()
+            app.create_instance = mock.Mock(return_value=target)
+            app.ensure_resize_capacity = mock.Mock()
+            app.migration_key_and_host = mock.Mock(
+                return_value=(
+                    "ssh-ed25519 AAAATARGET target",
+                    "ssh-ed25519 AAAASOURCE source",
+                )
+            )
+            app.authorize_resize_target = mock.Mock()
+            app.prepare_resize_excludes = mock.Mock()
+            app.cleanup_resize_access = mock.Mock()
+            app.transfer_resize_data = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            app.validate_resize_target = mock.Mock()
+            app.ensure_recovery_password = mock.Mock()
+            app.clear_resize_marker = mock.Mock()
+            app.repair_remote_repository_bindings = mock.Mock()
+            app.delete_instance = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                mock.patch.object(envr, "prompt_yes_no", return_value=True),
+                contextlib.redirect_stdout(output := io.StringIO()),
+            ):
+                attachment = app.resize(4)
+
+            self.assertEqual(attachment, (target, None))
+            self.assertIn("Not preserved: Git-ignored files", output.getvalue())
+            app.validate_resize_target.assert_called_once_with(target)
+            self.assertEqual(
+                api.patch.call_args_list,
+                [
+                    mock.call(
+                        "instances/old", {"label": envr.RESIZE_SOURCE_LABEL}
+                    ),
+                    mock.call("instances/new", {"label": envr.LABEL}),
+                ],
+            )
+            app.delete_instance.assert_called_once_with(api, source)
+            self.assertEqual(app.state()["instance_id"], "new")
+            create_kwargs = app.create_instance.call_args.kwargs
+            self.assertEqual(create_kwargs["label"], envr.RESIZE_TARGET_LABEL)
+            self.assertFalse(create_kwargs["cache_state"])
+            self.assertFalse(create_kwargs["prepare_workspace"])
+
+    def test_failed_validation_deletes_only_target_and_keeps_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance("old", envr.LABEL, 16384, "192.0.2.10")
+            target = self.instance(
+                "new", envr.RESIZE_TARGET_LABEL, 4096, "192.0.2.20"
+            )
+            api = mock.Mock()
+            app.api = mock.Mock(return_value=api)
+            app.resize_roles = mock.Mock(
+                side_effect=[([source], [], []), ([source], [target], [])]
+            )
+            app.ensure_device_access = mock.Mock()
+            app.wait_for_cloud_init = mock.Mock()
+            app.last_workspace = mock.Mock(return_value=None)
+            app.ensure_resize_source_ready = mock.Mock(return_value=1024)
+            app.sync_from_server = mock.Mock(return_value=True)
+            app.set_resize_marker = mock.Mock()
+            app.create_instance = mock.Mock(return_value=target)
+            app.ensure_resize_capacity = mock.Mock()
+            app.migration_key_and_host = mock.Mock(
+                return_value=(
+                    "ssh-ed25519 AAAATARGET target",
+                    "ssh-ed25519 AAAASOURCE source",
+                )
+            )
+            app.authorize_resize_target = mock.Mock()
+            app.prepare_resize_excludes = mock.Mock()
+            app.cleanup_resize_access = mock.Mock()
+            app.transfer_resize_data = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            app.validate_resize_target = mock.Mock(
+                side_effect=envr.EnvrError("bad copy")
+            )
+            app.delete_instance = mock.Mock()
+            app.clear_resize_marker = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                mock.patch.object(envr, "prompt_yes_no", return_value=True),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(envr.EnvrError, "bad copy"),
+            ):
+                app.resize(4)
+
+            api.patch.assert_not_called()
+            app.delete_instance.assert_called_once_with(api, target)
+            app.clear_resize_marker.assert_called_with(source)
+            self.assertEqual(source["label"], envr.LABEL)
+
+    def test_interrupted_promotion_is_finished_without_third_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance(
+                "old", envr.RESIZE_SOURCE_LABEL, 16384, "192.0.2.10"
+            )
+            target = self.instance(
+                "new", envr.RESIZE_TARGET_LABEL, 4096, "192.0.2.20"
+            )
+            api = mock.Mock()
+            app.api = mock.Mock(return_value=api)
+            app.resize_roles = mock.Mock(return_value=([], [target], [source]))
+            expected = (target, None)
+            app.finish_resize = mock.Mock(return_value=expected)
+            app.create_instance = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = app.resize(4)
+
+            self.assertEqual(result, expected)
+            app.finish_resize.assert_called_once_with(api, target, source)
+            app.create_instance.assert_not_called()
+
+    def test_interrupted_resize_must_finish_its_original_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance(
+                "old", envr.RESIZE_SOURCE_LABEL, 16384, "192.0.2.10"
+            )
+            target = self.instance(
+                "new", envr.RESIZE_TARGET_LABEL, 4096, "192.0.2.20"
+            )
+            app.api = mock.Mock(return_value=mock.Mock())
+            app.resize_roles = mock.Mock(return_value=([], [target], [source]))
+            app.finish_resize = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                self.assertRaisesRegex(envr.EnvrError, "run envr resize 4"),
+            ):
+                app.resize(8)
+
+            app.finish_resize.assert_not_called()
+
+    def test_destroy_refuses_while_resize_instance_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance("old", envr.LABEL, 16384, "192.0.2.10")
+            target = self.instance(
+                "new", envr.RESIZE_TARGET_LABEL, 4096, "192.0.2.20"
+            )
+            app.api = mock.Mock(return_value=mock.Mock())
+            app.all_instances = mock.Mock(return_value=[source, target])
+            app.delete_instance = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                self.assertRaisesRegex(envr.EnvrError, "finish it before destroy"),
+            ):
+                app.destroy()
+
+            app.delete_instance.assert_not_called()
+
+
 class ParserTests(unittest.TestCase):
+    def test_help_word_is_accepted_as_a_convenience(self) -> None:
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            envr.main(["help"])
+        self.assertEqual(raised.exception.code, 0)
+
     def test_up_requires_ram_but_repository_is_optional(self) -> None:
         parser = envr.build_parser()
+        self.assertEqual(envr.PLAN_IDS[16], "vc2-6c-16gb")
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["up"])
@@ -1371,10 +1803,30 @@ class ParserTests(unittest.TestCase):
         namespace = parser.parse_args(["up", "4"])
         self.assertEqual(namespace.ram, 4)
         self.assertIsNone(namespace.repository_folder)
+        namespace = parser.parse_args(["up", "16", "repo"])
+        self.assertEqual(namespace.ram, 16)
+        self.assertEqual(namespace.repository_folder, "repo")
 
     def test_port_is_parsed_as_integer(self) -> None:
         namespace = envr.build_parser().parse_args(["port-open", "443"])
         self.assertEqual(namespace.port, 443)
+
+    def test_go_accepts_optional_repository_without_ram(self) -> None:
+        parser = envr.build_parser()
+        namespace = parser.parse_args(["go"])
+        self.assertIsNone(namespace.repository_folder)
+        namespace = parser.parse_args(["go", "bet1"])
+        self.assertEqual(namespace.repository_folder, "bet1")
+
+    def test_resize_requires_one_supported_size(self) -> None:
+        namespace = envr.build_parser().parse_args(["resize", "16"])
+        self.assertEqual(namespace.command, "resize")
+        self.assertEqual(namespace.ram, 16)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                envr.build_parser().parse_args(["resize"])
+            with self.assertRaises(SystemExit):
+                envr.build_parser().parse_args(["resize", "3"])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,9 @@ envr git
 envr relay
 envr up 4
 envr up 4 repository-folder
+envr go
+envr go repository-folder
+envr resize 4
 envr status
 envr port-open 443
 envr destroy
@@ -31,8 +34,10 @@ tag:   envr-managed
 ```
 
 Legacy tags beginning with `envr-managed-` are also recognized. Finding more
-than one matching VPS is a conflict: `up` and `port-open` refuse to guess,
-`status` lists them, and `destroy` checks and offers to remove all of them.
+than one matching normal VPS is a conflict: `up` and `port-open` refuse to
+guess, `status` lists them, and `destroy` checks and offers to remove all of
+them. `resize` is the sole controlled exception: while it runs, one temporary
+target or one retired source can coexist under distinct labels.
 
 This account-wide identity is deliberate. A VPS created from a Mac must be
 discoverable from a phone using the same Vultr account; identity is not tied to
@@ -280,7 +285,7 @@ The exact grammar is:
 envr up RAM [REPOSITORY_FOLDER]
 ```
 
-`RAM` is required and must be `1`, `2`, `4`, or `8`. The repository is
+`RAM` is required and must be `1`, `2`, `4`, `8`, or `16`. The repository is
 optional. Without it, the shell starts in `/home/remote/envr`.
 
 If a VPS exists:
@@ -292,6 +297,7 @@ verify requested RAM
 → wait for successful cloud-init
 → repair missing runtime helpers/packages if needed
 → synchronize server metadata and credentials locally
+→ repair every registered repository's local Git/key binding
 → when supplied, resolve and verify the repository from the VPS
 → attach to the selected persistent tmux session
 ```
@@ -314,11 +320,110 @@ when supplied, require its saved configuration locally
 An existing repository is never pulled, reset, cleaned, overwritten, or
 switched automatically. Its `origin` must match the configured URL.
 
+Repository private keys in `~/.ssh/envr` are deliberately not loaded into a
+global SSH agent and are not discovered by OpenSSH automatically. On every
+successful `up`, envr reads the validated server manifest and idempotently
+repairs each existing repository's local `core.sshCommand` so it points to
+that repository's dedicated key and managed
+known-hosts file. The repair performs no clone, pull, fetch, or Git-host
+connection. Selecting a repository additionally uploads its cached key and
+verifies live access before attachment.
+
 Regional fallback is permitted only before Vultr returns an instance ID. Once
 an instance exists, `envr` never deletes it or creates a replacement because
 of an SSH, cloud-init, setup, or local timeout. It reports that the VPS remains
 billable, and the same `envr up RAM` command resumes setup. Interruption also
 leaves that single instance intact.
+
+## `envr go`
+
+`envr go [REPOSITORY_FOLDER]` is reconnect-only. With a repository it selects
+that repository's persistent tmux session; without one it reads the last
+workspace saved on the VPS. It tries the trusted cached IP, host key, and
+device key before using the API. The reconnect path does not rerun cloud-init,
+runtime repair, credential restoration, or Git-host verification. It may start
+an existing stopped VPS, but it never creates, replaces, or resizes one. With
+no managed VPS it fails with the single instruction to run
+`envr up RAM [repository]`.
+
+## `envr resize`
+
+The exact grammar is:
+
+```text
+envr resize RAM
+```
+
+`RAM` must be one of the normal supported sizes. Resize always creates a fresh
+Ubuntu VPS, so the same behavior supports both larger and smaller plans. It is
+not a block-device clone and does not use Vultr snapshots or native plan
+resize.
+
+The migration payload is deliberately limited to:
+
+```text
+/home/remote/envr/
+/home/remote/.codex/
+/home/remote/.ssh/envr/
+/home/remote/.config/envr/repos.json
+/home/remote/.config/envr/last-workspace
+```
+
+This preserves every repository and meaningful working file, complete Codex
+persistent state, repository-specific keys, repository metadata, and the
+directory to open after migration. For each Git repository, envr asks Git for
+untracked ignored paths using `git ls-files --others --ignored
+--exclude-standard`; only those paths are excluded. Tracked files and
+untracked non-ignored work remain in the payload. Source-side rsync runs through
+passwordless sudo so readable tracked content is not lost merely because a
+container or tool created it as root; destination ownership remains `remote`.
+The recovery-password record, authorized_keys, root
+state, system directories, packages, VPNs, containers, services, firewall
+rules, and open ports are not copied. The destination receives the normal
+fresh envr bootstrap and current Codex CLI.
+
+Codex must not be running. `resize` refuses before creating a target when a
+Codex process is found, then checks again immediately before cutover. The old
+tmux server is stopped before the final copy. Process memory and tmux sessions
+cannot move between VPSs; after attachment to a fresh destination tmux,
+`scodex resume` uses the copied Codex session history.
+
+The transaction is:
+
+```text
+verify one source and requested live plan
+→ measure only the migration payload
+→ confirm the preservation boundary
+→ mark the source as resizing
+→ create a fresh temporary target with every registered device key
+→ require payload size plus 1 GB to fit the target
+→ generate a temporary migration key on the target
+→ authorize it on the source only from the target IPv4
+→ pin the source SSH host key obtained over the trusted source connection
+→ rsync directly from source to target over SSH
+→ checksum-dry-run every copied directory and file
+→ validate repository manifests and private keys
+→ refresh local repository and Codex caches from the target
+→ verify destination SSH using the pinned client host key
+→ relabel the source as retired
+→ promote and cache the target
+→ create the target's new recovery password
+→ delete the source
+→ attach in the last selected workspace
+```
+
+The temporary migration identity is removed from both machines. Repository
+and Codex contents travel directly between the VPSs and never through the
+client or optional relay.
+
+Before promotion, every failure leaves the source authoritative and removes
+only the incomplete target when API-confirmed cleanup is possible. The source
+is deleted only after transfer and destination validation. The labels
+`envr-codex-resize-target` and `envr-codex-resize-source` make interruption
+recovery deterministic: rerunning the same command discards an uncommitted
+target, completes a validated promotion, or restores a lone retired source.
+`up` refuses when the source marker says resize is incomplete, `status` shows
+the migration roles, and `destroy` refuses until resize is resolved.
 
 ## VPS bootstrap
 
@@ -337,7 +442,7 @@ Additional disks: none
 IPv6:              disabled initially
 ```
 
-Plan IDs are mapped for the four supported sizes, but their existence, RAM,
+Plan IDs are mapped for the five supported sizes, but their existence, RAM,
 prices, OS ID, locations, and current availability are verified through the
 live API before creation.
 
@@ -365,11 +470,17 @@ no repository       → envr-workspace in /home/remote/envr
 repository "project" → envr-repo-project in /home/remote/envr/project
 ```
 
-`tmux new-session -A` permits multiple devices to attach without terminating
-another client. SSH loss, relay loss, Android suspension, and network changes
-detach the client while the remote session and its processes continue. The
-user can detach deliberately with `Ctrl-b d`. Sessions do not survive VPS
-reboot, process termination, out-of-memory failure, or instance destruction.
+envr creates the selected session only when absent, then uses
+`tmux attach-session` without detaching another client. SSH loss, relay loss,
+Android suspension, and network changes detach the client while the remote
+session and its processes continue. The user can detach deliberately with
+`Ctrl-b d`. Sessions do not survive VPS reboot, process termination,
+out-of-memory failure, or instance destruction.
+
+Before every attachment, envr enables `mouse` on the selected session and sets
+the global history limit to 50,000 lines. This applies to existing sessions
+without replacing `~/.tmux.conf`. In Termux, swipe/wheel events therefore enter
+tmux copy mode and scroll pane history instead of becoming shell Up/Down keys.
 
 The remote helper has exactly two operations:
 
@@ -404,6 +515,7 @@ estimated prepaid runway at the current plan price
 instance ID, region, RAM, CPU, IP
 Vultr default root password
 status, power state, hourly and monthly price
+incomplete resize source/target when present
 ```
 
 Vultr represents prepaid credit as a negative balance. `envr` converts the sign
@@ -432,6 +544,10 @@ ensure device access
 → warn clearly when SSH or synchronization failed
 → ask for confirmation
 ```
+
+`destroy` refuses while a resize target or retired source exists. This keeps a
+partially completed migration out of the older conflicting-instance deletion
+path.
 
 After confirmation, `envr` deletes every conflicting managed instance, waits
 until the API confirms absence, removes obsolete SSH host entries, and clears
@@ -488,6 +604,7 @@ configure repo on macOS
 → configure relay and verify status plus VPS SSH use it without direct fallback
 → interrupt SSH and verify both devices reattach to the persistent tmux session
 → verify scodex auth and scodex resume
+→ resize upward and downward, including one interrupted pre-promotion run
 → open a port
 → destroy from Android
 → recreate from a synchronized device

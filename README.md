@@ -14,6 +14,10 @@ envr git
 envr relay
 envr up 4
 envr up 4 repository-folder
+envr up 16 repository-folder
+envr go
+envr go repository-folder
+envr resize 4
 envr status
 envr port-open 443
 envr destroy
@@ -56,6 +60,8 @@ remote@envr:~/envr$
 The shell runs inside `tmux`. A lost SSH connection, Android suspension, relay
 failure, or network change detaches the client without stopping remote work.
 Detach deliberately with `Ctrl-b d`; the next identical `up` attaches again.
+Mouse mode is enabled for every session so Termux swipe scrolling enters tmux
+history instead of sending shell Up/Down keys.
 The general workspace and every repository use separate sessions:
 
 ```text
@@ -68,6 +74,18 @@ Select a configured repository when needed:
 ```bash
 envr up 4 repository-folder
 ```
+
+After creation, reconnect without repeating the VPS size:
+
+```bash
+envr go                    # last selected workspace
+envr go repository-folder  # a specific repository
+```
+
+`go` never creates or resizes a VPS. It tries the trusted local SSH cache first,
+does not repeat bootstrap or Git-host verification, and uses the Vultr API only
+as a fallback. If no VPS exists, it tells you to run
+`envr up RAM [repository]`.
 
 `envr` never starts Codex automatically. Inside the remote shell:
 
@@ -109,6 +127,12 @@ instead of repeatedly crossing an unreliable or filtered network path.
 Transient failures of the initial safe key probe are retried up to three times;
 authentication, host-key, and local-key failures are never blindly retried.
 
+Every successful reconnect also repairs the repository-local
+`core.sshCommand` for every repository already registered on
+the VPS. Keys under `~/.ssh/envr` are never loaded globally or placed in an
+agent; each repository remains bound only to its own dedicated key. This
+repair does not clone, pull, or contact a Git host.
+
 ## Optional SSH relay
 
 When the direct path to Vultr is filtered or unreliable, configure one stable
@@ -148,6 +172,28 @@ root password:
 ```bash
 envr status
 ```
+
+Move the complete working environment to a fresh supported VPS size:
+
+```bash
+envr resize 4
+```
+
+Resize preserves `/home/remote/envr`, the complete `~/.codex` directory,
+repository keys, repository metadata, and the last selected workspace. Inside
+Git repositories, untracked paths ignored by Git are deliberately omitted;
+tracked files and untracked non-ignored work are preserved. The
+operating system and standard envr tools are rebuilt fresh. Custom packages,
+VPNs, containers, services, firewall rules, and open ports are not migrated.
+Codex must be exited first; process memory and the old tmux process cannot be
+moved, but `scodex resume` sees the copied Codex sessions afterward.
+
+The old VPS remains authoritative until a direct encrypted VPS-to-VPS copy
+passes checksum, repository-key, metadata, and destination-SSH validation.
+Only then is the new VPS promoted and the old one deleted. If the command is
+interrupted, rerunning the same `envr resize RAM` safely restarts an
+uncommitted copy or finishes an already validated promotion. `status` exposes
+an incomplete resize and `destroy` refuses to run until it is resolved.
 
 Open a service port when needed:
 
