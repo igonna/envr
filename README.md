@@ -116,6 +116,8 @@ Within one `go`, SSH and SCP share a private OpenSSH control connection. Once
 one key-authenticated handshake succeeds, workspace selection, the interactive
 shell, and the cache refresh after disconnect reuse that connection instead of
 repeatedly crossing an unreliable or filtered network path.
+Each envr invocation has its own control connection, so independent terminal
+tabs do not depend on one another and closing one does not disconnect another.
 Transient failures of the initial safe key probe are retried up to three times;
 authentication, host-key, and local-key failures are never blindly retried.
 
@@ -166,8 +168,11 @@ envr status
 Move the complete working environment to a fresh supported VPS size:
 
 ```bash
-envr resize 4
+envr resize 24
 ```
+
+Supported sizes are 1, 2, 4, 8, 16, and 24 GB. The 24 GB option uses Vultr's
+12-vCPU High Performance AMD shared-CPU plan.
 
 Resize preserves `/home/remote/envr`, the complete `~/.codex` directory,
 repository keys, repository metadata, and the last selected workspace. Inside

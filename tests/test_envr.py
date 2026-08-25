@@ -348,6 +348,59 @@ class RelayTests(unittest.TestCase):
             )
             self.assertNotEqual(old_control, new_control)
 
+    def test_separate_processes_do_not_share_ssh_control_sockets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = envr.Envr(root)
+            second = envr.Envr(root)
+            relay = envr.RelayConfig("192.0.2.40", 2222, "relay")
+            envr.atomic_write_json(first.relay_config_path, relay.as_dict())
+            envr.atomic_write_text(first.relay_key, "private")
+
+            first_vps = next(
+                value
+                for value in first.ssh_options()
+                if value.startswith("ControlPath=")
+            )
+            repeated_vps = next(
+                value
+                for value in first.ssh_options()
+                if value.startswith("ControlPath=")
+            )
+            second_vps = next(
+                value
+                for value in second.ssh_options()
+                if value.startswith("ControlPath=")
+            )
+            first_relay = next(
+                value
+                for value in first.relay_ssh_options(relay)
+                if value.startswith("ControlPath=")
+            )
+            second_relay = next(
+                value
+                for value in second.relay_ssh_options(relay)
+                if value.startswith("ControlPath=")
+            )
+
+            self.assertEqual(first_vps, repeated_vps)
+            self.assertNotEqual(first_vps, second_vps)
+            self.assertNotEqual(first_relay, second_relay)
+
+    def test_api_relay_tunnel_does_not_own_shared_control_master(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            relay = envr.RelayConfig("192.0.2.40", 2222, "relay")
+            envr.atomic_write_text(app.relay_key, "private")
+
+            options = app.relay_ssh_options(relay, multiplex=False)
+
+            self.assertNotIn("ControlMaster=auto", options)
+            self.assertFalse(
+                any(value.startswith("ControlPath=") for value in options)
+            )
+            self.assertIn("BatchMode=yes", options)
+
     def test_configured_relay_with_missing_key_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -620,6 +673,7 @@ class LifecycleLogicTests(unittest.TestCase):
 
             self.assertEqual(result, active)
             self.assertEqual(api.post.call_count, 2)
+
             first_payload = api.post.call_args_list[0].args[1]
             second_payload = api.post.call_args_list[1].args[1]
             self.assertEqual(first_payload["region"], "fra")
@@ -635,6 +689,30 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertIn("AAAATEST", decoded)
             self.assertIn("AAAAPHONE", decoded)
             app.ensure_remote_repository.assert_not_called()
+
+    def test_plan_catalog_includes_regular_and_high_performance_families(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = mock.Mock()
+            api.get.return_value = {
+                "plans": [
+                    {"id": "vc2-2c-4gb", "ram": 4096},
+                    {"id": "vhp-12c-24gb-amd", "ram": 24576},
+                    {"id": "unrelated-expensive-plan", "ram": 24576},
+                ]
+            }
+
+            catalog = app.plan_catalog(api)
+
+            api.get.assert_called_once_with("plans", query={"per_page": 500})
+            self.assertEqual(
+                set(catalog),
+                {
+                    "vc2-2c-4gb",
+                    "vhp-12c-24gb-amd",
+                    "unrelated-expensive-plan",
+                },
+            )
 
     def test_setup_timeout_after_creation_never_creates_another_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1948,6 +2026,7 @@ class ParserTests(unittest.TestCase):
     def test_up_requires_only_ram(self) -> None:
         parser = envr.build_parser()
         self.assertEqual(envr.PLAN_IDS[16], "vc2-6c-16gb")
+        self.assertEqual(envr.PLAN_IDS[24], "vhp-12c-24gb-amd")
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["up"])
@@ -1955,6 +2034,7 @@ class ParserTests(unittest.TestCase):
                 parser.parse_args(["up", "3", "repo"])
         namespace = parser.parse_args(["up", "4"])
         self.assertEqual(namespace.ram, 4)
+        self.assertEqual(parser.parse_args(["up", "24"]).ram, 24)
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["up", "16", "repo"])
@@ -1974,6 +2054,7 @@ class ParserTests(unittest.TestCase):
         namespace = envr.build_parser().parse_args(["resize", "16"])
         self.assertEqual(namespace.command, "resize")
         self.assertEqual(namespace.ram, 16)
+        self.assertEqual(envr.build_parser().parse_args(["resize", "24"]).ram, 24)
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 envr.build_parser().parse_args(["resize"])

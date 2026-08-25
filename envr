@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -56,6 +56,7 @@ PLAN_IDS = {
     4: "vc2-2c-4gb",
     8: "vc2-4c-8gb",
     16: "vc2-6c-16gb",
+    24: "vhp-12c-24gb-amd",
 }
 SSH_CONNECT_TIMEOUT = 10
 INSTANCE_TIMEOUT = 600
@@ -605,6 +606,7 @@ class Envr:
         self.repos_path = self.root / "repos.json"
         self.state_path = self.root / "state.json"
         self.password_path = self.root / "instance-password"
+        self._ssh_session_id = secrets.token_hex(4)
         if root is None:
             self.migrate_legacy_layout()
 
@@ -828,6 +830,8 @@ class Envr:
     def relay_ssh_options(
         self,
         relay: RelayConfig | None = None,
+        *,
+        multiplex: bool = True,
     ) -> list[str]:
         relay = relay or self.relay_config()
         if relay is None:
@@ -838,8 +842,10 @@ class Envr:
         relay_identity = hashlib.sha256(
             f"{relay.user}@{relay.host}:{relay.port}".encode()
         ).hexdigest()[:12]
-        control_path = self.relay_root / f"c-{relay_identity}"
-        return [
+        control_path = self.relay_root / (
+            f"c-{relay_identity}-{self._ssh_session_id}"
+        )
+        options = [
             "-p",
             str(relay.port),
             "-i",
@@ -857,18 +863,24 @@ class Envr:
             "-o",
             "RequestTTY=no",
             "-o",
-            "ControlMaster=auto",
-            "-o",
-            "ControlPersist=300",
-            "-o",
-            f"ControlPath={control_path}",
-            "-o",
             f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
             "-o",
             "ServerAliveInterval=30",
             "-o",
             "ServerAliveCountMax=3",
         ]
+        if multiplex:
+            options.extend(
+                [
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    "ControlPersist=300",
+                    "-o",
+                    f"ControlPath={control_path}",
+                ]
+            )
+        return options
 
     def install_relay_key(self, relay: RelayConfig, public_key: str) -> None:
         ensure_private_dir(self.relay_root)
@@ -940,7 +952,7 @@ class Envr:
 
     def verify_relay(self, relay: RelayConfig) -> None:
         tunnel = RelayAPITunnel(
-            self.relay_ssh_options(relay),
+            self.relay_ssh_options(relay, multiplex=False),
             relay.target,
             self.relay_api_ipv4(),
         )
@@ -1047,7 +1059,7 @@ class Envr:
                     "a custom Vultr API endpoint cannot use the SSH relay"
                 )
         tunnel = RelayAPITunnel(
-            self.relay_ssh_options(relay),
+            self.relay_ssh_options(relay, multiplex=False),
             relay.target,
             self.relay_api_ipv4(),
         )
@@ -1197,7 +1209,7 @@ class Envr:
         }
         self.save_repositories(repositories)
         print(f"\nSaved repository as: {parsed['folder']}")
-        print(f"Run: envr up 4 {parsed['folder']}")
+        print(f"Run: envr go {parsed['folder']}")
 
     def repository(self, folder: str) -> dict[str, Any]:
         if not FOLDER_RE.fullmatch(folder):
@@ -1353,7 +1365,7 @@ class Envr:
         return instance
 
     def plan_catalog(self, api: VultrAPI) -> dict[str, dict[str, Any]]:
-        response = api.get("plans", query={"type": "vc2", "per_page": 500})
+        response = api.get("plans", query={"per_page": 500})
         plans = response.get("plans")
         if not isinstance(plans, list):
             raise EnvrError("Vultr API returned an invalid plan catalog")
@@ -1680,7 +1692,9 @@ runcmd:
         connection_identity = hashlib.sha256(
             f"{REMOTE_USER}@{instance_ip}|{transport_identity}".encode()
         ).hexdigest()[:16]
-        control_path = self.ssh_root / f"c-{connection_identity}"
+        control_path = self.ssh_root / (
+            f"c-{connection_identity}-{self._ssh_session_id}"
+        )
         options = [
             "-i",
             str(self.vps_key),

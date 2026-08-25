@@ -88,11 +88,13 @@ host-key verification, local-key loading, and unknown pre-authentication
 failure each produce a distinct error containing the final sanitized SSH
 diagnostic line.
 
-All remote SSH commands and SCP transfers for the same VPS use
-`ControlMaster=auto` with a mode-private control socket and a five-minute
-`ControlPersist`. This makes the first successful authenticated connection the
-transport for the rest of setup, synchronization, and shell attachment. Local
-control sockets are transient and removed with instance state. The idempotent
+All remote SSH commands and SCP transfers within one envr invocation use
+`ControlMaster=auto` with a mode-private, invocation-specific control socket
+and a five-minute `ControlPersist`. This makes the first successful
+authenticated connection the transport for the rest of that command without
+coupling independent terminal tabs: closing one tab cannot terminate another
+tab's SSH transport. Local control sockets are transient and removed with
+instance state. The idempotent
 initial `true` probe retries transient handshake/network failure up to three
 times; explicit authentication, host-key, and local-key failures stop
 immediately, and arbitrary remote operations are never automatically replayed.
@@ -282,7 +284,7 @@ The exact grammar is:
 envr up RAM
 ```
 
-`RAM` is required and must be `1`, `2`, `4`, `8`, or `16`. `up` owns only
+`RAM` is required and must be `1`, `2`, `4`, `8`, `16`, or `24`. `up` owns only
 initial creation and recovery of an interrupted initial deployment. It never
 selects a repository, changes an existing size, or opens an interactive shell.
 
@@ -426,7 +428,7 @@ The fixed initial server choices are:
 
 ```text
 Provider:          Vultr
-Plan type:         regular shared CPU
+Plan type:         shared CPU (regular; 24 GB uses High Performance AMD)
 OS:                Ubuntu 24.04 LTS x64
 Regions:           fra, ams, waw
 Hostname:          envr
@@ -437,7 +439,9 @@ Additional disks: none
 IPv6:              disabled initially
 ```
 
-Plan IDs are mapped for the five supported sizes, but their existence, RAM,
+Plan IDs are mapped for the six supported sizes. The 24 GB mapping uses
+`vhp-12c-24gb-amd` (12 vCPU); the smaller mappings use regular Cloud Compute.
+Their existence, RAM,
 prices, OS ID, locations, and current availability are verified through the
 live API before creation.
 
