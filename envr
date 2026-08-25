@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 LABEL = "envr-codex"
@@ -89,11 +89,21 @@ class EnvrError(RuntimeError):
 
 
 class ApiError(EnvrError):
-    def __init__(self, status: int, message: str, *, retry_after: int | None = None):
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        retry_after: int | None = None,
+        operation: str | None = None,
+    ):
         self.status = status
         self.message = message
         self.retry_after = retry_after
-        super().__init__(message)
+        self.operation = operation
+        prefix = f"Vultr API {operation}" if operation else "Vultr API"
+        detail = f"{prefix} failed (HTTP {status}): {message}" if status else message
+        super().__init__(detail)
 
 
 def eprint(*values: object) -> None:
@@ -540,7 +550,13 @@ class VultrAPI:
             retry_after = None
             with contextlib.suppress(TypeError, ValueError):
                 retry_after = int(error.headers.get("Retry-After", ""))
-            raise ApiError(error.code, message, retry_after=retry_after) from error
+            operation = f"{method} /v2/{resource.lstrip('/')}"
+            raise ApiError(
+                error.code,
+                message,
+                retry_after=retry_after,
+                operation=operation,
+            ) from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise ApiError(0, f"Vultr API network error: {error}") from error
 
@@ -3295,12 +3311,15 @@ done
         source: dict[str, Any],
     ) -> None:
         if target.get("label") == RESIZE_TARGET_LABEL:
+            print("Promoting the validated VPS...")
             self.set_instance_label(api, target, LABEL)
         self.save_instance_state(target, ram_gb=self.instance_ram_gb(target))
+        print("Synchronizing final device access and credentials...")
         self.ensure_device_access(api, target)
         self.ensure_recovery_password(target)
         self.repair_remote_repository_bindings(target)
         self.sync_from_server(target)
+        print(f"Deleting the old {self.instance_ram_gb(source)} GB VPS...")
         self.delete_instance(api, source)
         self.remote_command(
             target,
@@ -3450,20 +3469,50 @@ done
                         "Warning: resize cleanup could not be confirmed; "
                         f"run envr resize {ram_gb} again"
                     )
+            else:
+                eprint(
+                    "Warning: the validated destination was promoted, but final "
+                    "cleanup is incomplete. The old source may still be running "
+                    "and billable. Do not create or delete a VPS manually; when "
+                    f"the Vultr API recovers, run envr resize {ram_gb} again"
+                )
             raise
 
+    def status_api_unavailable(self, error: ApiError) -> int:
+        state = self.state()
+        print("Vultr")
+        print(f"  API:              unavailable ({error})")
+        instance_id = str(state.get("instance_id") or "")
+        main_ip = str(state.get("main_ip") or "")
+        ram_gb = int(state.get("ram_gb") or 0)
+        if not instance_id or not main_ip or not ram_gb:
+            print("\nCached envr state: unavailable")
+            print("Live inventory, billing, and resize state cannot be confirmed.")
+            return 1
+        print("\nCached envr state (not live API data)")
+        print(f"  ID:         {instance_id}")
+        print(f"  Region:     {state.get('region') or ''}")
+        print(f"  RAM:        {ram_gb} GB")
+        print(f"  IP:         {main_ip}")
+        print("  Status:     unknown while Vultr API is unavailable")
+        print("  Warning:    billing and incomplete resize resources are unknown")
+        return 1
+
     def status(self) -> int:
-        api = self.api()
-        account_response = api.get("account")
+        try:
+            api = self.api()
+            account_response = api.get("account")
+            inventory = self.all_instances(api)
+            plans = self.plan_catalog(api)
+        except ApiError as error:
+            return self.status_api_unavailable(error)
         account = account_response.get("account")
         if not isinstance(account, dict):
             raise EnvrError("Vultr API returned invalid account information")
-        inventory = self.all_instances(api)
         instances = self.managed_from(inventory)
         resizing = self.resize_from(inventory)
         if len(instances) == 1 and not resizing:
             self.save_instance_state(instances[0])
-        plans = self.plan_catalog(api)
 
         balance = float(account.get("balance", 0))
         pending = float(account.get("pending_charges", 0))

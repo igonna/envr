@@ -160,6 +160,10 @@ class APITests(unittest.TestCase):
             self.api.get("instances")
         self.assertEqual(raised.exception.status, 503)
         self.assertEqual(raised.exception.message, "capacity unavailable")
+        self.assertEqual(
+            str(raised.exception),
+            "Vultr API GET /v2/instances failed (HTTP 503): capacity unavailable",
+        )
         self.assertTrue(envr.Envr.retryable_region_error(raised.exception))
 
     def test_patch_uses_update_instance_method_and_json(self) -> None:
@@ -1627,6 +1631,35 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(app.state()["instance_id"], "instance-id")
             self.assertEqual(app.state()["main_ip"], "192.0.2.10")
 
+    def test_status_shows_cached_state_during_vultr_api_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.save_state(
+                {
+                    "instance_id": "target-id",
+                    "main_ip": "192.0.2.24",
+                    "ram_gb": 24,
+                    "region": "fra",
+                }
+            )
+            api = mock.Mock()
+            api.get.side_effect = envr.ApiError(
+                502,
+                "We are currently conducting some software upgrades.",
+            )
+            app.api = mock.Mock(return_value=api)
+
+            with contextlib.redirect_stdout(output := io.StringIO()):
+                result = app.status()
+
+            self.assertEqual(result, 1)
+            detail = output.getvalue()
+            self.assertIn("Vultr API failed (HTTP 502)", detail)
+            self.assertIn("Cached envr state (not live API data)", detail)
+            self.assertIn("RAM:        24 GB", detail)
+            self.assertIn("192.0.2.24", detail)
+            self.assertIn("incomplete resize resources are unknown", detail)
+
 
 class ResizeTests(unittest.TestCase):
     def instance(self, identifier: str, label: str, ram: int, ip: str) -> dict:
@@ -1874,6 +1907,9 @@ class ResizeTests(unittest.TestCase):
 
             self.assertIsNone(attachment)
             self.assertIn("Not preserved: Git-ignored files", output.getvalue())
+            self.assertIn("Promoting the validated VPS", output.getvalue())
+            self.assertIn("Synchronizing final device access", output.getvalue())
+            self.assertIn("Deleting the old 16 GB VPS", output.getvalue())
             app.validate_resize_target.assert_called_once_with(target)
             self.assertEqual(
                 api.patch.call_args_list,
