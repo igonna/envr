@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import contextlib
 import fcntl
 import getpass
@@ -32,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 AKAMAI_API_BASE = "https://api.linode.com/v4"
@@ -69,8 +70,9 @@ SSH_CONNECT_TIMEOUT = 10
 INSTANCE_TIMEOUT = 600
 CLOUD_INIT_TIMEOUT = 900
 DELETE_TIMEOUT = 300
+# User-facing preference order: proven fit/value first, onboarding friction last.
 PROVIDER_NAMES = (
-    "vultr", "digitalocean", "akamai", "upcloud", "exoscale", "gcore"
+    "vultr", "upcloud", "exoscale", "gcore", "digitalocean", "akamai"
 )
 PROVIDER_LABELS = {
     "vultr": "Vultr",
@@ -95,6 +97,17 @@ PROVIDER_REGIONS = {
     "digitalocean": ("fra1", "ams3", "lon1"),
     "exoscale": ("de-fra-1", "de-muc-1", "at-vie-1", "ch-dk-2"),
     "gcore": ("frankfurt-2", "amsterdam", "warsaw"),
+}
+REGION_LABELS = {
+    "fra": "Frankfurt", "fra1": "Frankfurt", "de-fra1": "Frankfurt",
+    "de-fra-1": "Frankfurt", "de-fra-2": "Frankfurt",
+    "frankfurt-2": "Frankfurt",
+    "ams": "Amsterdam", "ams3": "Amsterdam", "nl-ams1": "Amsterdam",
+    "nl-ams": "Amsterdam", "amsterdam": "Amsterdam",
+    "waw": "Warsaw", "pl-waw1": "Warsaw", "warsaw": "Warsaw",
+    "de-muc-1": "Munich", "at-vie-1": "Vienna", "ch-dk-2": "Zurich",
+    "eu-central": "Frankfurt", "se-sto": "Stockholm", "lon1": "London",
+    "fi-hel1": "Helsinki",
 }
 PROVIDER_PLAN_IDS = {
     "vultr": PLAN_IDS,
@@ -369,6 +382,40 @@ def ensure_commands(commands: Sequence[str]) -> None:
 def available_prepaid_credit(balance: float, pending_charges: float) -> float:
     """Translate Vultr's negative-credit balance into remaining prepaid credit."""
     return max(-balance - pending_charges, 0.0)
+
+
+def format_runway(hours: float) -> str:
+    """Format remaining prepaid runtime compactly without rounding it upward."""
+    total_minutes = int(max(hours, 0) * 60)
+    if total_minutes < 1:
+        return "<1m"
+    days, remainder = divmod(total_minutes, 24 * 60)
+    whole_hours, minutes = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if whole_hours:
+        parts.append(f"{whole_hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def region_label(region: str) -> str:
+    return REGION_LABELS.get(region, region)
+
+
+def compact_price(plan: dict[str, Any]) -> str:
+    hourly = plan.get("hourly_cost")
+    if hourly in (None, ""):
+        return "price unavailable"
+    currency = str(plan.get("currency") or "USD")
+    prefix = "$" if currency == "USD" else f"{currency} "
+    text = f"{prefix}{float(hourly):.3f}/hour"
+    monthly = plan.get("monthly_cost")
+    if monthly not in (None, ""):
+        text += f" · {prefix}{float(monthly):g}/month"
+    return text
 
 
 REPO_URL_RE = re.compile(
@@ -815,6 +862,12 @@ class ExoscaleAPI:
     regions = PROVIDER_REGIONS["exoscale"]
     security_group_name = "envr-managed"
 
+    @staticmethod
+    def memory_mib(value: Any) -> int:
+        """Normalize Exoscale's byte-sized memory field to envr's MiB contract."""
+        memory = int(value or 0)
+        return memory // (1024 * 1024) if memory >= 1024 * 1024 else memory
+
     def __init__(
         self,
         credentials: str,
@@ -830,6 +883,7 @@ class ExoscaleAPI:
         self.opener = opener
         self.opener_factory = opener_factory
         self._plans: dict[str, dict[str, Any]] = {}
+        self._instance_types: dict[str, dict[str, Any]] = {}
         self._template_zones: set[str] = set()
         self._instance_zones: dict[str, str] = {}
         self._key_material: dict[str, str] = {}
@@ -951,11 +1005,13 @@ class ExoscaleAPI:
             raise ApiError(status, message, provider=self.display_name)
         return operation
 
-    @staticmethod
-    def _instance(value: dict[str, Any], zone: str) -> dict[str, Any]:
+    def _instance(self, value: dict[str, Any], zone: str) -> dict[str, Any]:
         instance_type = value.get("instance-type")
         if not isinstance(instance_type, dict):
             instance_type = {}
+        type_id = str(instance_type.get("id") or "")
+        if type_id and not instance_type.get("family"):
+            instance_type = self._instance_types.get(type_id, instance_type)
         labels = value.get("labels") if isinstance(value.get("labels"), dict) else {}
         state = str(value.get("state") or "pending")
         running = state == "running"
@@ -966,7 +1022,7 @@ class ExoscaleAPI:
             "hostname": value.get("name"),
             "tags": [MANAGEMENT_TAG] if labels.get("envr") == "managed" else [],
             "region": zone,
-            "ram": int(instance_type.get("memory") or 0),
+            "ram": ExoscaleAPI.memory_mib(instance_type.get("memory")),
             "vcpu_count": int(instance_type.get("cpus") or 0),
             "disk": int(value.get("disk-size") or 0),
             "main_ip": str(value.get("public-ip") or "0.0.0.0"),
@@ -1022,6 +1078,10 @@ class ExoscaleAPI:
         if resource == "instances":
             instances = []
             for zone in self.regions:
+                types = self._all_zone(zone, "instance-type", "instance-types", timeout)
+                self._instance_types.update({
+                    str(value["id"]): value for value in types if value.get("id")
+                })
                 for value in self._all_zone(zone, "instance", "instances", timeout):
                     identifier = str(value.get("id") or "")
                     if identifier:
@@ -1031,10 +1091,17 @@ class ExoscaleAPI:
         if resource.startswith("instances/"):
             identifier = resource.split("/", 1)[1]
             zone = self._zone_for_instance(identifier, timeout)
+            types = self._all_zone(zone, "instance-type", "instance-types", timeout)
+            self._instance_types.update({
+                str(value["id"]): value for value in types if value.get("id")
+            })
             value = self.raw_request(zone, "GET", f"instance/{identifier}", timeout=timeout)
             return {"instance": self._instance(value, zone)}
         if resource == "plans":
             values = self._all_zone(primary, "instance-type", "instance-types", timeout)
+            self._instance_types.update({
+                str(value["id"]): value for value in values if value.get("id")
+            })
             plans = []
             wanted = {alias: (name.split(".", 1)[1]) for alias, name in self.plan_ids.items()}
             for requested, size in wanted.items():
@@ -1045,7 +1112,7 @@ class ExoscaleAPI:
                 alias = {
                     "id": self.plan_ids[requested],
                     "provider_plan": str(backing.get("id") or ""),
-                    "ram": int(backing.get("memory") or 0),
+                    "ram": self.memory_mib(backing.get("memory")),
                     "vcpu_count": int(backing.get("cpus") or 0),
                     "disk": 50,
                     "hourly_cost": None,
@@ -1694,6 +1761,17 @@ class GcoreAPI:
         self._instance_regions: dict[str, str] = {}
         self._security_group_ids: dict[str, str] = {}
 
+    def ensure_writable(self, *, timeout: int = 30) -> None:
+        value = self.raw.request("GET", "iam/clients/me", timeout=timeout)
+        status = str(value.get("status") or "").lower()
+        if status == "preparation":
+            raise EnvrError(
+                "Gcore account is still in preparation; finish the portal's "
+                "account upgrade/activation before creating a VPS"
+            )
+        if status in {"blocked", "deleted", "suspended"}:
+            raise EnvrError(f"Gcore account is not writable (status: {status})")
+
     def _all(
         self,
         resource: str,
@@ -1801,7 +1879,7 @@ class GcoreAPI:
         tags = value.get("tags")
         if isinstance(tags, dict):
             return {str(key): str(item) for key, item in tags.items()}
-        tags_v2 = value.get("tags_v2")
+        tags_v2 = tags if isinstance(tags, list) else value.get("tags_v2")
         if isinstance(tags_v2, list):
             return {
                 str(item.get("key")): str(item.get("value"))
@@ -1821,6 +1899,17 @@ class GcoreAPI:
                 if candidate:
                     main_ip = candidate
                     break
+        addresses = value.get("addresses")
+        if main_ip == "0.0.0.0" and isinstance(addresses, dict):
+            public = addresses.get("pub_net")
+            if isinstance(public, list):
+                for item in public:
+                    if not isinstance(item, dict):
+                        continue
+                    candidate = str(item.get("addr") or "")
+                    if candidate and ":" not in candidate:
+                        main_ip = candidate
+                        break
         status = str(value.get("status") or value.get("vm_state") or "pending")
         running = status.lower() in {"active", "running"}
         identifier = str(value.get("id") or "")
@@ -2274,6 +2363,7 @@ class UpCloudAPI:
         self._plans: dict[str, dict[str, Any]] = {}
         self._template: str | None = None
         self._deleted_storages: dict[str, list[str]] = {}
+        self._currency = "USD"
 
     @staticmethod
     def _labels(value: object) -> dict[str, str]:
@@ -2344,6 +2434,8 @@ class UpCloudAPI:
     def _zone_prices(self, region: str, *, timeout: int = 30) -> dict[str, Any]:
         response = self.raw.request("GET", "price", timeout=timeout)
         prices = response.get("prices")
+        if isinstance(prices, dict) and prices.get("currency"):
+            self._currency = str(prices["currency"])
         zones = prices.get("zone") if isinstance(prices, dict) else None
         if not isinstance(zones, list):
             raise EnvrError("UpCloud API returned an invalid price list")
@@ -2386,7 +2478,9 @@ class UpCloudAPI:
                 "account": {
                     "balance": -credits,
                     "pending_charges": 0,
-                    "currency": str(value.get("currency") or "EUR"),
+                    # UpCloud's account response omits currency. Its live price
+                    # catalog is USD unless it explicitly reports otherwise.
+                    "currency": str(value.get("currency") or self._currency),
                     "credit_model": "prepaid",
                 }
             }
@@ -2409,13 +2503,15 @@ class UpCloudAPI:
         if resource == "plans":
             response = self.raw.request("GET", "plan", timeout=timeout)
             values = self._items(response, "plans", "plan")
-            regions = [region for region in self.regions if region in self._zones(timeout=timeout)]
+            available_zones = set(self._zones(timeout=timeout))
+            regions = [region for region in self.regions if region in available_zones]
             if not regions:
                 raise EnvrError("UpCloud has no configured European region")
             prices = self._zone_prices(regions[0], timeout=timeout)
             plans = []
             for value in values:
-                if str(value.get("current_offering", "yes")) != "yes":
+                offering = value.get("current_offering", "yes")
+                if str(offering).lower() not in {"yes", "true", "1"}:
                     continue
                 plan = {
                     "id": value.get("name"),
@@ -2426,6 +2522,7 @@ class UpCloudAPI:
                     "hourly_cost": self._hourly_price(
                         prices.get(f"server_plan_{value.get('name')}")
                     ),
+                    "currency": self._currency,
                     "locations": regions,
                 }
                 if plan["hourly_cost"] is not None:
@@ -2434,12 +2531,38 @@ class UpCloudAPI:
                     plan["monthly_cost"] = None
                 plans.append(plan)
                 self._plans[str(plan["id"])] = plan
-            # UpCloud plan names may evolve. Present stable envr aliases while
-            # retaining the live backing plan selected by memory and CPU.
-            desired_cpu = {1: 1, 2: 1, 4: 2, 8: 4, 16: 6, 32: 8}
+            # UpCloud plan names evolve. Present stable envr aliases while
+            # retaining a live backing plan selected by memory, CPU and total
+            # deployable cost. Cloud Native plans do not bundle a boot disk or
+            # IPv4 address, so include both explicitly in their displayed cost.
+            def deployment_candidate(item: dict[str, Any]) -> dict[str, Any]:
+                candidate = dict(item)
+                if int(candidate.get("disk") or 0) > 0:
+                    return candidate
+                candidate["disk"] = 50
+                candidate["storage_tier"] = "maxiops"
+                candidate["unbundled_resources"] = True
+                hourly = candidate.get("hourly_cost")
+                for name, quantity in (("storage_maxiops", 50), ("ipv4_address", 1)):
+                    component = self._hourly_price(prices.get(name))
+                    if hourly is None or component is None:
+                        hourly = None
+                        break
+                    hourly = float(hourly) + component * quantity
+                candidate["hourly_cost"] = hourly
+                candidate["monthly_cost"] = (
+                    round(float(hourly) * 672, 2)
+                    if hourly is not None else None
+                )
+                return candidate
+
+            # There is currently no exact deployable 12 GB plan. It is omitted
+            # instead of pretending that a larger plan or sales-only custom
+            # configuration is the requested size.
+            desired_cpu = {1: 1, 2: 1, 4: 2, 8: 4, 16: 6, 24: 8, 32: 8}
             for ram_gb, cpu in desired_cpu.items():
                 candidates = [
-                    item for item in plans
+                    deployment_candidate(item) for item in plans
                     if int(item.get("ram") or 0) == ram_gb * 1024
                 ]
                 if not candidates:
@@ -2449,6 +2572,7 @@ class UpCloudAPI:
                     key=lambda item: (
                         abs(int(item.get("vcpu_count") or 0) - cpu),
                         int(item.get("vcpu_count") or 0) < cpu,
+                        float(item.get("hourly_cost") or float("inf")),
                     ),
                 )
                 alias = dict(backing)
@@ -2456,42 +2580,6 @@ class UpCloudAPI:
                 alias["provider_plan"] = backing["id"]
                 plans.append(alias)
                 self._plans[str(alias["id"])] = alias
-            for ram_gb, cpu, disk in ((12, 4, 80), (24, 8, 160)):
-                custom = {
-                    "id": self.plan_ids[ram_gb],
-                    "ram": ram_gb * 1024,
-                    "vcpu_count": cpu,
-                    "disk": disk,
-                    "storage_tier": "maxiops",
-                    "hourly_cost": None,
-                    "monthly_cost": None,
-                    "locations": regions,
-                    "custom": True,
-                }
-                components = (
-                    ("server_core", cpu),
-                    ("server_memory", ram_gb * 1024),
-                    ("storage_maxiops", disk),
-                    ("ipv4_address", 1),
-                )
-                custom_cents = 0.0
-                valid_price = True
-                for name, quantity in components:
-                    component = prices.get(name)
-                    try:
-                        custom_cents += (
-                            float(component["price"])
-                            * quantity
-                            / float(component["amount"])
-                        )
-                    except (KeyError, TypeError, ValueError, ZeroDivisionError):
-                        valid_price = False
-                        break
-                if valid_price:
-                    custom["hourly_cost"] = custom_cents / 100
-                    custom["monthly_cost"] = round(custom_cents / 100 * 672, 2)
-                plans.append(custom)
-                self._plans[str(custom["id"])] = custom
             return {"plans": plans}
         if resource == "os":
             response = self.raw.request("GET", "storage/template", timeout=timeout)
@@ -2499,7 +2587,14 @@ class UpCloudAPI:
             systems = []
             for value in values:
                 title = str(value.get("title") or "")
-                if "Ubuntu Server 24.04" in title or title == "Ubuntu 24.04 LTS":
+                normalized_title = title.lower()
+                if (
+                    ("ubuntu server 24.04" in normalized_title
+                     or normalized_title == "ubuntu 24.04 lts")
+                    and "nvidia" not in normalized_title
+                    and "cuda" not in normalized_title
+                    and str(value.get("state") or "online") == "online"
+                ):
                     identifier = str(value.get("uuid") or "")
                     systems.append(
                         {
@@ -2589,6 +2684,24 @@ class UpCloudAPI:
         if resource.startswith("instances/"):
             identifier = resource.split("/", 1)[1]
             details = self._server_details(identifier)
+            state = str(details.get("state") or "")
+            if state == "started":
+                self.raw.request(
+                    "POST",
+                    f"server/{identifier}/stop",
+                    payload={
+                        "stop_server": {"stop_type": "soft", "timeout": "60"}
+                    },
+                )
+            deadline = time.monotonic() + DELETE_TIMEOUT
+            while state != "stopped":
+                if time.monotonic() >= deadline:
+                    raise EnvrError(
+                        f"UpCloud server {identifier} did not stop before deletion"
+                    )
+                time.sleep(2)
+                details = self._server_details(identifier)
+                state = str(details.get("state") or "")
             devices = details.get("storage_devices")
             device_items = (
                 devices.get("storage_device") if isinstance(devices, dict) else []
@@ -2598,7 +2711,11 @@ class UpCloudAPI:
                 for item in device_items
                 if isinstance(item, dict) and item.get("storage")
             ] if isinstance(device_items, list) else []
-            self.raw.request("DELETE", f"server/{identifier}", query={"storages": 1})
+            self.raw.request(
+                "DELETE",
+                f"server/{identifier}",
+                query={"storages": 1, "backups": "delete"},
+            )
             self._deleted_storages[identifier] = storage_ids
             return
         raise EnvrError(f"unsupported UpCloud operation: DELETE {resource}")
@@ -2643,6 +2760,14 @@ class Envr:
         self.relay_known_hosts = self.relay_root / "known_hosts"
         self._api_tunnels: dict[str, RelayAPITunnel] = {}
         self._api_openers: dict[str, urllib.request.OpenerDirector] = {}
+        self._apis: dict[str, Any] = {}
+        self._plan_catalogs: dict[str, dict[str, dict[str, Any]]] = {}
+        self._ubuntu_os_ids: dict[str, str | int] = {}
+        self._account_responses: dict[str, dict[str, Any]] = {}
+        self._managed_ssh_keys: dict[str, list[dict[str, Any]]] = {}
+        self._region_availability: dict[tuple[str, str], set[str]] = {}
+        self._authorized_instances: set[tuple[str, str]] = set()
+        self._resize_markers: dict[str, tuple[str, int | None] | None] = {}
         self.repos_path = self.root / "repos.json"
         self.state_path = self.root / "state.json"
         self.password_path = self.root / "instance-password"
@@ -3209,17 +3334,30 @@ class Envr:
             prompt_provider = selected
         if include_selected and selected not in providers:
             providers.append(selected)
-        results = []
-        for provider in PROVIDER_NAMES:
-            if provider not in providers:
-                continue
+        state_provider = str(self.state().get("provider") or selected)
+        ordered = (
+            [state_provider] if state_provider in providers else []
+        ) + [
+            provider for provider in PROVIDER_NAMES
+            if provider in providers and provider != state_provider
+        ]
+
+        def load(provider: str) -> tuple[Any, list[dict[str, Any]]]:
             api = self.api(
                 provider,
                 prompt=(provider == prompt_provider)
                 or (include_selected and provider == selected),
             )
-            results.append((api, self.all_instances(api)))
-        return results
+            return api, self.all_instances(api)
+
+        if prompt_provider is not None:
+            prompted = load(prompt_provider)
+            return [prompted]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(ordered)
+        ) as executor:
+            futures = {provider: executor.submit(load, provider) for provider in ordered}
+            return [futures[provider].result() for provider in ordered]
 
     def active_inventory(
         self, *, include_selected: bool = False
@@ -3285,10 +3423,18 @@ class Envr:
         }
         return classes[provider](credentials, opener=opener)
 
-    def api(self, provider: str | None = None, *, prompt: bool = True) -> Any:
+    def api(
+        self,
+        provider: str | None = None,
+        *,
+        prompt: bool = True,
+        fresh: bool = False,
+    ) -> Any:
         provider = provider or self.selected_provider()
         if provider not in PROVIDER_NAMES:
             raise EnvrError(f"unknown cloud provider: {provider}")
+        if not fresh and provider in self._apis:
+            return self._apis[provider]
         path = self.provider_token_path(provider)
         saved = path.exists() and bool(
             path.read_text(encoding="utf-8").strip()
@@ -3301,6 +3447,8 @@ class Envr:
             api.get("account")
             atomic_write_text(path, token + "\n")
             print(f"{api.display_name} API credentials verified and saved to {path}")
+        if not fresh:
+            self._apis[provider] = api
         return api
 
     def cloud_menu(self) -> None:
@@ -3314,7 +3462,7 @@ class Envr:
                 marker = "*" if provider == selected else " "
                 state = "ready" if provider in configured else "not configured"
                 print(f"  {index}. {marker} {PROVIDER_LABELS[provider]:<13} {state}")
-            print("\nThe * provider is used by envr up and as the resize destination.")
+            print("\nThe * provider is used by envr up. Resize asks each time.")
             choice = input(
                 f"Select 1-{len(PROVIDER_NAMES)}, [R] replace credentials, "
                 "[D] forget selected, [Q] quit: "
@@ -3536,6 +3684,18 @@ class Envr:
             raise EnvrError(
                 f"{self.provider_label(api)} API returned an invalid SSH-key list"
             )
+        provider = self.provider_name(api)
+        managed = [
+            dict(key)
+            for key in keys
+            if isinstance(key, dict)
+            and str(key.get("name", "")).startswith(("envr-", DEVICE_KEY_PREFIX))
+            and key.get("id")
+            and key.get("ssh_key")
+        ]
+        self._managed_ssh_keys[provider] = sorted(
+            managed, key=lambda key: str(key.get("id"))
+        )
         normalized = public_key.strip()
         for key in keys:
             if isinstance(key, dict) and str(key.get("ssh_key", "")).strip() == normalized:
@@ -3552,11 +3712,19 @@ class Envr:
             raise EnvrError(
                 f"{self.provider_label(api)} API did not return the uploaded SSH-key ID"
             )
+        cached = dict(created)
+        cached.setdefault("name", DEVICE_KEY_PREFIX + "current")
+        cached.setdefault("ssh_key", normalized)
+        self._managed_ssh_keys[provider].append(cached)
+        self._managed_ssh_keys[provider].sort(key=lambda key: str(key.get("id")))
         return str(created["id"])
 
     def managed_vultr_ssh_keys(
         self, api: VultrAPI, *, timeout: int = 30
     ) -> list[dict[str, Any]]:
+        provider = self.provider_name(api)
+        if provider in self._managed_ssh_keys:
+            return [dict(key) for key in self._managed_ssh_keys[provider]]
         response = api.get("ssh-keys", query={"per_page": 500}, timeout=timeout)
         keys = response.get("ssh_keys")
         if not isinstance(keys, list):
@@ -3571,7 +3739,9 @@ class Envr:
             and key.get("id")
             and key.get("ssh_key")
         ]
-        return sorted(managed, key=lambda key: str(key.get("id")))
+        managed = sorted(managed, key=lambda key: str(key.get("id")))
+        self._managed_ssh_keys[provider] = [dict(key) for key in managed]
+        return managed
 
     def all_instances(self, api: Any) -> list[dict[str, Any]]:
         response = api.get("instances", query={"per_page": 500})
@@ -3643,19 +3813,27 @@ class Envr:
         return instance
 
     def plan_catalog(self, api: Any) -> dict[str, dict[str, Any]]:
+        provider = self.provider_name(api)
+        if provider in self._plan_catalogs:
+            return self._plan_catalogs[provider]
         response = api.get("plans", query={"per_page": 500})
         plans = response.get("plans")
         if not isinstance(plans, list):
             raise EnvrError(
                 f"{self.provider_label(api)} API returned an invalid plan catalog"
             )
-        return {
+        catalog = {
             str(plan["id"]): plan
             for plan in plans
             if isinstance(plan, dict) and plan.get("id")
         }
+        self._plan_catalogs[provider] = catalog
+        return catalog
 
     def ubuntu_os_id(self, api: Any) -> str | int:
+        provider = self.provider_name(api)
+        if provider in self._ubuntu_os_ids:
+            return self._ubuntu_os_ids[provider]
         response = api.get("os", query={"per_page": 500})
         systems = response.get("os")
         if not isinstance(systems, list):
@@ -3675,7 +3853,15 @@ class Envr:
         identifier = exact[0].get("id")
         if identifier in (None, ""):
             raise EnvrError("Ubuntu 24.04 image has no provider ID")
+        self._ubuntu_os_ids[provider] = identifier
         return identifier
+
+    def account_response(self, api: Any) -> dict[str, Any]:
+        """Return one live account result per provider for this command."""
+        provider = self.provider_name(api)
+        if provider not in self._account_responses:
+            self._account_responses[provider] = api.get("account")
+        return self._account_responses[provider]
 
     def available_regions(
         self, api: VultrAPI, plan_id: str, plan: dict[str, Any]
@@ -3689,10 +3875,19 @@ class Envr:
         )
         candidates = [region for region in preferred if region in advertised]
         available = []
+        provider = self.provider_name(api)
         for region in candidates:
-            response = api.get(f"regions/{region}/availability")
-            plans = response.get("available_plans")
-            if isinstance(plans, list) and plan_id in plans:
+            key = (provider, str(region))
+            if key not in self._region_availability:
+                response = api.get(f"regions/{region}/availability")
+                plans = response.get("available_plans")
+                if not isinstance(plans, list):
+                    raise EnvrError(
+                        f"{self.provider_label(api)} returned invalid availability "
+                        f"for {region}"
+                    )
+                self._region_availability[key] = {str(value) for value in plans}
+            if plan_id in self._region_availability[key]:
                 available.append(region)
         if not available:
             raise EnvrError(
@@ -3805,6 +4000,9 @@ runcmd:
         cache_state: bool = True,
         prepare_workspace: bool = True,
     ) -> dict[str, Any]:
+        ensure_writable = getattr(api, "ensure_writable", None)
+        if callable(ensure_writable):
+            ensure_writable()
         plan_ids = getattr(api, "plan_ids", None)
         if not isinstance(plan_ids, dict):
             plan_ids = PLAN_IDS
@@ -3904,7 +4102,7 @@ runcmd:
                 resume_command = (
                     f"envr up {ram_gb}"
                     if label == LABEL
-                    else f"envr resize {ram_gb}"
+                    else "envr resize"
                 )
                 raise EnvrError(
                     f"VPS {instance.get('id')} was created and remains running "
@@ -4069,12 +4267,6 @@ runcmd:
         self, api: VultrAPI, instance: dict[str, Any]
     ) -> str:
         password = str(instance.get("default_password") or "").strip()
-        if not password and instance.get("id"):
-            response = api.get(f"instances/{instance['id']}")
-            current = response.get("instance")
-            if isinstance(current, dict):
-                password = str(current.get("default_password") or "").strip()
-                instance.update(current)
         if (
             not password
             and self.state().get("instance_id") == instance.get("id")
@@ -4083,6 +4275,12 @@ runcmd:
             and self.password_path.exists()
         ):
             password = self.password_path.read_text(encoding="utf-8").strip()
+        if not password and instance.get("id"):
+            response = api.get(f"instances/{instance['id']}")
+            current = response.get("instance")
+            if isinstance(current, dict):
+                password = str(current.get("default_password") or "").strip()
+                instance.update(current)
         if not password:
             raise EnvrError(
                 f"{self.provider_label(api)} did not return the instance password; "
@@ -4257,6 +4455,12 @@ runcmd:
     def ensure_device_access(
         self, api: VultrAPI, instance: dict[str, Any]
     ) -> None:
+        identity = (
+            self.provider_name(api),
+            str(instance.get("id") or instance.get("main_ip") or ""),
+        )
+        if identity[1] and identity in self._authorized_instances:
+            return
         public_key = self.ensure_vps_key()
         self.ensure_vultr_ssh_key(api, public_key)
         try:
@@ -4271,6 +4475,8 @@ runcmd:
             ) from error
         if result.returncode == 0:
             self.sync_managed_device_keys(api, instance)
+            if identity[1]:
+                self._authorized_instances.add(identity)
             return
         failure = (result.stderr or "").lower()
         local_key_failed = any(
@@ -4359,6 +4565,8 @@ runcmd:
         if result.returncode != 0:
             raise EnvrError("the device SSH key was installed but login still failed")
         self.sync_managed_device_keys(api, instance)
+        if identity[1]:
+            self._authorized_instances.add(identity)
 
     def sync_managed_device_keys(
         self,
@@ -4742,6 +4950,7 @@ PY
             raise EnvrError("server repository manifest is invalid")
         local_manifest = self.repositories()
         local_records = local_manifest["repositories"]
+        validated_records: list[tuple[str, dict[str, Any]]] = []
         for folder, record in remote_records.items():
             if not isinstance(folder, str) or not isinstance(record, dict):
                 raise EnvrError("server repository manifest contains an invalid entry")
@@ -4755,7 +4964,12 @@ PY
                 raise EnvrError("server repository manifest has an identity mismatch")
             for field in ("identity", "host", "author_name", "author_email"):
                 validate_text_field(field, str(record.get(field, "")))
+            validated_records.append((folder, record))
 
+        def fetch_repository_key(
+            item: tuple[str, dict[str, Any]]
+        ) -> tuple[str, dict[str, str]]:
+            folder, record = item
             key_directory = self.git_root / folder
             ensure_private_dir(key_directory)
             private_key = key_directory / "id_ed25519"
@@ -4790,12 +5004,20 @@ PY
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     candidate.unlink()
-
-            local_records[folder] = {
+            return folder, {
                 **self.portable_repository(record),
                 "private_key": str(private_key),
                 "public_key": str(public_key),
             }
+
+        if validated_records:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(4, len(validated_records))
+            ) as executor:
+                for folder, local_record in executor.map(
+                    fetch_repository_key, validated_records
+                ):
+                    local_records[folder] = local_record
         self.save_repositories(local_manifest)
 
         return auth_synchronized
@@ -4947,11 +5169,14 @@ trap - EXIT
 
     def refuse_incomplete_resize(self, instance: dict[str, Any]) -> None:
         if self.resize_marker_exists(instance):
-            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
+            raise EnvrError("resize is incomplete; run envr resize to resume it")
 
     def resize_marker_state(
         self, instance: dict[str, Any]
     ) -> tuple[str, int | None] | None:
+        identity = str(instance.get("id") or instance.get("main_ip") or "")
+        if identity and identity in self._resize_markers:
+            return self._resize_markers[identity]
         result = self.remote_command(
             instance,
             f"test -s {shlex.quote(REMOTE_RESIZE_MARKER)} && "
@@ -4962,11 +5187,17 @@ trap - EXIT
             timeout=15,
         )
         if result.returncode != 0:
+            if identity:
+                self._resize_markers[identity] = None
             return None
         match = re.fullmatch(r"(source|target):([0-9]+)", result.stdout.strip())
         if match is None:
-            return ("unknown", None)
-        return (match.group(1), int(match.group(2)))
+            marker: tuple[str, int | None] = ("unknown", None)
+        else:
+            marker = (match.group(1), int(match.group(2)))
+        if identity:
+            self._resize_markers[identity] = marker
+        return marker
 
     def resize_marker_exists(self, instance: dict[str, Any]) -> bool:
         return self.resize_marker_state(instance) is not None
@@ -5124,7 +5355,7 @@ trap - EXIT
             if self.initial_setup_complete(cached):
                 raise EnvrError(
                     f"envr VPS already exists ({current_ram} GB); "
-                    "use envr go or envr resize RAM"
+                    "use envr go or envr resize"
                 )
             if current_ram != ram_gb:
                 raise EnvrError(
@@ -5152,7 +5383,7 @@ trap - EXIT
             if self.initial_setup_complete(instance):
                 raise EnvrError(
                     f"envr VPS already exists ({current_ram} GB); "
-                    "use envr go or envr resize RAM"
+                    "use envr go or envr resize"
                 )
             if current_ram != ram_gb:
                 raise EnvrError(
@@ -5162,7 +5393,7 @@ trap - EXIT
             self.resume_initial_setup(instance)
         else:
             api = self.api(self.selected_provider())
-            api.get("account")
+            self.account_response(api)
             self.create_instance(api, ram_gb)
         print("VPS ready. Connect with envr go.")
 
@@ -5281,21 +5512,34 @@ trap - EXIT
         self.remote_script(
             instance, script, (role, str(ram_gb)), quiet=True, timeout=30
         )
+        identity = str(instance.get("id") or instance.get("main_ip") or "")
+        if identity:
+            self._resize_markers[identity] = (role, ram_gb)
 
     def clear_resize_marker(self, instance: dict[str, Any]) -> None:
-        self.remote_command(
+        result = self.remote_command(
             instance,
             f"rm -f {shlex.quote(REMOTE_RESIZE_MARKER)}",
             quiet=True,
             check=False,
             timeout=30,
         )
+        identity = str(instance.get("id") or instance.get("main_ip") or "")
+        if identity and result.returncode == 0:
+            self._resize_markers[identity] = None
 
-    def ensure_resize_source_ready(self, instance: dict[str, Any]) -> int:
+    def ensure_resize_source_ready(
+        self, instance: dict[str, Any], *, measure: bool = True
+    ) -> int:
         script = r"""set -euo pipefail
+measure=$1
 if pgrep -u remote -af '[c]odex' >/dev/null; then
     echo CODEX_RUNNING
     exit 20
+fi
+if test "$measure" != yes; then
+    printf '0\n'
+    exit 0
 fi
 for path in /home/remote/envr /home/remote/.codex /home/remote/.ssh/envr; do
     test -d "$path" || continue
@@ -5319,7 +5563,12 @@ done
 printf '%s\n' "$total"
 """
         result = self.remote_script(
-            instance, script, (), capture=True, check=False, timeout=120
+            instance,
+            script,
+            ("yes" if measure else "no",),
+            capture=True,
+            check=False,
+            timeout=120,
         )
         detail = result.stdout.strip()
         if result.returncode == 20 or detail == "CODEX_RUNNING":
@@ -5360,17 +5609,11 @@ printf '%s\n' "$total"
         token: str,
     ) -> tuple[str, str]:
         key = f"{REMOTE_CONFIG_ROOT}/.resize-key-{token}"
-        self.remote_command(
+        public = self.remote_command(
             target,
             f"install -d -m 700 {shlex.quote(REMOTE_CONFIG_ROOT)} && "
             f"ssh-keygen -q -t ed25519 -N '' -C {shlex.quote('envr-resize-' + token)} "
-            f"-f {shlex.quote(key)}",
-            quiet=True,
-            timeout=30,
-        )
-        public = self.remote_command(
-            target,
-            f"cat {shlex.quote(key + '.pub')}",
+            f"-f {shlex.quote(key)} && cat {shlex.quote(key + '.pub')}",
             capture=True,
             quiet=True,
             timeout=30,
@@ -5646,6 +5889,8 @@ done
         api: VultrAPI,
         target: dict[str, Any],
         source: dict[str, Any],
+        *,
+        target_validated: bool = False,
     ) -> None:
         if target.get("label") == RESIZE_TARGET_LABEL:
             print("Promoting the validated VPS...")
@@ -5654,8 +5899,9 @@ done
         print("Synchronizing final device access and credentials...")
         self.ensure_device_access(api, target)
         self.ensure_recovery_password(target)
-        self.repair_remote_repository_bindings(target)
-        self.sync_from_server(target)
+        if not target_validated:
+            self.repair_remote_repository_bindings(target)
+            self.sync_from_server(target)
         print(f"Deleting the old {self.instance_ram_gb(source)} GB VPS...")
         self.delete_instance(api, source)
         self.remote_command(
@@ -5675,6 +5921,8 @@ done
         target_api: Any,
         target: dict[str, Any],
         source: dict[str, Any],
+        *,
+        target_validated: bool = False,
     ) -> None:
         if target.get("label") == RESIZE_TARGET_LABEL:
             print("Promoting the validated VPS...")
@@ -5682,8 +5930,9 @@ done
         print("Synchronizing final device access and credentials...")
         self.ensure_device_access(target_api, target)
         self.ensure_recovery_password(target)
-        self.repair_remote_repository_bindings(target)
-        self.sync_from_server(target)
+        if not target_validated:
+            self.repair_remote_repository_bindings(target)
+            self.sync_from_server(target)
         print(
             f"Deleting the old {self.provider_label(source_api)} "
             f"{self.instance_ram_gb(source)} GB VPS..."
@@ -5748,7 +5997,11 @@ done
         if source_old and target_pending:
             self.validate_resize_target(target_pending[0])
             self.finish_cross_provider_resize(
-                source_api, target_api, target_pending[0], source
+                source_api,
+                target_api,
+                target_pending[0],
+                source,
+                target_validated=True,
             )
             return
         if target_current:
@@ -5760,7 +6013,7 @@ done
 
         self.ensure_device_access(source_api, source)
         self.wait_for_cloud_init(source)
-        transfer_bytes = self.ensure_resize_source_ready(source)
+        self.ensure_resize_source_ready(source, measure=False)
         target_plan_id = target_api.plan_ids[ram_gb]
         plan = self.plan_catalog(target_api).get(target_plan_id)
         if not plan:
@@ -5800,7 +6053,6 @@ done
                 prepare_workspace=False,
             )
             self.set_resize_marker(target, ram_gb, role="target")
-            self.ensure_resize_capacity(target, transfer_bytes)
             token = secrets.token_hex(8)
             public_key, host_key = self.migration_key_and_host(source, target, token)
             try:
@@ -5821,7 +6073,11 @@ done
             promoted = True
             self.set_instance_label(source_api, source, RESIZE_SOURCE_LABEL)
             self.finish_cross_provider_resize(
-                source_api, target_api, target, source
+                source_api,
+                target_api,
+                target,
+                source,
+                target_validated=True,
             )
         except (EnvrError, subprocess.TimeoutExpired, KeyboardInterrupt):
             if not promoted and target is not None:
@@ -5831,10 +6087,150 @@ done
             if promoted:
                 eprint(
                     "Warning: destination validation completed, but cleanup is "
-                    f"incomplete. Run envr resize {ram_gb} again; do not delete "
+                    "incomplete. Run envr resize again; do not delete "
                     "either VPS manually."
                 )
             raise
+
+    def resize_options(self, api: Any) -> list[dict[str, Any]]:
+        """Return exact, currently deployable configurations for one provider."""
+        plans = self.plan_catalog(api)
+        self.ubuntu_os_id(api)
+        options: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for requested, plan_id in sorted(api.plan_ids.items()):
+            plan = plans.get(str(plan_id))
+            if not isinstance(plan, dict):
+                continue
+            actual_ram = int(plan.get("ram") or 0) // 1024
+            # Aliases such as a 12 GB request backed by a 16 GB plan are not
+            # separate configurations. The menu exposes only what is allocated.
+            if actual_ram != requested:
+                continue
+            key = (str(plan_id), actual_ram)
+            if key in seen:
+                continue
+            try:
+                regions = self.available_regions(api, str(plan_id), plan)
+            except ApiError:
+                raise
+            except EnvrError:
+                continue
+            if not regions:
+                continue
+            seen.add(key)
+            options.append({
+                "ram_gb": requested,
+                "plan_id": str(plan_id),
+                "vcpu_count": int(plan.get("vcpu_count") or 0),
+                "region": regions[0],
+                "plan": plan,
+            })
+        return options
+
+    def resize_menu(self) -> None:
+        """Choose one live destination and delegate to the transactional resize."""
+        ensure_commands(("ssh", "scp", "ssh-keygen"))
+        state = self.state()
+        source_provider = str(
+            state.get("provider") or self.selected_provider()
+        )
+        source_api = self.api(source_provider)
+        current, pending, retired = self.resize_roles(source_api)
+        for instance in current + pending + retired:
+            self.ensure_device_access(source_api, instance)
+        recovery_instances = current + pending + retired
+        selected_provider = self.selected_provider()
+        if selected_provider != source_provider:
+            selected_api = self.api(selected_provider, prompt=False)
+            selected_roles = self.resize_roles(selected_api)
+            for instance in (item for role in selected_roles for item in role):
+                self.ensure_device_access(selected_api, instance)
+            recovery_instances.extend(
+                instance for role in selected_roles for instance in role
+            )
+        marker_sizes = {
+            marker[1]
+            for instance in recovery_instances
+            if (marker := self.resize_marker_state(instance)) is not None
+            and marker[1] in PLAN_IDS
+        }
+        if len(marker_sizes) == 1:
+            ram_gb = marker_sizes.pop()
+            print(f"Resuming the interrupted {ram_gb} GB migration...")
+            self.resize(ram_gb)
+            return
+        if pending or retired or len(marker_sizes) > 1:
+            raise EnvrError("resize state is ambiguous; run envr status")
+        if len(current) != 1:
+            raise EnvrError("envr-codex is not running")
+
+        source = current[0]
+        source_plan = self.plan_catalog(source_api).get(
+            str(source.get("plan") or ""), {}
+        )
+        current_price = compact_price(source_plan) if source_plan else "price unavailable"
+        print(
+            f"Current: {self.provider_label(source_api)} · "
+            f"{region_label(str(source.get('region') or ''))} · "
+            f"{self.instance_ram_gb(source)} GB · "
+            f"{int(source.get('vcpu_count') or 0)} CPU · {current_price}"
+        )
+
+        configured = self.configured_providers()
+        if not configured:
+            raise EnvrError("no cloud provider is configured; run envr cloud")
+        print("\nDestination cloud:")
+        for index, provider in enumerate(configured, 1):
+            suffix = " (current)" if provider == source_provider else ""
+            print(f"  {index}. {PROVIDER_LABELS[provider]}{suffix}")
+        while True:
+            choice = input(f"Choose 1-{len(configured)}, or Q to cancel: ").strip().lower()
+            if choice in {"", "q"}:
+                print("Cancelled.")
+                return
+            if choice.isdigit() and 1 <= int(choice) <= len(configured):
+                target_provider = configured[int(choice) - 1]
+                break
+            print(f"Choose 1-{len(configured)}, or Q.")
+
+        target_api = self.api(target_provider, prompt=False)
+        self.account_response(target_api)
+        options = self.resize_options(target_api)
+        if target_provider == source_provider:
+            current_actual_ram = self.instance_ram_gb(source)
+            options = [
+                option for option in options
+                if int(option["ram_gb"]) != current_actual_ram
+            ]
+        if not options:
+            raise EnvrError(
+                f"{self.provider_label(target_api)} has no supported configuration "
+                "available in the preferred regions"
+            )
+        print("\nAvailable configurations:")
+        for index, option in enumerate(options, 1):
+            print(
+                f"  {index}. {option['ram_gb']} GB · "
+                f"{option['vcpu_count']} CPU · "
+                f"{region_label(str(option['region']))} · "
+                f"{compact_price(option['plan'])}"
+            )
+        while True:
+            choice = input(f"Choose 1-{len(options)}, or Q to cancel: ").strip().lower()
+            if choice in {"", "q"}:
+                print("Cancelled.")
+                return
+            if choice.isdigit() and 1 <= int(choice) <= len(options):
+                option = options[int(choice) - 1]
+                break
+            print(f"Choose 1-{len(options)}, or Q.")
+
+        atomic_write_json(
+            self.cloud_path,
+            {"schema": SCHEMA_VERSION, "selected": target_provider},
+        )
+        self.resize(int(option["ram_gb"]))
 
     def resize(self, ram_gb: int) -> None:
         if ram_gb not in PLAN_IDS:
@@ -5862,10 +6258,10 @@ done
             source_provider = self.selected_provider()
         target_provider = self.selected_provider()
         api = self.api(source_provider)
-        api.get("account")
+        self.account_response(api)
         if target_provider != source_provider:
             target_api = self.api(target_provider)
-            target_api.get("account")
+            self.account_response(target_api)
             return self.resize_cross_provider(api, target_api, ram_gb)
         current, targets, sources = self.resize_roles(api)
         if any(len(role) > 1 for role in (current, targets, sources)):
@@ -5883,7 +6279,7 @@ done
             if target_ram != ram_gb:
                 raise EnvrError(
                     f"interrupted resize target is {target_ram} GB; "
-                    f"run envr resize {target_ram}"
+                    "run envr resize to resume it"
                 )
             self.finish_resize(api, targets[0], sources[0])
             return
@@ -5892,7 +6288,7 @@ done
             if target_ram != ram_gb:
                 raise EnvrError(
                     f"promoted resize target is {target_ram} GB; "
-                    f"run envr resize {target_ram} to finish cleanup"
+                    "run envr resize to finish cleanup"
                 )
             self.finish_resize(api, current[0], sources[0])
             return
@@ -5925,7 +6321,7 @@ done
             if marker is not None:
                 target_ram = marker[1]
                 detail = (
-                    f"; run envr resize {target_ram}"
+                    "; run envr resize"
                     if target_ram is not None
                     else "; inspect envr status before retrying"
                 )
@@ -5933,7 +6329,7 @@ done
             print(f"envr VPS is already {ram_gb} GB. Connect with envr go.")
             return
 
-        transfer_bytes = self.ensure_resize_source_ready(source)
+        self.ensure_resize_source_ready(source, measure=False)
         print(
             f"Resize envr from {current_ram} GB to {ram_gb} GB?\n\n"
             "Preserved: workspace, Codex state, repository keys\n"
@@ -5958,7 +6354,6 @@ done
                 prepare_workspace=False,
             )
             self.set_resize_marker(target, ram_gb, role="target")
-            self.ensure_resize_capacity(target, transfer_bytes)
             token = secrets.token_hex(8)
             public_key, host_key = self.migration_key_and_host(source, target, token)
             try:
@@ -5980,7 +6375,7 @@ done
             self.validate_resize_target(target)
             self.set_instance_label(api, source, RESIZE_SOURCE_LABEL)
             promoted = True
-            self.finish_resize(api, target, source)
+            self.finish_resize(api, target, source, target_validated=True)
             return
         except (EnvrError, subprocess.TimeoutExpired, KeyboardInterrupt):
             if not promoted:
@@ -5995,50 +6390,112 @@ done
                 except (EnvrError, subprocess.TimeoutExpired):
                     eprint(
                         "Warning: resize cleanup could not be confirmed; "
-                        f"run envr resize {ram_gb} again"
+                        "run envr resize again"
                     )
             else:
                 eprint(
                     "Warning: the validated destination was promoted, but final "
                     "cleanup is incomplete. The old source may still be running "
                     "and billable. Do not create or delete a VPS manually; when "
-                    f"the provider API recovers, run envr resize {ram_gb} again"
+                    "the provider API recovers, run envr resize again"
                 )
             raise
 
     def status_api_unavailable(self, error: ApiError) -> int:
         state = self.state()
         provider = str(state.get("provider") or self.selected_provider())
-        print(PROVIDER_LABELS.get(provider, provider))
-        print(f"  API:              unavailable ({error})")
         instance_id = str(state.get("instance_id") or "")
         main_ip = str(state.get("main_ip") or "")
         ram_gb = int(state.get("ram_gb") or 0)
         if not instance_id or not main_ip or not ram_gb:
-            print("\nCached envr state: unavailable")
+            print("envr-codex: not running (cached state unavailable)")
             print("Live inventory, billing, and resize state cannot be confirmed.")
-            return 1
-        print("\nCached envr state (not live API data)")
-        print(f"  ID:         {instance_id}")
-        print(f"  Region:     {state.get('region') or ''}")
-        print(f"  RAM:        {ram_gb} GB")
-        print(f"  IP:         {main_ip}")
-        print("  Status:     unknown while the cloud API is unavailable")
-        print("  Warning:    billing and incomplete resize resources are unknown")
+        else:
+            print("envr-codex")
+            print("  Cached envr state (not live API data)")
+            print(f"  ID:         {instance_id}")
+            print(f"  Region:     {state.get('region') or ''}")
+            print(f"  RAM:        {ram_gb} GB")
+            print(f"  IP:         {main_ip}")
+            print("  Status:     unknown while the cloud API is unavailable")
+            print("  Warning:    billing and incomplete resize resources are unknown")
+        print("\nClouds")
+        print(PROVIDER_LABELS.get(provider, provider))
+        print(f"  API:              unavailable ({error})")
         return 1
 
+    def print_instance_status(
+        self,
+        api: Any,
+        instance: dict[str, Any],
+        plan: dict[str, Any],
+        currency: str,
+        *,
+        show_cloud: bool = False,
+        leading_blank: bool = True,
+    ) -> None:
+        """Print one VPS as a stable, readable vertical block."""
+        try:
+            password = self.instance_password(api, instance)
+        except EnvrError:
+            password = "unavailable from API"
+        prefix = "\n" if leading_blank else ""
+        print(f"{prefix}{instance.get('label') or LABEL}")
+        if show_cloud:
+            print(f"  Cloud:      {self.provider_label(api)}")
+        print(f"  ID:         {instance.get('id', '')}")
+        print(f"  Region:     {instance.get('region', '')}")
+        print(f"  RAM:        {self.instance_ram_gb(instance)} GB")
+        print(f"  CPU:        {instance.get('vcpu_count', '')}")
+        print(f"  IP:         {instance.get('main_ip', '')}")
+        print(f"  SSH user:   {REMOTE_USER} (key)")
+        print("  Root user:  root")
+        print(f"  Password:   {password}")
+        print(f"  Status:     {instance.get('status', '')}")
+        print(f"  Power:      {instance.get('power_status', '')}")
+        hourly = plan.get("hourly_cost")
+        monthly = plan.get("monthly_cost")
+        if hourly is not None and monthly is not None:
+            price_currency = str(plan.get("currency") or currency)
+            symbol = "$" if price_currency == "USD" else f"{price_currency} "
+            print(
+                f"  Price:      {symbol}{float(hourly):.3f}/hour · "
+                f"{symbol}{monthly}/month"
+            )
+        else:
+            print("  Price:      unavailable")
+
     def status_multiple(self, providers: Sequence[str]) -> int:
-        all_managed: list[tuple[Any, dict[str, Any]]] = []
-        all_resize: list[tuple[Any, dict[str, Any]]] = []
-        failures = 0
-        for provider in providers:
+        current_provider = str(
+            self.state().get("provider") or self.selected_provider()
+        )
+        ordered_providers = (
+            [current_provider] if current_provider in providers else []
+        ) + [provider for provider in providers if provider != current_provider]
+        cached_active = bool(self.state().get("instance_id"))
+
+        def query_provider(provider: str) -> dict[str, Any]:
             label = PROVIDER_LABELS[provider]
-            print(label)
+            lines = [label]
             try:
                 api = self.api(provider, prompt=False)
-                account_response = api.get("account")
-                inventory = self.all_instances(api)
-                plans = self.plan_catalog(api)
+                prefetch_plans = provider == current_provider and cached_active
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=3 if prefetch_plans else 2
+                ) as provider_executor:
+                    account_future = provider_executor.submit(api.get, "account")
+                    inventory_api = self.api(provider, prompt=False, fresh=True)
+                    inventory_future = provider_executor.submit(
+                        self.all_instances, inventory_api
+                    )
+                    plans_future = None
+                    if prefetch_plans:
+                        plans_api = self.api(provider, prompt=False, fresh=True)
+                        plans_future = provider_executor.submit(
+                            self.plan_catalog, plans_api
+                        )
+                    account_response = account_future.result()
+                    inventory = inventory_future.result()
                 account = account_response.get("account")
                 if not isinstance(account, dict):
                     raise EnvrError(f"{label} returned invalid account information")
@@ -6050,56 +6507,131 @@ done
                     reason = str(
                         account.get("billing_reason") or "token needs billing:read"
                     )
-                    print(f"  Billing: unavailable ({reason})")
+                    lines.append(f"  Billing: unavailable ({reason})")
                 elif account.get("credit_model") == "postpaid":
                     if balance > 0:
-                        print(f"  Balance: {balance:.2f} {currency} due")
+                        lines.append(f"  Balance: {balance:.2f} {currency} due")
                     elif balance < 0:
-                        print(f"  Balance: {-balance:.2f} {currency} credit")
+                        lines.append(f"  Balance: {-balance:.2f} {currency} credit")
                     else:
-                        print(f"  Balance: 0.00 {currency}")
-                    print(f"  Uninvoiced: {pending:.2f} {currency}")
+                        lines.append(f"  Balance: 0.00 {currency}")
+                    lines.append(f"  Uninvoiced: {pending:.2f} {currency}")
                 else:
-                    print(f"  Available credit: {credit:.2f} {currency}")
+                    lines.append(f"  Available credit: {credit:.2f} {currency}")
                 managed = self.managed_from(inventory)
                 resizing = self.resize_from(inventory)
+                if managed or resizing:
+                    plans = (
+                        plans_future.result()
+                        if plans_future is not None
+                        else self.plan_catalog(api)
+                    )
+                else:
+                    plans = {}
+                if len(managed) == 1 and not resizing:
+                    active_plan = plans.get(str(managed[0].get("plan")), {})
+                    active_hourly = float(active_plan.get("hourly_cost", 0) or 0)
+                    if (
+                        account.get("billing_available") is not False
+                        and account.get("credit_model") != "postpaid"
+                        and active_hourly > 0
+                        and credit > 0
+                    ):
+                        lines.append(
+                            f"  Credit runway: {format_runway(credit / active_hourly)}"
+                        )
+                return {
+                    "provider": provider,
+                    "api": api,
+                    "lines": lines,
+                    "managed": managed,
+                    "resizing": resizing,
+                    "plans": plans,
+                    "currency": currency,
+                    "failed": False,
+                }
+            except (ApiError, EnvrError) as error:
+                lines.append(f"  API: unavailable ({error})")
+                return {
+                    "provider": provider,
+                    "api": None,
+                    "lines": lines,
+                    "managed": [],
+                    "resizing": [],
+                    "plans": {},
+                    "currency": "USD",
+                    "failed": True,
+                }
+
+        all_managed: list[tuple[Any, dict[str, Any]]] = []
+        all_resize: list[tuple[Any, dict[str, Any]]] = []
+        failures = 0
+        machine_printed = False
+        clouds_printed = False
+
+        def render(result: dict[str, Any], *, primary: bool = False) -> None:
+            nonlocal failures, machine_printed, clouds_printed
+            api = result["api"]
+            managed = result["managed"]
+            resizing = result["resizing"]
+            if result["failed"]:
+                failures += 1
+            if api is not None:
                 all_managed.extend((api, item) for item in managed)
                 all_resize.extend((api, item) for item in resizing)
-                if not managed and not resizing:
-                    print("  envr: not running")
-                for instance in managed + resizing:
-                    plan = plans.get(str(instance.get("plan")), {})
-                    hourly = plan.get("hourly_cost")
-                    monthly = plan.get("monthly_cost")
-                    price_currency = str(plan.get("currency") or currency)
-                    role = str(instance.get("label") or LABEL)
-                    price = ""
-                    if hourly not in (None, ""):
-                        price = f" · {price_currency} {float(hourly):.3f}/hour"
-                        if monthly not in (None, ""):
-                            price += f" · {price_currency} {monthly}/month"
-                    print(
-                        f"  {role}: {self.instance_ram_gb(instance)} GB · "
-                        f"{instance.get('region', '')} · {instance.get('main_ip', '')}"
-                        f" · {instance.get('status', '')}{price}"
+            shown = managed + resizing
+            if shown:
+                if machine_printed or clouds_printed:
+                    print("\nAdditional envr instance")
+                for index, instance in enumerate(shown):
+                    if index:
+                        print()
+                    plan = result["plans"].get(str(instance.get("plan")), {})
+                    self.print_instance_status(
+                        api,
+                        instance,
+                        plan,
+                        result["currency"],
+                        show_cloud=True,
+                        leading_blank=False,
                     )
-                    if instance in managed:
-                        try:
-                            password = self.instance_password(api, instance)
-                        except EnvrError:
-                            password = "unavailable on this device"
-                        print(f"    Root password: {password}")
-            except (ApiError, EnvrError) as error:
-                failures += 1
-                print(f"  API: unavailable ({error})")
-            print()
+                machine_printed = True
+            elif primary:
+                label = PROVIDER_LABELS[result["provider"]]
+                print(f"envr-codex: not running on {label}")
+
+            if not clouds_printed:
+                print("\nClouds")
+                clouds_printed = True
+            else:
+                print()
+            print("\n".join(result["lines"]))
+            sys.stdout.flush()
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(ordered_providers)
+        ) as executor:
+            futures = {
+                provider: executor.submit(query_provider, provider)
+                for provider in ordered_providers
+            }
+            primary = ordered_providers[0]
+            render(futures[primary].result(), primary=True)
+            remaining = {
+                future: provider
+                for provider, future in futures.items()
+                if provider != primary
+            }
+            for future in concurrent.futures.as_completed(remaining):
+                render(future.result())
+
         if len(all_managed) == 1 and not all_resize:
             self.save_instance_state(all_managed[0][1])
         if len(all_managed) > 1:
             print(f"CONFLICT: {len(all_managed)} envr instances exist across clouds")
             return 2
         if all_resize:
-            print("Resize is incomplete. Resume with: envr resize RAM")
+            print("Resize is incomplete. Resume with: envr resize")
             return 2
         return 1 if failures else 0
 
@@ -6136,7 +6668,7 @@ done
         currency = str(account.get("currency") or "USD")
         credit_model = str(account.get("credit_model") or "prepaid")
         symbol = "$" if currency == "USD" else f"{currency} "
-        print(self.provider_label(api))
+        cloud_lines = [self.provider_label(api)]
         if symbol != "$":
             balance_text = (
                 f"{symbol}{-balance:.2f} credit" if balance < 0
@@ -6144,14 +6676,14 @@ done
             )
         if account.get("billing_available") is False:
             reason = str(account.get("billing_reason") or "token needs billing:read")
-            print(f"  Billing:          unavailable ({reason})")
+            cloud_lines.append(f"  Billing:          unavailable ({reason})")
         else:
-            print(f"  Balance:          {balance_text}")
+            cloud_lines.append(f"  Balance:          {balance_text}")
             if credit_model == "postpaid":
-                print(f"  Uninvoiced:       {symbol}{pending:.2f}")
+                cloud_lines.append(f"  Uninvoiced:       {symbol}{pending:.2f}")
             else:
-                print(f"  Pending charges:  {symbol}{pending:.2f}")
-                print(f"  Available credit: {symbol}{credit:.2f}")
+                cloud_lines.append(f"  Pending charges:  {symbol}{pending:.2f}")
+                cloud_lines.append(f"  Available credit: {symbol}{credit:.2f}")
 
         if len(instances) == 1:
             plan = plans.get(str(instances[0].get("plan")), {})
@@ -6162,15 +6694,28 @@ done
                 and hourly > 0
                 and credit > 0
             ):
-                days = credit / (hourly * 24)
-                print(
-                    f"  Credit runway:    about {days:.1f} days at "
+                cloud_lines.append(
+                    f"  Credit runway:    {format_runway(credit / hourly)} at "
                     f"{symbol}{hourly:.3f}/hour"
                 )
             else:
-                print("  Credit runway:    n/a")
+                cloud_lines.append("  Credit runway:    n/a")
         else:
-            print("  Credit runway:    n/a")
+            cloud_lines.append("  Credit runway:    n/a")
+
+        if not instances:
+            print("envr-codex: not running")
+        else:
+            conflict = len(instances) > 1
+            if conflict:
+                print(f"CONFLICT: {len(instances)} envr-managed instances are running\n")
+            for index, instance in enumerate(instances):
+                if index:
+                    print()
+                plan = plans.get(str(instance.get("plan")), {})
+                self.print_instance_status(
+                    api, instance, plan, currency, leading_blank=False
+                )
 
         if resizing:
             print("\nResize: incomplete")
@@ -6184,43 +6729,11 @@ done
                     f"  {role.capitalize()}: {self.instance_ram_gb(instance)} GB · "
                     f"{instance.get('main_ip', '')} · {instance.get('status', '')}"
                 )
-            print("  Resume with: envr resize RAM")
+            print("  Resume with: envr resize")
 
-        if not instances:
-            print("\nenvr-codex: not running")
-            return 2 if resizing else 0
-
+        print("\nClouds")
+        print("\n".join(cloud_lines))
         conflict = len(instances) > 1
-        if conflict:
-            print(f"\nCONFLICT: {len(instances)} envr-managed instances are running")
-        for instance in instances:
-            plan = plans.get(str(instance.get("plan")), {})
-            try:
-                password = self.instance_password(api, instance)
-            except EnvrError:
-                password = "unavailable from API"
-            print(f"\n{LABEL}")
-            print(f"  ID:         {instance.get('id', '')}")
-            print(f"  Region:     {instance.get('region', '')}")
-            print(f"  RAM:        {int(instance.get('ram', 0)) // 1024} GB")
-            print(f"  CPU:        {instance.get('vcpu_count', '')}")
-            print(f"  IP:         {instance.get('main_ip', '')}")
-            print(f"  SSH user:   {REMOTE_USER} (key)")
-            print("  Root user:  root")
-            print(f"  Password:   {password}")
-            print(f"  Status:     {instance.get('status', '')}")
-            print(f"  Power:      {instance.get('power_status', '')}")
-            hourly = plan.get("hourly_cost")
-            monthly = plan.get("monthly_cost")
-            if hourly is not None and monthly is not None:
-                price_currency = str(plan.get("currency") or currency)
-                price_symbol = "$" if price_currency == "USD" else f"{price_currency} "
-                print(
-                    f"  Price:      {price_symbol}{float(hourly):.3f}/hour · "
-                    f"{price_symbol}{monthly}/month"
-                )
-            else:
-                print("  Price:      unavailable")
         return 2 if conflict or resizing else 0
 
     def port_open(self, port: int) -> None:
@@ -6322,8 +6835,17 @@ fi
         api.delete(f"instances/{instance_id}")
         deadline = time.monotonic() + DELETE_TIMEOUT
         while time.monotonic() < deadline:
-            instances = self.all_instances(api)
-            if not any(item.get("id") == instance_id for item in instances):
+            deleted = False
+            try:
+                response = api.get(f"instances/{instance_id}")
+                current = response.get("instance")
+                if isinstance(current, dict) and not current.get("id"):
+                    deleted = True
+            except ApiError as error:
+                if error.status != 404:
+                    raise
+                deleted = True
+            if deleted:
                 verifier = getattr(api, "verify_instance_deleted", None)
                 if callable(verifier) and not verifier(instance_id):
                     time.sleep(3)
@@ -6440,7 +6962,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser(
         "cloud", help="configure and select a cloud provider",
-        description="Choose the provider used by the next up or resize.",
+        description="Configure providers and choose the default used by envr up.",
     )
 
     up = subparsers.add_parser(
@@ -6463,11 +6985,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     resize = subparsers.add_parser(
         "resize", help="move the environment to a fresh VPS size",
-        description="Safely migrate the preserved environment to a fresh VPS.",
-    )
-    resize.add_argument(
-        "ram", type=int, choices=sorted(PLAN_IDS), metavar="RAM_GB",
-        help="destination memory size: %(choices)s",
+        description="Choose a live cloud configuration and safely migrate the environment.",
     )
 
     subparsers.add_parser("status", help="show account and VPS status")
@@ -6509,7 +7027,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             elif namespace.command == "go":
                 attachment = app.go(namespace.repository_folder)
             elif namespace.command == "resize":
-                attachment = app.resize(namespace.ram)
+                attachment = app.resize_menu()
             elif namespace.command == "status":
                 return app.status()
             elif namespace.command == "port-open":

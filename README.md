@@ -1,15 +1,14 @@
 # envr
 
 `envr` is a small command-line tool for using one disposable cloud development
-VPS from Android Termux. It supports Vultr, DigitalOcean, Akamai Cloud,
-UpCloud, Exoscale, and Gcore and
+VPS from Android Termux. It supports Vultr, UpCloud, Exoscale, Gcore,
+DigitalOcean, and Akamai Cloud and
 prepares Git repositories, remote shells, Codex
 authentication, development tools, and safe instance cleanup.
 
-Status: Vultr is account-backed deployment validated. Exoscale and Gcore have
-funded accounts; their adapters, along with DigitalOcean, Akamai Cloud, and
-UpCloud, are contract-tested against current official APIs and await their
-first account-backed envr deployment.
+Status: Vultr, UpCloud, Exoscale, and Gcore have passed account-backed create,
+SSH, cloud-init, tmux reconnect, destroy, and resource-cleanup tests.
+DigitalOcean and Akamai Cloud are contract-tested against current official APIs.
 
 ## Interface
 
@@ -20,7 +19,7 @@ envr cloud
 envr up 4
 envr go
 envr go repository-folder
-envr resize 4
+envr resize
 envr status
 envr port-open 443
 envr destroy
@@ -139,25 +138,25 @@ Configure or select a provider with one interactive command:
 envr cloud
 ```
 
-The selected provider is where `envr up RAM` creates a new VPS and where
-`envr resize RAM` places its destination. Selecting an unconfigured provider
+The selected provider is where `envr up RAM` creates a new VPS. Selecting an unconfigured provider
 asks once for its API credentials, verifies them, and stores them privately. Existing
 installations remain selected as Vultr without a migration step. The same menu
 can rotate credentials or forget an unused provider locally; it refuses to forget
-the provider recorded as owning the running VPS.
+the provider recorded as owning the running VPS. Provider menus use the deliberate
+best-fit order Vultr, UpCloud, Exoscale, Gcore, DigitalOcean, then Akamai Cloud;
+this reflects tested value and operational friction for this workflow, not a
+claim that one cloud is universally superior.
 
-To move between providers without another migration command:
+Resize chooses its destination directly, without changing the default first:
 
 ```bash
-envr cloud       # select any configured destination cloud
-envr resize 32   # encrypted VPS-to-VPS migration
+envr resize
 ```
 
-Frankfurt is preferred, with nearby European regions as fallbacks. Requested
-sizes are 1, 2, 4, 8, 12, 16, 24, and 32 GB. UpCloud supplies exact custom
-12 and 24 GB configurations. Gcore selects an exact live flavor where present,
-or the smallest safe larger flavor. Providers without 12 or 24 GB plans round
-up to 16 or 32 GB and show the actual size before creation or migration. The
+The command lists configured clouds, queries the chosen provider's live plan,
+Ubuntu-image, and regional availability, then lists only actual deployable RAM,
+CPU, preferred region, and price. Rounded aliases are not shown as separate
+sizes. Frankfurt is preferred, with nearby European regions as fallbacks. The
 old VPS remains authoritative until the destination validates and source
 deletion is confirmed.
 
@@ -168,12 +167,21 @@ lifecycle. If billing read is omitted, envr still works but `status` reports
 that billing is unavailable.
 
 Provider signup constraints are separate from API support. Akamai currently
-requires SMS phone verification during onboarding. UpCloud's published account
-requirements exclude customers located in Russia, so it is not a suitable
-choice when that restriction applies. DigitalOcean is the more practical next
-provider to test, but payment acceptance, account review, capacity, and access
+requires SMS phone verification during onboarding and did not accept the test
+registration. Payment acceptance, account review, capacity, quotas, and access
 from a particular Russian network still cannot be guaranteed. Always use
 truthful identity and billing information.
+
+For UpCloud, create a Bearer API token under **Account → API Tokens** and select
+UpCloud in `envr cloud`; token values begin with `ucat_`. UpCloud uses Frankfurt,
+Amsterdam, Warsaw, then Helsinki, reads prepaid balance and USD plan prices live,
+and deletes the boot storage and backups with the server. Current Starter plans
+are selected for 1–8 GB because they are the least expensive balanced bundled
+options. Exact 16, 24, and 32 GB Cloud Native plans receive a 50 GB MaxIOPS boot
+disk and public IPv4; their displayed price includes those unbundled resources.
+UpCloud currently exposes no exact 12 GB plan, so that size is not shown. New
+accounts can have low core/RAM quotas even after funding; larger deployments may
+require a quota increase.
 
 For Exoscale, open the portal's IAM section, create an API key (an unrestricted
 key is simplest for this disposable environment), and copy both values shown:
@@ -237,18 +245,16 @@ root password:
 envr status
 ```
 
-Move the complete working environment to a fresh supported VPS size:
+Choose a cloud and move the complete working environment to one of its live
+configurations:
 
 ```bash
-envr resize 24
+envr resize
 ```
 
-Supported requested sizes are 1, 2, 4, 8, 12, 16, 24, and 32 GB. Vultr's
-24 GB option uses its 12-vCPU High Performance AMD shared-CPU plan. UpCloud
-uses exact custom 12 and 24 GB configurations, while Gcore chooses from its
-live regional flavor catalog. A provider lacking an exact 12 or 24 GB option
-uses the smallest configured safe larger size; the actual size is shown before
-creation or migration.
+The numbered menu shows only actual sizes available from the selected provider
+in the preferred regions. It never presents a 12 GB request that secretly
+allocates 16 GB, or a 24 GB request that allocates 32 GB.
 
 Resize preserves `/home/remote/envr`, the complete `~/.codex` directory,
 repository keys, enrolled device SSH keys, repository metadata, and the last selected workspace. Inside
@@ -262,8 +268,8 @@ moved, but `scodex resume` sees the copied Codex sessions afterward.
 The old VPS remains authoritative until a direct encrypted VPS-to-VPS copy
 passes checksum, repository-key, metadata, and destination-SSH validation.
 Only then is the new VPS promoted and the old one deleted. If the command is
-interrupted, rerunning the same `envr resize RAM` safely restarts an
-uncommitted copy or finishes an already validated promotion. `status` exposes
+interrupted, rerunning `envr resize` detects the saved target size and safely
+restarts an uncommitted copy or finishes an already validated promotion. `status` exposes
 an incomplete resize and `destroy` refuses to run until it is resolved. Resize
 then exits; `envr go` reconnects to the preserved last workspace.
 

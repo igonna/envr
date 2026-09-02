@@ -722,8 +722,10 @@ class LifecycleLogicTests(unittest.TestCase):
             }
 
             catalog = app.plan_catalog(api)
+            cached = app.plan_catalog(api)
 
             api.get.assert_called_once_with("plans", query={"per_page": 500})
+            self.assertIs(cached, catalog)
             self.assertEqual(
                 set(catalog),
                 {
@@ -732,6 +734,98 @@ class LifecycleLogicTests(unittest.TestCase):
                     "unrelated-expensive-plan",
                 },
             )
+
+    def test_region_availability_is_loaded_once_per_region(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = SimpleNamespace(
+                provider_name="vultr",
+                display_name="Vultr",
+                regions=("fra", "ams"),
+                get=mock.Mock(return_value={
+                    "available_plans": ["small", "large"]
+                }),
+            )
+            small = {"locations": ["fra", "ams"]}
+            large = {"locations": ["fra", "ams"]}
+
+            self.assertEqual(
+                app.available_regions(api, "small", small), ["fra", "ams"]
+            )
+            self.assertEqual(
+                app.available_regions(api, "large", large), ["fra", "ams"]
+            )
+            self.assertEqual(api.get.call_count, 2)
+
+    def test_provider_inventories_load_clouds_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.configured_providers = mock.Mock(return_value=["vultr", "upcloud"])
+            app.selected_provider = mock.Mock(return_value="vultr")
+            app.state = mock.Mock(return_value={"provider": "vultr"})
+            vultr = SimpleNamespace(provider_name="vultr")
+            upcloud = SimpleNamespace(provider_name="upcloud")
+            app.api = mock.Mock(
+                side_effect=lambda provider, **kwargs: (
+                    vultr if provider == "vultr" else upcloud
+                )
+            )
+            rendezvous = threading.Barrier(2)
+
+            def inventory(api: object) -> list[dict[str, object]]:
+                rendezvous.wait(1)
+                return [{"provider": getattr(api, "provider_name")}]
+
+            app.all_instances = mock.Mock(side_effect=inventory)
+
+            results = app.provider_inventories()
+
+            self.assertEqual(
+                [api.provider_name for api, _ in results], ["vultr", "upcloud"]
+            )
+
+    def test_provider_adapter_is_reused_within_one_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            envr.atomic_write_text(app.token_path, "token\n")
+            app.relay_config = mock.Mock(return_value=None)
+            created: list[object] = []
+
+            def make_api(*args: object) -> object:
+                value = SimpleNamespace(provider_name="vultr")
+                created.append(value)
+                return value
+
+            app.api_from_credentials = mock.Mock(side_effect=make_api)
+
+            first = app.api("vultr", prompt=False)
+            second = app.api("vultr", prompt=False)
+            isolated = app.api("vultr", prompt=False, fresh=True)
+
+            self.assertIs(first, second)
+            self.assertIsNot(first, isolated)
+            self.assertEqual(len(created), 2)
+
+    def test_creation_reuses_initial_managed_ssh_key_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            public_key = "ssh-ed25519 AAAATEST"
+            api = SimpleNamespace(
+                provider_name="vultr",
+                display_name="Vultr",
+                get=mock.Mock(return_value={"ssh_keys": [{
+                    "id": "key-id",
+                    "name": "envr-device-test",
+                    "ssh_key": public_key,
+                }]}),
+            )
+
+            identifier = app.ensure_vultr_ssh_key(api, public_key)
+            keys = app.managed_vultr_ssh_keys(api)
+
+            self.assertEqual(identifier, "key-id")
+            self.assertEqual([key["id"] for key in keys], ["key-id"])
+            api.get.assert_called_once()
 
     def test_setup_timeout_after_creation_never_creates_another_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1197,6 +1291,26 @@ class LifecycleLogicTests(unittest.TestCase):
             app.enroll_device_key.assert_called_once_with(api, instance)
             app.sync_managed_device_keys.assert_called_once_with(api, instance)
 
+    def test_successful_device_access_is_reused_within_one_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.ensure_vps_key = mock.Mock(return_value="ssh-ed25519 AAAATEST")
+            app.ensure_vultr_ssh_key = mock.Mock()
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            app.sync_managed_device_keys = mock.Mock()
+            api = SimpleNamespace(provider_name="vultr")
+            instance = {"id": "instance-id", "main_ip": "192.0.2.10"}
+
+            app.ensure_device_access(api, instance)
+            app.ensure_device_access(api, instance)
+
+            app.ensure_vps_key.assert_called_once()
+            app.ensure_vultr_ssh_key.assert_called_once()
+            app.remote_command.assert_called_once()
+            app.sync_managed_device_keys.assert_called_once()
+
     def test_device_enrollment_keeps_password_out_of_command_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -1605,7 +1719,9 @@ class LifecycleLogicTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 result = app.status()
             self.assertEqual(result, 0)
-            self.assertIn("envr-codex: not running", output.getvalue())
+            text = output.getvalue()
+            self.assertTrue(text.startswith("envr-codex: not running"))
+            self.assertLess(text.index("envr-codex"), text.index("\nClouds\n"))
 
     def test_status_caches_the_single_instance_connection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1645,6 +1761,21 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(app.state()["instance_id"], "instance-id")
             self.assertEqual(app.state()["main_ip"], "192.0.2.10")
+
+    def test_instance_password_uses_matching_cache_without_api_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.save_state({"instance_id": "instance-id", "provider": "vultr"})
+            app.password_path.parent.mkdir(parents=True, exist_ok=True)
+            app.password_path.write_text("CachedPassword123\n", encoding="utf-8")
+            api = mock.Mock()
+
+            password = app.instance_password(
+                api, {"id": "instance-id", "provider": "vultr"}
+            )
+
+            self.assertEqual(password, "CachedPassword123")
+            api.get.assert_not_called()
 
     def test_status_shows_cached_state_during_vultr_api_outage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1785,6 +1916,7 @@ class ResizeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             app.remote_script = mock.Mock()
+            app.remote_command = mock.Mock()
 
             app.set_resize_marker({"id": "new"}, 16, role="target")
 
@@ -1792,6 +1924,121 @@ class ResizeTests(unittest.TestCase):
                 app.remote_script.call_args.args[2], ("target", "16")
             )
             self.assertIn("printf '%s:%s", app.remote_script.call_args.args[1])
+            self.assertEqual(
+                app.resize_marker_state({"id": "new"}), ("target", 16)
+            )
+            app.remote_command.assert_not_called()
+
+    def test_preliminary_resize_check_does_not_scan_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+            )
+
+            size = app.ensure_resize_source_ready(
+                {"id": "old"}, measure=False
+            )
+
+            self.assertEqual(size, 0)
+            self.assertEqual(app.remote_script.call_args.args[2], ("no",))
+            script = app.remote_script.call_args.args[1]
+            self.assertLess(script.index('test "$measure" != yes'),
+                            script.index("find \"$path\""))
+
+    def test_resize_options_show_actual_available_sizes_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = SimpleNamespace(
+                plan_ids={12: "plan-16", 16: "plan-16", 24: "plan-24"}
+            )
+            app.plan_catalog = mock.Mock(return_value={
+                "plan-16": {"id": "plan-16", "ram": 16384, "vcpu_count": 4},
+                "plan-24": {"id": "plan-24", "ram": 24576, "vcpu_count": 8},
+            })
+            app.ubuntu_os_id = mock.Mock(return_value=1743)
+            app.available_regions = mock.Mock(return_value=["fra"])
+
+            options = app.resize_options(api)
+
+            self.assertEqual([item["ram_gb"] for item in options], [16, 24])
+            self.assertEqual([item["region"] for item in options], ["fra", "fra"])
+
+    def test_resize_menu_selects_provider_and_exact_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance("old", envr.LABEL, 4096, "192.0.2.10")
+            source["provider"] = "vultr"
+            source["region"] = "fra"
+            source["vcpu_count"] = 2
+            source["plan"] = "source-plan"
+            source_api = SimpleNamespace(
+                provider_name="vultr", display_name="Vultr"
+            )
+            target_api = SimpleNamespace(
+                provider_name="gcore", display_name="Gcore",
+                get=mock.Mock(return_value={"account": {}}),
+            )
+            app.save_instance_state(source, ram_gb=4)
+            app.api = mock.Mock(
+                side_effect=lambda provider=None, **kwargs: (
+                    source_api if provider == "vultr" else target_api
+                )
+            )
+            app.resize_roles = mock.Mock(return_value=([source], [], []))
+            app.ensure_device_access = mock.Mock()
+            app.resize_marker_state = mock.Mock(return_value=None)
+            app.plan_catalog = mock.Mock(return_value={
+                "source-plan": {"hourly_cost": 0.027, "monthly_cost": 20}
+            })
+            app.configured_providers = mock.Mock(return_value=["vultr", "gcore"])
+            app.resize_options = mock.Mock(return_value=[{
+                "ram_gb": 8,
+                "vcpu_count": 4,
+                "region": "frankfurt-2",
+                "plan": {
+                    "hourly_cost": 0.08,
+                    "monthly_cost": 57.6,
+                    "currency": "EUR",
+                },
+            }])
+            app.resize = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                mock.patch("builtins.input", side_effect=["2", "1"]),
+                contextlib.redirect_stdout(output := io.StringIO()),
+            ):
+                app.resize_menu()
+
+            self.assertEqual(app.selected_provider(), "gcore")
+            app.resize.assert_called_once_with(8)
+            self.assertIn("Current: Vultr · Frankfurt · 4 GB", output.getvalue())
+            self.assertIn("8 GB · 4 CPU · Frankfurt", output.getvalue())
+
+    def test_resize_menu_resumes_marker_without_prompting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source = self.instance("old", envr.LABEL, 4096, "192.0.2.10")
+            source["provider"] = "vultr"
+            api = SimpleNamespace(provider_name="vultr", display_name="Vultr")
+            app.save_instance_state(source, ram_gb=4)
+            app.api = mock.Mock(return_value=api)
+            app.resize_roles = mock.Mock(return_value=([source], [], []))
+            app.ensure_device_access = mock.Mock()
+            app.resize_marker_state = mock.Mock(return_value=("source", 8))
+            app.resize = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "ensure_commands"),
+                mock.patch("builtins.input") as ask,
+                contextlib.redirect_stdout(output := io.StringIO()),
+            ):
+                app.resize_menu()
+
+            ask.assert_not_called()
+            app.resize.assert_called_once_with(8)
+            self.assertIn("Resuming the interrupted 8 GB migration", output.getvalue())
 
     def test_legacy_resize_marker_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1864,7 +2111,7 @@ class ResizeTests(unittest.TestCase):
             with (
                 mock.patch.object(envr, "ensure_commands"),
                 contextlib.redirect_stdout(io.StringIO()),
-                self.assertRaisesRegex(envr.EnvrError, "run envr resize 4"),
+                self.assertRaisesRegex(envr.EnvrError, "run envr resize"),
             ):
                 app.resize(16)
 
@@ -2041,7 +2288,7 @@ class ResizeTests(unittest.TestCase):
 
             with (
                 mock.patch.object(envr, "ensure_commands"),
-                self.assertRaisesRegex(envr.EnvrError, "run envr resize 4"),
+                self.assertRaisesRegex(envr.EnvrError, "run envr resize"),
             ):
                 app.resize(8)
 
@@ -2100,26 +2347,19 @@ class ParserTests(unittest.TestCase):
         namespace = envr.build_parser().parse_args(["port-open", "443"])
         self.assertEqual(namespace.port, 443)
 
+    def test_resize_has_one_argument_free_interface(self) -> None:
+        parser = envr.build_parser()
+        self.assertEqual(parser.parse_args(["resize"]).command, "resize")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["resize", "8"])
+
     def test_go_accepts_optional_repository_without_ram(self) -> None:
         parser = envr.build_parser()
         namespace = parser.parse_args(["go"])
         self.assertIsNone(namespace.repository_folder)
         namespace = parser.parse_args(["go", "bet1"])
         self.assertEqual(namespace.repository_folder, "bet1")
-
-    def test_resize_requires_one_supported_size(self) -> None:
-        namespace = envr.build_parser().parse_args(["resize", "16"])
-        self.assertEqual(namespace.command, "resize")
-        self.assertEqual(namespace.ram, 16)
-        self.assertEqual(envr.build_parser().parse_args(["resize", "24"]).ram, 24)
-        self.assertEqual(envr.build_parser().parse_args(["resize", "12"]).ram, 12)
-        self.assertEqual(envr.build_parser().parse_args(["resize", "32"]).ram, 32)
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                envr.build_parser().parse_args(["resize"])
-            with self.assertRaises(SystemExit):
-                envr.build_parser().parse_args(["resize", "3"])
-
 
 class MainDispatchTests(unittest.TestCase):
     def test_successful_up_without_attachment_exits_zero(self) -> None:
@@ -2138,12 +2378,12 @@ class MainDispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             app = mock.Mock()
             app.root = Path(temporary)
-            app.resize.return_value = None
+            app.resize_menu.return_value = None
             with mock.patch.object(envr, "Envr", return_value=app):
-                result = envr.main(["resize", "16"])
+                result = envr.main(["resize"])
 
             self.assertEqual(result, 0)
-            app.resize.assert_called_once_with(16)
+            app.resize_menu.assert_called_once_with()
             app.connect_shell.assert_not_called()
 
     def test_go_is_the_only_command_that_attaches(self) -> None:
@@ -2177,7 +2417,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(namespace.command, "cloud")
         self.assertEqual(
             envr.PROVIDER_NAMES,
-            ("vultr", "digitalocean", "akamai", "upcloud", "exoscale", "gcore"),
+            ("vultr", "upcloud", "exoscale", "gcore", "digitalocean", "akamai"),
         )
 
     def test_exoscale_hmac_matches_official_reference_vectors(self) -> None:
@@ -2215,7 +2455,10 @@ class ProviderTests(unittest.TestCase):
             candidate = mock.Mock(display_name="Exoscale")
             candidate.get.return_value = {"account": {"balance": -10}}
             with (
-                mock.patch("builtins.input", side_effect=["5"]),
+                mock.patch(
+                    "builtins.input",
+                    side_effect=[str(envr.PROVIDER_NAMES.index("exoscale") + 1)],
+                ),
                 mock.patch.object(
                     envr.getpass,
                     "getpass",
@@ -2235,12 +2478,12 @@ class ProviderTests(unittest.TestCase):
         api = envr.ExoscaleAPI("EXO-key\nsecret")
         instance_types = []
         definitions = (
-            ("tiny", 1024, 1),
-            ("small", 2048, 2),
-            ("medium", 4096, 2),
-            ("large", 8192, 4),
-            ("extra-large", 16384, 4),
-            ("huge", 32768, 8),
+            ("tiny", 1024**3, 1),
+            ("small", 2 * 1024**3, 2),
+            ("medium", 4 * 1024**3, 2),
+            ("large", 8 * 1024**3, 4),
+            ("extra-large", 16 * 1024**3, 4),
+            ("huge", 32 * 1024**3, 8),
         )
         for size, memory, cpus in definitions:
             instance_types.append(
@@ -2293,7 +2536,7 @@ class ProviderTests(unittest.TestCase):
                     "instance-type": {
                         "family": "standard",
                         "size": "medium",
-                        "memory": 4096,
+                        "memory": 4 * 1024**3,
                         "cpus": 2,
                     },
                 }
@@ -2319,6 +2562,26 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(create["user-data"], encoded)
         self.assertEqual(result["instance"]["provider"], "exoscale")
         self.assertEqual(result["instance"]["main_ip"], "192.0.2.10")
+        self.assertEqual(result["instance"]["ram"], 4096)
+
+    def test_exoscale_instance_expands_live_type_reference(self) -> None:
+        api = envr.ExoscaleAPI("EXO-key\nsecret")
+        api._instance_types["type-uuid"] = {
+            "id": "type-uuid",
+            "family": "standard",
+            "size": "tiny",
+            "memory": 1024**3,
+            "cpus": 1,
+        }
+
+        instance = api._instance(
+            {"instance-type": {"id": "type-uuid"}, "state": "running"},
+            "de-fra-1",
+        )
+
+        self.assertEqual(instance["ram"], 1024)
+        self.assertEqual(instance["vcpu_count"], 1)
+        self.assertEqual(instance["plan"], "standard.tiny")
 
     def test_exoscale_relay_selects_the_api_tunnel_for_each_zone(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2355,7 +2618,10 @@ class ProviderTests(unittest.TestCase):
             candidate = mock.Mock(display_name="Akamai Cloud")
             candidate.get.return_value = {"account": {"balance": 0}}
             with (
-                mock.patch("builtins.input", side_effect=["3"]),
+                mock.patch(
+                    "builtins.input",
+                    side_effect=[str(envr.PROVIDER_NAMES.index("akamai") + 1)],
+                ),
                 mock.patch.object(envr.getpass, "getpass", return_value="token-value"),
                 mock.patch.object(envr, "AkamaiAPI", return_value=candidate),
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2374,7 +2640,10 @@ class ProviderTests(unittest.TestCase):
             candidate = mock.Mock(display_name="Akamai Cloud")
             candidate.get.side_effect = envr.ApiError(401, "Unauthorized")
             with (
-                mock.patch("builtins.input", side_effect=["3"]),
+                mock.patch(
+                    "builtins.input",
+                    side_effect=[str(envr.PROVIDER_NAMES.index("akamai") + 1)],
+                ),
                 mock.patch.object(envr.getpass, "getpass", return_value="bad-token"),
                 mock.patch.object(envr, "AkamaiAPI", return_value=candidate),
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2586,6 +2855,37 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(api._project_id, 7)
         self.assertFalse(account["billing_available"])
 
+    def test_gcore_preparation_account_is_rejected_before_creation(self) -> None:
+        api = envr.GcoreAPI("secret")
+        api.raw.request = mock.Mock(return_value={"status": "preparation"})
+
+        with self.assertRaisesRegex(envr.EnvrError, "still in preparation"):
+            api.ensure_writable()
+
+    def test_gcore_instance_accepts_current_tags_and_addresses_shape(self) -> None:
+        api = envr.GcoreAPI("secret")
+        instance = api._instance(
+            {
+                "id": "instance-id",
+                "name": envr.LABEL,
+                "status": "ACTIVE",
+                "tags": [{"key": "envr", "value": "managed"}],
+                "addresses": {
+                    "pub_net": [{"addr": "192.0.2.40", "type": "fixed"}]
+                },
+                "flavor": {
+                    "flavor_id": "g1-standard-1-2",
+                    "ram": 2048,
+                    "vcpus": 1,
+                },
+            },
+            "frankfurt-2",
+        )
+
+        self.assertEqual(instance["tags"], [envr.MANAGEMENT_TAG])
+        self.assertEqual(instance["main_ip"], "192.0.2.40")
+        self.assertEqual(instance["status"], "active")
+
     def test_gcore_live_flavors_expose_exact_12_and_24_gb(self) -> None:
         api = envr.GcoreAPI("secret")
         api._project_id = 7
@@ -2776,8 +3076,111 @@ class ProviderTests(unittest.TestCase):
         self.assertIsInstance(payload["memory_amount"], int)
         self.assertEqual(payload["storage_devices"]["storage_device"][0]["size"], "160")
         self.assertEqual(response["instance"]["provider"], "upcloud")
+        stopped = dict(api.raw.request.return_value["server"], state="stopped")
+        api.raw.request.side_effect = [
+            api.raw.request.return_value,
+            {},
+            {"server": stopped},
+            {},
+        ]
         api.delete("instances/up-id")
-        self.assertEqual(api.raw.request.call_args.kwargs["query"], {"storages": 1})
+        self.assertIn(
+            mock.call(
+                "POST",
+                "server/up-id/stop",
+                payload={"stop_server": {"stop_type": "soft", "timeout": "60"}},
+            ),
+            api.raw.request.call_args_list,
+        )
+        self.assertEqual(
+            api.raw.request.call_args.kwargs["query"],
+            {"storages": 1, "backups": "delete"},
+        )
+
+    def test_upcloud_catalog_chooses_balanced_live_plans_with_complete_cost(self) -> None:
+        api = envr.UpCloudAPI("secret")
+        api.raw = mock.Mock()
+        api.raw.request.side_effect = [
+            {"plans": {"plan": [
+                {"name": "STARTER-1xCPU-1GB", "memory_amount": 1024,
+                 "core_number": 1, "storage_size": 10, "storage_tier": "standard"},
+                {"name": "PREMIUM-1xCPU-1GB", "memory_amount": 1024,
+                 "core_number": 1, "storage_size": 25, "storage_tier": "maxiops"},
+                {"name": "STARTER-2xCPU-4GB", "memory_amount": 4096,
+                 "core_number": 2, "storage_size": 30, "storage_tier": "standard"},
+                {"name": "PREMIUM-2xCPU-4GB", "memory_amount": 4096,
+                 "core_number": 2, "storage_size": 50, "storage_tier": "maxiops"},
+                {"name": "CLOUDNATIVE-6xCPU-16GB", "memory_amount": 16384,
+                 "core_number": 6, "storage_size": 0, "storage_tier": "maxiops"},
+                {"name": "CLOUDNATIVE-8xCPU-24GB", "memory_amount": 24576,
+                 "core_number": 8, "storage_size": 0, "storage_tier": "maxiops"},
+            ]}},
+            {"zones": {"zone": [{"id": "de-fra1"}]}},
+            {"prices": {"currency": "EUR", "zone": [{
+                "name": "de-fra1",
+                "server_plan_STARTER-1xCPU-1GB": {"amount": 1, "price": 0.5208},
+                "server_plan_PREMIUM-1xCPU-1GB": {"amount": 1, "price": 0.8928},
+                "server_plan_STARTER-2xCPU-4GB": {"amount": 1, "price": 2.0833},
+                "server_plan_PREMIUM-2xCPU-4GB": {"amount": 1, "price": 3.869},
+                "server_plan_CLOUDNATIVE-6xCPU-16GB": {"amount": 1, "price": 12.6488},
+                "server_plan_CLOUDNATIVE-8xCPU-24GB": {"amount": 1, "price": 14.2857},
+                "storage_maxiops": {"amount": 1, "price": 0.0347},
+                "ipv4_address": {"amount": 1, "price": 0.5347},
+            }]}},
+        ]
+
+        plans = api.get("plans")["plans"]
+        aliases = {plan["id"]: plan for plan in plans if plan["id"] in api.plan_ids.values()}
+
+        self.assertEqual(aliases[api.plan_ids[1]]["provider_plan"], "STARTER-1xCPU-1GB")
+        self.assertEqual(aliases[api.plan_ids[4]]["provider_plan"], "STARTER-2xCPU-4GB")
+        cloud_native = aliases[api.plan_ids[16]]
+        self.assertEqual(cloud_native["provider_plan"], "CLOUDNATIVE-6xCPU-16GB")
+        self.assertEqual(cloud_native["disk"], 50)
+        self.assertEqual(cloud_native["currency"], "EUR")
+        self.assertTrue(cloud_native["unbundled_resources"])
+        self.assertAlmostEqual(cloud_native["hourly_cost"], 0.149185)
+        self.assertEqual(
+            aliases[api.plan_ids[24]]["provider_plan"],
+            "CLOUDNATIVE-8xCPU-24GB",
+        )
+        self.assertNotIn(api.plan_ids[12], aliases)
+
+        api.raw.request.side_effect = None
+        api.raw.request.return_value = {"server": {
+            "uuid": "up-id", "title": envr.LABEL, "zone": "de-fra1",
+            "memory_amount": "24576", "core_number": "8", "state": "started",
+            "plan": "CLOUDNATIVE-8xCPU-24GB",
+            "labels": {"label": [{"key": "envr", "value": "managed"}]},
+            "ip_addresses": {"ip_address": [{
+                "family": "IPv4", "access": "public", "address": "192.0.2.30"
+            }]},
+        }}
+        api.post("instances", {
+            "region": "de-fra1", "plan": api.plan_ids[24],
+            "os_id": "template-id", "label": envr.LABEL, "hostname": "envr",
+            "public_keys": ["ssh-ed25519 AAAA"],
+            "user_data": "I2Nsb3VkLWNvbmZpZw==",
+        })
+        payload = api.raw.request.call_args.kwargs["payload"]["server"]
+        self.assertEqual(payload["plan"], "CLOUDNATIVE-8xCPU-24GB")
+        self.assertNotIn("core_number", payload)
+        self.assertNotIn("memory_amount", payload)
+        self.assertEqual(payload["storage_devices"]["storage_device"][0]["size"], "50")
+
+    def test_upcloud_selects_plain_ubuntu_template_not_cuda_variant(self) -> None:
+        api = envr.UpCloudAPI("secret")
+        api.raw = mock.Mock()
+        api.raw.request.return_value = {"storages": {"storage": [
+            {"uuid": "cuda", "title": "Ubuntu Server 24.04 LTS (with NVIDIA drivers & CUDA)",
+             "state": "online", "type": "template", "access": "public"},
+            {"uuid": "plain", "title": "Ubuntu Server 24.04 LTS (Noble Numbat)",
+             "state": "online", "type": "template", "access": "public"},
+        ]}}
+
+        systems = api.get("os")["os"]
+
+        self.assertEqual([system["id"] for system in systems], ["plain"])
 
     def test_akamai_24_gb_request_is_explicitly_32_gb(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2836,6 +3239,134 @@ class ProviderTests(unittest.TestCase):
             self.assertIn("EUR 0.050/hour", output.getvalue())
             self.assertIn("EUR 33.6/month", output.getvalue())
             self.assertIn("at EUR 0.050/hour", output.getvalue())
+
+    def test_multi_cloud_status_keeps_instance_in_vertical_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            instance = {
+                "id": "vultr-id", "provider": "vultr", "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG], "region": "fra", "ram": 4096,
+                "vcpu_count": 2, "main_ip": "192.0.2.10", "status": "active",
+                "power_status": "running", "plan": "vultr-plan",
+            }
+            vultr_responses = {
+                "account": {"account": {"balance": -10, "pending_charges": 0,
+                                          "currency": "USD", "credit_model": "prepaid"}},
+                "instances": {"instances": [instance]},
+                "plans": {"plans": [{"id": "vultr-plan", "hourly_cost": 0.027,
+                                       "monthly_cost": 20, "currency": "USD"}]},
+            }
+            upcloud_responses = {
+                "account": {"account": {"balance": -10, "pending_charges": 0,
+                                          "currency": "USD", "credit_model": "prepaid"}},
+                "instances": {"instances": []},
+                "plans": {"plans": []},
+            }
+            vultr = SimpleNamespace(
+                provider_name="vultr", display_name="Vultr",
+                get=mock.Mock(side_effect=lambda resource, **kwargs: vultr_responses[resource]),
+            )
+            upcloud = SimpleNamespace(
+                provider_name="upcloud", display_name="UpCloud",
+                get=mock.Mock(side_effect=lambda resource, **kwargs: upcloud_responses[resource]),
+            )
+            app.api = mock.Mock(
+                side_effect=lambda provider=None, **kwargs: vultr if provider == "vultr" else upcloud
+            )
+            app.instance_password = mock.Mock(return_value="recovery-password")
+
+            with contextlib.redirect_stdout(output := io.StringIO()):
+                result = app.status_multiple(["vultr", "upcloud"])
+
+            text = output.getvalue()
+            self.assertEqual(result, 0)
+            self.assertTrue(text.startswith("envr-codex\n"))
+            self.assertIn("  Cloud:      Vultr", text)
+            self.assertIn("  ID:         vultr-id", text)
+            self.assertIn("  RAM:        4 GB", text)
+            self.assertIn("  Price:      $0.027/hour · $20/month", text)
+            self.assertNotIn("envr-codex: 4 GB ·", text)
+            self.assertLess(text.index("envr-codex\n"), text.index("\nClouds\n"))
+            self.assertLess(text.index("Vultr", text.index("\nClouds\n")),
+                            text.index("UpCloud", text.index("\nClouds\n")))
+            self.assertFalse(any(
+                call.args and call.args[0] == "plans"
+                for call in upcloud.get.call_args_list
+            ))
+
+    def test_multi_cloud_status_streams_active_cloud_before_slow_cloud(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            instance = {
+                "id": "vultr-id", "provider": "vultr", "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG], "region": "fra", "ram": 4096,
+                "vcpu_count": 2, "main_ip": "192.0.2.10", "status": "active",
+                "power_status": "running", "plan": "vultr-plan",
+            }
+            vultr_responses = {
+                "account": {"account": {"balance": -10, "pending_charges": 0,
+                                          "currency": "USD", "credit_model": "prepaid"}},
+                "instances": {"instances": [instance]},
+                "plans": {"plans": [{"id": "vultr-plan", "hourly_cost": 0.027,
+                                       "monthly_cost": 20, "currency": "USD"}]},
+            }
+            slow_started = threading.Event()
+            release_slow = threading.Event()
+
+            def slow_get(resource: str, **kwargs: object) -> dict[str, object]:
+                slow_started.set()
+                release_slow.wait(5)
+                responses = {
+                    "account": {"account": {"balance": -10, "pending_charges": 0,
+                                              "currency": "USD", "credit_model": "prepaid"}},
+                    "instances": {"instances": []},
+                    "plans": {"plans": []},
+                }
+                return responses[resource]
+
+            vultr = SimpleNamespace(
+                provider_name="vultr", display_name="Vultr",
+                get=mock.Mock(side_effect=lambda resource, **kwargs: vultr_responses[resource]),
+            )
+            upcloud = SimpleNamespace(
+                provider_name="upcloud", display_name="UpCloud",
+                get=mock.Mock(side_effect=slow_get),
+            )
+            app.api = mock.Mock(
+                side_effect=lambda provider=None, **kwargs: vultr if provider == "vultr" else upcloud
+            )
+            app.instance_password = mock.Mock(return_value="recovery-password")
+            active_printed = threading.Event()
+
+            class StreamingOutput(io.StringIO):
+                def write(self, value: str) -> int:
+                    written = super().write(value)
+                    if "Clouds\nVultr" in self.getvalue():
+                        active_printed.set()
+                    return written
+
+            output = StreamingOutput()
+
+            def run_status() -> None:
+                with contextlib.redirect_stdout(output):
+                    app.status_multiple(["vultr", "upcloud"])
+
+            worker = threading.Thread(target=run_status)
+            worker.start()
+            try:
+                self.assertTrue(slow_started.wait(1))
+                self.assertTrue(active_printed.wait(1))
+                self.assertTrue(worker.is_alive())
+            finally:
+                release_slow.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+
+    def test_runway_is_compact_and_does_not_round_up(self) -> None:
+        self.assertEqual(envr.format_runway(0.001), "<1m")
+        self.assertEqual(envr.format_runway(0.8), "48m")
+        self.assertEqual(envr.format_runway(4.8), "4h 48m")
+        self.assertEqual(envr.format_runway(7.7 * 24), "7d 16h 48m")
 
     def test_resize_transfer_preserves_enrolled_device_keys(self) -> None:
         source = Path(envr.__file__).read_text(encoding="utf-8")
@@ -2898,7 +3429,11 @@ class ProviderTests(unittest.TestCase):
                 source_api, source, envr.RESIZE_SOURCE_LABEL
             )
             app.finish_cross_provider_resize.assert_called_once_with(
-                source_api, target_api, target, source
+                source_api,
+                target_api,
+                target,
+                source,
+                target_validated=True,
             )
             app.create_instance.assert_called_once_with(
                 target_api, 24, label=envr.RESIZE_TARGET_LABEL,
@@ -2929,6 +3464,58 @@ class ProviderTests(unittest.TestCase):
                     source_api, target_api, target, source
                 )
             self.assertEqual(events, ["delete", "save"])
+
+    def test_validated_resize_target_is_not_synchronized_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source_api = SimpleNamespace(display_name="Vultr")
+            target_api = SimpleNamespace(display_name="UpCloud")
+            source = {"id": "source", "ram": 8192, "provider": "vultr"}
+            target = {
+                "id": "target", "ram": 16384, "provider": "upcloud",
+                "label": envr.LABEL,
+            }
+            app.ensure_device_access = mock.Mock()
+            app.ensure_recovery_password = mock.Mock()
+            app.repair_remote_repository_bindings = mock.Mock()
+            app.sync_from_server = mock.Mock(return_value=True)
+            app.delete_instance = mock.Mock()
+            app.save_instance_state = mock.Mock()
+            app.remote_command = mock.Mock()
+            app.clear_resize_marker = mock.Mock()
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                app.finish_cross_provider_resize(
+                    source_api,
+                    target_api,
+                    target,
+                    source,
+                    target_validated=True,
+                )
+
+            app.repair_remote_repository_bindings.assert_not_called()
+            app.sync_from_server.assert_not_called()
+
+    def test_delete_confirmation_uses_specific_instance_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = SimpleNamespace(
+                provider_name="vultr",
+                delete=mock.Mock(),
+                get=mock.Mock(side_effect=envr.ApiError(404, "not found")),
+            )
+            app.all_instances = mock.Mock(
+                side_effect=AssertionError("full inventory must not be polled")
+            )
+            app.remove_known_host = mock.Mock()
+
+            app.delete_instance(
+                api, {"id": "instance-id", "main_ip": "192.0.2.10"}
+            )
+
+            api.delete.assert_called_once_with("instances/instance-id")
+            api.get.assert_called_once_with("instances/instance-id")
+            app.all_instances.assert_not_called()
 
 
 if __name__ == "__main__":

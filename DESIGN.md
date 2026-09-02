@@ -1,8 +1,8 @@
 # envr design
 
-Status: Vultr is account-backed deployment validated. Exoscale and Gcore are
-funded; their adapters, along with DigitalOcean, Akamai Cloud, and UpCloud, are
-implemented against current official API contracts and locally tested.
+Status: Vultr, UpCloud, Exoscale, and Gcore are account-backed deployment
+validated. DigitalOcean and Akamai Cloud are implemented against current
+official API contracts and locally tested.
 
 ## Goal
 
@@ -16,7 +16,7 @@ envr cloud
 envr up 4
 envr go
 envr go repository-folder
-envr resize 4
+envr resize
 envr status
 envr port-open 443
 envr destroy
@@ -48,7 +48,7 @@ not tied to a local installation.
 
 ## Provider boundary
 
-Vultr, DigitalOcean, Akamai Cloud, UpCloud, Exoscale, and Gcore adapters normalize account data,
+Vultr, UpCloud, Exoscale, Gcore, DigitalOcean, and Akamai Cloud adapters normalize account data,
 plans, regions, Ubuntu images, instances, creation, relabel/start, and deletion.
 Core SSH, cloud-init, Git, Codex, tmux, safety checks, and migration logic are
 shared. Adding a provider must not fork that lifecycle.
@@ -342,7 +342,7 @@ repeat envr up with the original RAM
 ```
 
 A healthy existing VPS makes `up` fail with the two valid choices: `envr go`
-to connect or `envr resize RAM` to change its size. A different RAM cannot be
+to connect or `envr resize` to choose a new cloud configuration. A different RAM cannot be
 used while initial setup is incomplete; the original size must finish first.
 
 Regional fallback is permitted only before the provider returns an instance ID. Once
@@ -375,13 +375,17 @@ resizes one. With no managed VPS it fails with the single instruction to run
 The exact grammar is:
 
 ```text
-envr resize RAM
+envr resize
 ```
 
-`RAM` must be one of the normal supported sizes. Resize always creates a fresh
-Ubuntu VPS, so the same behavior supports both larger and smaller plans. It is
-not a block-device clone and does not use provider snapshots or native plan
-resize.
+Resize lists configured destination clouds and then queries the selected
+provider's live plans, Ubuntu image, and regional availability. Its second
+numbered menu contains only exact allocated RAM sizes, CPU counts, the first
+available preferred region, and live price when exposed. Resize always creates
+a fresh Ubuntu VPS, so the same behavior supports both larger and smaller
+plans. It is not a block-device clone and does not use provider snapshots or
+native plan resize. An interrupted migration is detected from its remote marker
+and resumed without asking for the target size again.
 
 The migration payload is deliberately limited to:
 
@@ -474,8 +478,13 @@ Plan IDs or stable aliases are mapped for the eight supported requested sizes.
 Vultr 12 GB uses its 16 GB plan and Vultr 24 GB uses
 `vhp-12c-24gb-amd` (12 vCPU). DigitalOcean and Akamai map 24 GB to their 32 GB
 shared plans; an explicit 32 GB request uses those same plans without an alias.
-Their 12 GB requests use 16 GB plans. UpCloud uses exact custom 12 and 24 GB
-configurations and a standard 32 GB plan. Exoscale maps 12 GB to 16 GB and
+Their 12 GB requests use 16 GB plans. UpCloud selects its live, least-expensive
+balanced Starter plans for 1–8 GB. For 16, 24, and 32 GB it uses exact balanced
+Cloud Native plans with an explicit 50 GB MaxIOPS boot disk and IPv4, including
+both unbundled resources in the displayed price. UpCloud has no current exact
+12 GB plan, so it does not expose one. Deletion first stops the server as
+required by the provider, then deletes attached storage and backups; normal
+server addresses are released with the server. Exoscale maps 12 GB to 16 GB and
 24/32 GB to `standard.huge` (32 GB, 8 vCPU), discovers
 the current type and Ubuntu template UUIDs live, and uses a 50 GB local root
 disk. Its zones are Frankfurt, Munich, Vienna, then Zurich. Exoscale's HMAC
@@ -500,11 +509,11 @@ personal access token is the simplest configuration. Billing read permission
 is optional for operation but required for balance data in `status`.
 
 Provider adapters do not imply account eligibility. Akamai requires phone/SMS
-verification during onboarding. UpCloud's published requirements exclude
-customers located in Russia. DigitalOcean recognizes Russian billing/tax data,
-but that is not a promise of payment approval, account approval, or network
-reachability. envr never circumvents provider restrictions and requires
-truthful account data.
+verification during onboarding. UpCloud does not accept new registrations from
+Russian companies and may apply low initial resource quotas. DigitalOcean
+recognizes Russian billing/tax data, but none of these facts promises payment
+approval, account approval, capacity, or network reachability. envr never
+circumvents provider restrictions and requires truthful account data.
 
 Cloud-init installs:
 
