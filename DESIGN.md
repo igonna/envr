@@ -1,15 +1,18 @@
 # envr design
 
-Status: implemented, locally tested, and funded-account resize validated.
+Status: Vultr is account-backed deployment validated. Exoscale and Gcore are
+funded; their adapters, along with DigitalOcean, Akamai Cloud, and UpCloud, are
+implemented against current official API contracts and locally tested.
 
 ## Goal
 
-`envr` provides one disposable Vultr development VPS that can be controlled
+`envr` provides one disposable cloud development VPS that can be controlled
 from Android Termux, macOS, or Linux. The normal interface remains:
 
 ```bash
 envr git
 envr relay
+envr cloud
 envr up 4
 envr go
 envr go repository-folder
@@ -23,9 +26,9 @@ There is no `init`, `connect`, `shell`, separate relay-edit/delete, or envr
 authentication-maintenance command. Setup, reconnection, device enrollment,
 and credential synchronization happen inside the commands above.
 
-## One account, one VPS
+## Configured clouds, one VPS
 
-An `envr` VPS is identified account-wide by:
+An `envr` VPS is identified in each configured provider by:
 
 ```text
 label: envr-codex
@@ -38,9 +41,26 @@ guess, `status` lists them, and `destroy` checks and offers to remove all of
 them. `resize` is the sole controlled exception: while it runs, one temporary
 target or one retired source can coexist under distinct labels.
 
-This account-wide identity is deliberate. A VPS created from a Mac must be
-discoverable from a phone using the same Vultr account; identity is not tied to
-a local installation.
+This provider-wide identity is deliberate. Inventory across all configured
+providers must still contain at most one normal VPS. A VPS created from a Mac
+must be discoverable from a phone with the same provider token; identity is
+not tied to a local installation.
+
+## Provider boundary
+
+Vultr, DigitalOcean, Akamai Cloud, UpCloud, Exoscale, and Gcore adapters normalize account data,
+plans, regions, Ubuntu images, instances, creation, relabel/start, and deletion.
+Core SSH, cloud-init, Git, Codex, tmux, safety checks, and migration logic are
+shared. Adding a provider must not fork that lifecycle.
+
+`envr cloud` is the only provider configuration interface. It verifies and
+stores provider API credentials, and selects the destination used by `up` and `resize`.
+Old state without a provider field is interpreted as Vultr. Tokens remain
+separate and are never sent to a VPS.
+
+Preferred regions are provider-specific and Frankfurt-first. Capacity fallback
+is allowed only after an explicit pre-instance creation rejection. Unknown
+creation outcomes never fall through to another region or provider.
 
 ## Multi-device authority
 
@@ -51,32 +71,34 @@ Each trusted client device has its own Ed25519 key:
 ~/.config/envr/ssh/id_ed25519.pub
 ```
 
-The public key is registered in the Vultr account as
-`envr-device-FINGERPRINT`. New VPS instances include every registered envr
-device key in the `remote` user’s `authorized_keys`.
+Where the provider exposes an account SSH-key registry, the public key is
+registered as `envr-device-FINGERPRINT`. New VPS instances always include the
+current key and all discoverable envr device keys in the `remote` user’s
+`authorized_keys`. Resize also copies that authoritative file, which keeps
+devices enrolled across provider boundaries.
 
-Vultr account SSH keys do not modify an already-running instance. Therefore,
+Provider account SSH keys do not modify an already-running instance. Therefore,
 when a new device joins a running VPS:
 
 ```text
-find VPS through Vultr API
+find VPS through its provider API
 → try the device key
 → fail immediately without an interactive password prompt if unauthorized
-→ register the device public key in the Vultr account
+→ register the device public key where supported
 → enroll once with the VPS recovery password
 → reconnect as remote with the device key
 ```
 
-If Vultr supplies the instance default password through its API, envr can
+If the provider supplies the instance default password through its API, envr can
 instead enroll the device directly through a temporary SSH askpass file. The
-password never appears in a process argument or log. If Vultr omits it, envr
+password never appears in a process argument or log. If the provider omits it, envr
 asks for it explicitly in the controlling terminal without an SSH probe
-timeout. The Vultr web console can provide the password as a manual fallback.
+timeout. The provider web console can provide the password as a manual fallback.
 
 After any key-authorized connection, envr creates or retrieves one strong
 per-VPS recovery password, sets it for root through `chpasswd` standard input,
 and stores it mode `600` both on the VPS and connected client. Thus envr no
-longer depends on Vultr continuing to expose its original provisioning
+longer depends on the provider continuing to expose its original provisioning
 password. A new client may enter the recovery password once to install its
 public key; later connections remain key-only.
 
@@ -99,7 +121,7 @@ initial `true` probe retries transient handshake/network failure up to three
 times; explicit authentication, host-key, and local-key failures stop
 immediately, and arbitrary remote operations are never automatically replayed.
 
-Removing a device key from the Vultr account prevents it from being included
+Removing a device key from a provider account prevents it from being included
 in future VPS instances. A key already installed on a running VPS must also be
 removed there, or the disposable VPS can simply be destroyed and recreated.
 
@@ -123,21 +145,21 @@ stored, placed in an argument, or logged by `envr`.
 When configured, the same command displays the IP, user, port, and
 `Password: not stored (key-only)`, then offers only `E`dit, `D`elete, or
 `Q`uit. Editing is transactional: the old configuration remains active unless
-key installation and a certificate-validated TLS connection to the Vultr API
+key installation and a certificate-validated TLS connection to the selected API
 through the candidate relay both succeed. Deletion is confirmed and removes
 the local relay configuration, identity, host keys, and control sockets.
 
 Relay configuration is fail-closed. Every VPS SSH/SCP operation receives one
-centralized ProxyCommand; all Vultr API calls use an SSH Unix-socket forward
-to a current IPv4 address for `api.vultr.com:443`. IPv4 is deliberate because
-the Vultr API allowlist may permit broad IPv4 but reject the relay's otherwise
-preferred IPv6 address. TLS still validates the `api.vultr.com` hostname and
+centralized ProxyCommand; all provider API calls use SSH Unix-socket forwards
+to current IPv4 API addresses. IPv4 is deliberate because an API allowlist may
+permit broad IPv4 but reject the relay's otherwise preferred IPv6 address.
+TLS still validates the provider API hostname and
 certificate on the client, so DNS cannot expose the token or impersonate the
 API. There is no direct fallback while a relay is configured. Direct and
 relayed VPS transports use different control-socket names so one mode can
 never accidentally reuse the other.
 
-The relay receives no Vultr API token, VPS private key, recovery password,
+The relay receives no provider API token, VPS private key, recovery password,
 Codex auth, Git private key, repository file, or terminal plaintext. It sees
 the client address, destinations, timing, and traffic volume. Agent forwarding
 is disabled. Package downloads and Git traffic initiated by the VPS do not
@@ -155,7 +177,7 @@ authentication. It stores a portable manifest at:
 After a successful connection, the client caches the instance ID, IP, RAM,
 region, SSH host key, and its device key. Later `go` calls first try that exact
 IP with strict host-key checking and key-only authentication. A successful
-cached SSH connection proceeds even if the Vultr API is unavailable. A short,
+cached SSH connection proceeds even if the provider API is unavailable. A short,
 best-effort API request may add newly registered envr device public keys to the
 server, but failure never blocks the established SSH session.
 
@@ -215,7 +237,14 @@ The default private state directory is:
 
 ```text
 ~/.config/envr/
-├── api
+├── api                         # legacy-compatible Vultr token
+├── cloud.json                  # selected provider
+├── providers/
+│   ├── akamai/api
+│   ├── digitalocean/api
+│   ├── upcloud/api
+│   ├── exoscale/api            # API key + one-time secret, two lines
+│   └── gcore/api
 ├── codex/
 │   └── auth.json
 ├── git/
@@ -284,15 +313,16 @@ The exact grammar is:
 envr up RAM
 ```
 
-`RAM` is required and must be `1`, `2`, `4`, `8`, `16`, or `24`. `up` owns only
-initial creation and recovery of an interrupted initial deployment. It never
-selects a repository, changes an existing size, or opens an interactive shell.
+`RAM` is required and must be `1`, `2`, `4`, `8`, `12`, `16`, `24`, or `32`. `up`
+owns only initial creation and recovery of an interrupted initial deployment.
+It never selects a repository, changes an existing size, or opens an
+interactive shell.
 
 If no VPS exists:
 
 ```text
-query live plan, OS, and regional availability data
-→ ask Vultr to create in fra, then ams, then waw only when creation is rejected
+query live plan, OS, and regional availability data from the selected provider
+→ create in Frankfurt, then configured nearby regions only when creation is rejected
 → include all registered envr device keys
 → wait for active IPv4, SSH, and successful cloud-init
 → install and validate the standard runtime
@@ -315,7 +345,7 @@ A healthy existing VPS makes `up` fail with the two valid choices: `envr go`
 to connect or `envr resize RAM` to change its size. A different RAM cannot be
 used while initial setup is incomplete; the original size must finish first.
 
-Regional fallback is permitted only before Vultr returns an instance ID. Once
+Regional fallback is permitted only before the provider returns an instance ID. Once
 an instance exists, `envr` never deletes it or creates a replacement because
 of an SSH, cloud-init, setup, or local timeout. It reports that the VPS remains
 billable, and the same `envr up RAM` command resumes setup. Interruption also
@@ -350,7 +380,7 @@ envr resize RAM
 
 `RAM` must be one of the normal supported sizes. Resize always creates a fresh
 Ubuntu VPS, so the same behavior supports both larger and smaller plans. It is
-not a block-device clone and does not use Vultr snapshots or native plan
+not a block-device clone and does not use provider snapshots or native plan
 resize.
 
 The migration payload is deliberately limited to:
@@ -359,6 +389,7 @@ The migration payload is deliberately limited to:
 /home/remote/envr/
 /home/remote/.codex/
 /home/remote/.ssh/envr/
+/home/remote/.ssh/authorized_keys
 /home/remote/.config/envr/repos.json
 /home/remote/.config/envr/last-workspace
 ```
@@ -371,8 +402,8 @@ untracked ignored paths using `git ls-files --others --ignored
 untracked non-ignored work remain in the payload. Source-side rsync runs through
 passwordless sudo so readable tracked content is not lost merely because a
 container or tool created it as root; destination ownership remains `remote`.
-The recovery-password record, authorized_keys, root
-state, system directories, packages, VPNs, containers, services, firewall
+The recovery-password record, root state, system directories, packages, VPNs,
+containers, services, firewall
 rules, and open ports are not copied. The destination receives the normal
 fresh envr bootstrap and current Codex CLI.
 
@@ -400,9 +431,9 @@ verify one source and requested live plan
 → refresh local repository and Codex caches from the target
 → verify destination SSH using the pinned client host key
 → relabel the source as retired
-→ promote and cache the target
-→ create the target's new recovery password
-→ delete the source
+→ retire the source and promote the target
+→ create the target's new recovery password and verify device access
+→ delete the source and only then cache the target as authoritative
 → exit with the instruction to run envr go
 ```
 
@@ -427,10 +458,10 @@ the migration roles, and `destroy` refuses until resize is resolved.
 The fixed initial server choices are:
 
 ```text
-Provider:          Vultr
-Plan type:         shared CPU (regular; 24 GB uses High Performance AMD)
+Provider:          selected with envr cloud
+Plan type:         provider shared/general-purpose compute
 OS:                Ubuntu 24.04 LTS x64
-Regions:           fra, ams, waw
+Regions:           Frankfurt first, then provider-specific European fallbacks
 Hostname:          envr
 Remote user:       remote
 Repository root:   /home/remote/envr
@@ -439,24 +470,56 @@ Additional disks: none
 IPv6:              disabled initially
 ```
 
-Plan IDs are mapped for the six supported sizes. The 24 GB mapping uses
-`vhp-12c-24gb-amd` (12 vCPU); the smaller mappings use regular Cloud Compute.
-Their existence, RAM,
-prices, OS ID, locations, and current availability are verified through the
-live API before creation.
+Plan IDs or stable aliases are mapped for the eight supported requested sizes.
+Vultr 12 GB uses its 16 GB plan and Vultr 24 GB uses
+`vhp-12c-24gb-amd` (12 vCPU). DigitalOcean and Akamai map 24 GB to their 32 GB
+shared plans; an explicit 32 GB request uses those same plans without an alias.
+Their 12 GB requests use 16 GB plans. UpCloud uses exact custom 12 and 24 GB
+configurations and a standard 32 GB plan. Exoscale maps 12 GB to 16 GB and
+24/32 GB to `standard.huge` (32 GB, 8 vCPU), discovers
+the current type and Ubuntu template UUIDs live, and uses a 50 GB local root
+disk. Its zones are Frankfurt, Munich, Vienna, then Zurich. Exoscale's HMAC
+authentication is signed locally with the API key and secret; relay mode opens
+a separate hostname-validated TLS tunnel for each zone API host. A reusable,
+unbilled `envr-managed` security group permits SSH and only ports explicitly
+added with `port-open`.
+Gcore uses the account's single default project, discovers region IDs, flavors,
+prices, and Ubuntu image IDs live, and selects exact 12/24 GB flavors when
+available or the smallest safe larger flavor otherwise. Its order is
+Frankfurt, Amsterdam, then Warsaw. Creation uses one project SSH key, a
+reusable `envr-managed` security group with unrestricted egress and explicit
+ingress, and a 50 GB boot volume marked `delete_on_termination`. Its task IDs
+are polled to a terminal state before lifecycle progress. Account balance is
+not exposed by the Cloud API; flavor prices shown by envr are compute-only.
+Plan RAM, prices when supplied, image IDs, regions, and availability are read
+through the provider API before creation.
+
+DigitalOcean uses its v2 Droplet API, Ubuntu `24.04 (LTS) x64`, the Basic shared
+CPU size family, account SSH keys, and Frankfurt-first regions. A full-access
+personal access token is the simplest configuration. Billing read permission
+is optional for operation but required for balance data in `status`.
+
+Provider adapters do not imply account eligibility. Akamai requires phone/SMS
+verification during onboarding. UpCloud's published requirements exclude
+customers located in Russia. DigitalOcean recognizes Russian billing/tax data,
+but that is not a promise of payment approval, account approval, or network
+reachability. envr never circumvents provider restrictions and requires
+truthful account data.
 
 Cloud-init installs:
 
 ```text
 git curl ca-certificates build-essential tmux jq rsync unzip
-Node.js npm bubblewrap Codex CLI Docker ufw fail2ban unattended-upgrades
+Node.js npm bubblewrap AppArmor profiles/tools Codex CLI Docker ufw fail2ban
+unattended-upgrades
 ```
 
 It creates the sudo-capable `remote` user, initializes the firewall once,
 allows SSH, enables fail2ban, and configures Codex to keep credentials in
-`~/.codex/auth.json`. Existing VPSs receive missing `bubblewrap` and the
-`scodex` wrapper idempotently on connection. Later commands never reset
-firewall rules.
+`~/.codex/auth.json`. On Ubuntu 24.04 it installs and loads the distribution
+`bubblewrap` AppArmor profile when AppArmor is active. Existing VPSs receive
+missing sandbox prerequisites and the `scodex` wrapper idempotently on
+connection. Later commands never reset firewall rules.
 
 ## Remote shell and Codex
 
@@ -505,14 +568,15 @@ before destruction.
 
 ## `envr status`
 
-`status` uses only the Vultr API and can run before a device has SSH access.
-When a relay is configured, the API request is tunneled through it. It shows:
+`status` uses configured provider APIs and can run before a device has SSH
+access. One provider failure does not hide successful results from another.
+When a relay is configured, every API request is tunneled through it. It shows:
 
 ```text
 account balance, pending charges, available prepaid credit
 estimated prepaid runway at the current plan price
 instance ID, region, RAM, CPU, IP
-Vultr default root password
+envr recovery root password when known on this device
 status, power state, hourly and monthly price
 incomplete resize source/target when present
 ```
@@ -529,7 +593,7 @@ envr port-open PORT
 
 The port must be `1..65535`. The command enrolls the current device if needed,
 then idempotently opens both TCP and UDP in UFW and verifies the rules. It does
-not alter a Vultr Firewall group or reset any existing VPS firewall rules.
+not alter a provider firewall product or reset any existing VPS firewall rules.
 
 ## `envr destroy`
 
@@ -553,15 +617,15 @@ until the API confirms absence, removes obsolete SSH host entries, and clears
 transient instance state. Repository credentials and Codex authentication
 remain cached for the next disposable VPS.
 
-Stopping is not exposed because Vultr continues billing stopped instances.
+Stopping is not exposed because providers continue reserving and billing stopped instances.
 
 ## Security boundaries
 
-- The Vultr API token is entered independently on each trusted client,
+- Each provider API credential is entered independently on each trusted client,
   validated before being saved, never passed to an external process, and
   remains protected by end-to-end TLS through an optional relay.
 - API access must be permitted for the client’s public IP range. Broad IPv4
-  access may be necessary for mobile networks, so Vultr account 2FA and token
+  access may be necessary for mobile networks, so account 2FA and token
   rotation are important.
 - Each device has a distinct SSH private key.
 - A new VPS host key is accepted automatically on first contact and recorded

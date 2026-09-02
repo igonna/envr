@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable Vultr development environments from a Unix terminal."""
+"""Disposable cloud development environments from a Unix terminal."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import contextlib
 import fcntl
 import getpass
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import json
@@ -25,15 +26,19 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterator, NamedTuple, Sequence
+from typing import Any, Callable, Iterator, NamedTuple, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
 
 
-VERSION = "0.8.1"
+VERSION = "0.12.0"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
+AKAMAI_API_BASE = "https://api.linode.com/v4"
+UPCLOUD_API_BASE = "https://api.upcloud.com/1.3"
+DIGITALOCEAN_API_BASE = "https://api.digitalocean.com/v2"
+GCORE_API_BASE = "https://api.gcore.com"
 LABEL = "envr-codex"
 RESIZE_TARGET_LABEL = "envr-codex-resize-target"
 RESIZE_SOURCE_LABEL = "envr-codex-resize-source"
@@ -55,14 +60,89 @@ PLAN_IDS = {
     2: "vc2-1c-2gb",
     4: "vc2-2c-4gb",
     8: "vc2-4c-8gb",
+    12: "vc2-6c-16gb",
     16: "vc2-6c-16gb",
     24: "vhp-12c-24gb-amd",
+    32: "vc2-8c-32gb",
 }
 SSH_CONNECT_TIMEOUT = 10
 INSTANCE_TIMEOUT = 600
 CLOUD_INIT_TIMEOUT = 900
 DELETE_TIMEOUT = 300
-RELAY_API_HOST = "api.vultr.com"
+PROVIDER_NAMES = (
+    "vultr", "digitalocean", "akamai", "upcloud", "exoscale", "gcore"
+)
+PROVIDER_LABELS = {
+    "vultr": "Vultr",
+    "akamai": "Akamai Cloud",
+    "upcloud": "UpCloud",
+    "digitalocean": "DigitalOcean",
+    "exoscale": "Exoscale",
+    "gcore": "Gcore",
+}
+PROVIDER_API_HOSTS = {
+    "vultr": "api.vultr.com",
+    "akamai": "api.linode.com",
+    "upcloud": "api.upcloud.com",
+    "digitalocean": "api.digitalocean.com",
+    "exoscale": "api-de-fra-1.exoscale.com",
+    "gcore": "api.gcore.com",
+}
+PROVIDER_REGIONS = {
+    "vultr": ("fra", "ams", "waw"),
+    "akamai": ("de-fra-2", "eu-central", "nl-ams", "se-sto"),
+    "upcloud": ("de-fra1", "nl-ams1", "pl-waw1", "fi-hel1"),
+    "digitalocean": ("fra1", "ams3", "lon1"),
+    "exoscale": ("de-fra-1", "de-muc-1", "at-vie-1", "ch-dk-2"),
+    "gcore": ("frankfurt-2", "amsterdam", "warsaw"),
+}
+PROVIDER_PLAN_IDS = {
+    "vultr": PLAN_IDS,
+    "akamai": {
+        1: "g6-nanode-1",
+        2: "g6-standard-1",
+        4: "g6-standard-2",
+        8: "g6-standard-4",
+        12: "g6-standard-6",
+        16: "g6-standard-6",
+        24: "g6-standard-8",
+        32: "g6-standard-8",
+    },
+    "upcloud": {
+        1: "1xCPU-1GB",
+        2: "1xCPU-2GB",
+        4: "2xCPU-4GB",
+        8: "4xCPU-8GB",
+        12: "custom-4xCPU-12GB",
+        16: "6xCPU-16GB",
+        24: "custom-8xCPU-24GB",
+        32: "8xCPU-32GB",
+    },
+    "digitalocean": {
+        1: "s-1vcpu-1gb",
+        2: "s-1vcpu-2gb",
+        4: "s-2vcpu-4gb",
+        8: "s-4vcpu-8gb",
+        12: "s-6vcpu-16gb",
+        16: "s-6vcpu-16gb",
+        24: "s-8vcpu-32gb",
+        32: "s-8vcpu-32gb",
+    },
+    "exoscale": {
+        1: "standard.tiny",
+        2: "standard.small",
+        4: "standard.medium",
+        8: "standard.large",
+        12: "standard.extra-large",
+        16: "standard.extra-large",
+        24: "standard.huge",
+        32: "standard.huge",
+    },
+    "gcore": {
+        size: f"gcore-envr-{size}gb"
+        for size in (1, 2, 4, 8, 12, 16, 24, 32)
+    },
+}
 
 SCODEX_SCRIPT = """#!/bin/sh
 set -eu
@@ -96,18 +176,36 @@ class ApiError(EnvrError):
         *,
         retry_after: int | None = None,
         operation: str | None = None,
+        provider: str = "Vultr",
     ):
         self.status = status
         self.message = message
         self.retry_after = retry_after
         self.operation = operation
-        prefix = f"Vultr API {operation}" if operation else "Vultr API"
+        self.provider = provider
+        prefix = f"{provider} API {operation}" if operation else f"{provider} API"
         detail = f"{prefix} failed (HTTP {status}): {message}" if status else message
         super().__init__(detail)
 
 
 def eprint(*values: object) -> None:
     print(*values, file=sys.stderr)
+
+
+def strong_password(length: int = 24) -> str:
+    if length < 16:
+        raise ValueError("strong passwords must be at least 16 characters")
+    groups = (
+        "ABCDEFGHJKLMNPQRSTUVWXYZ",
+        "abcdefghijkmnopqrstuvwxyz",
+        "23456789",
+        "!@#$%^&*()-_=+",
+    )
+    characters = [secrets.choice(group) for group in groups]
+    alphabet = "".join(groups)
+    characters.extend(secrets.choice(alphabet) for _ in range(length - len(groups)))
+    secrets.SystemRandom().shuffle(characters)
+    return "".join(characters)
 
 
 def data_root() -> Path:
@@ -409,10 +507,12 @@ class RelayAPITunnel:
         ssh_options: Sequence[str],
         target: str,
         api_ipv4: str,
+        api_host: str,
     ):
         self.ssh_options = list(ssh_options)
         self.target = target
         self.api_ipv4 = api_ipv4
+        self.api_host = api_host
         self.process: subprocess.Popen[str] | None = None
         self.temporary_directory: Path | None = None
         self.socket_path: Path | None = None
@@ -469,13 +569,13 @@ class RelayAPITunnel:
             context = ssl.create_default_context()
             with context.wrap_socket(
                 raw_socket,
-                server_hostname=RELAY_API_HOST,
+                server_hostname=self.api_host,
             ):
                 pass
         except (OSError, ssl.SSLError) as error:
             raw_socket.close()
             raise EnvrError(
-                f"relay cannot securely reach {RELAY_API_HOST}: {error}"
+                f"relay cannot securely reach {self.api_host}: {error}"
             ) from error
 
     def close(self) -> None:
@@ -501,6 +601,12 @@ class RelayAPITunnel:
 
 
 class VultrAPI:
+    provider_name = "vultr"
+    display_name = "Vultr"
+    api_host = "api.vultr.com"
+    plan_ids = PROVIDER_PLAN_IDS["vultr"]
+    regions = PROVIDER_REGIONS["vultr"]
+
     def __init__(
         self,
         token: str,
@@ -556,18 +662,23 @@ class VultrAPI:
                 message,
                 retry_after=retry_after,
                 operation=operation,
+                provider=self.display_name,
             ) from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
-            raise ApiError(0, f"Vultr API network error: {error}") from error
+            raise ApiError(
+                0,
+                f"{self.display_name} API network error: {error}",
+                provider=self.display_name,
+            ) from error
 
         if not content:
             return {}
         try:
             value = json.loads(content.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as error:
-            raise EnvrError("Vultr API returned malformed JSON") from error
+            raise EnvrError(f"{self.display_name} API returned malformed JSON") from error
         if not isinstance(value, dict):
-            raise EnvrError("Vultr API returned an unexpected response")
+            raise EnvrError(f"{self.display_name} API returned an unexpected response")
         return value
 
     @staticmethod
@@ -576,8 +687,20 @@ class VultrAPI:
             value = json.loads(content.decode("utf-8"))
             if isinstance(value, dict):
                 for key in ("error", "message"):
-                    if value.get(key):
-                        return str(value[key])
+                    candidate = value.get(key)
+                    if isinstance(candidate, str) and candidate:
+                        return candidate
+                    if isinstance(candidate, dict):
+                        for nested in ("error_message", "message", "reason"):
+                            if candidate.get(nested):
+                                return str(candidate[nested])
+                errors = value.get("errors")
+                if isinstance(errors, list) and errors:
+                    first = errors[0]
+                    if isinstance(first, dict):
+                        for nested in ("reason", "message", "error"):
+                            if first.get(nested):
+                                return str(first[nested])
         except (UnicodeError, json.JSONDecodeError):
             pass
         decoded = content.decode("utf-8", errors="replace").strip()
@@ -602,10 +725,1911 @@ class VultrAPI:
         self.request("DELETE", resource)
 
 
+class JSONAPI:
+    """Small provider-neutral JSON transport with precise errors."""
+
+    def __init__(
+        self,
+        token: str,
+        base_url: str,
+        display_name: str,
+        *,
+        opener: urllib.request.OpenerDirector | None = None,
+        auth_scheme: str = "Bearer",
+    ):
+        self.token = token
+        self.base_url = base_url.rstrip("/")
+        self.display_name = display_name
+        self.opener = opener
+        self.auth_scheme = auth_scheme
+
+    def request(
+        self,
+        method: str,
+        resource: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        url = self.base_url + "/" + resource.lstrip("/")
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        body = None
+        headers = {
+            "Authorization": f"{self.auth_scheme} {self.token}",
+            "Accept": "application/json",
+            "User-Agent": f"envr/{VERSION}",
+        }
+        if payload is not None:
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            open_request = self.opener.open if self.opener else urllib.request.urlopen
+            with open_request(request, timeout=timeout) as response:
+                content = response.read()
+        except urllib.error.HTTPError as error:
+            try:
+                content = error.read()
+            finally:
+                error.close()
+            message = VultrAPI._error_message(content, error.reason)
+            retry_after = None
+            with contextlib.suppress(TypeError, ValueError):
+                retry_after = int(error.headers.get("Retry-After", ""))
+            path = urllib.parse.urlsplit(url).path
+            raise ApiError(
+                error.code,
+                message,
+                retry_after=retry_after,
+                operation=f"{method} {path}",
+                provider=self.display_name,
+            ) from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise ApiError(
+                0,
+                f"{self.display_name} API network error: {error}",
+                provider=self.display_name,
+            ) from error
+        if not content:
+            return {}
+        try:
+            value = json.loads(content.decode())
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise EnvrError(
+                f"{self.display_name} API returned malformed JSON"
+            ) from error
+        if not isinstance(value, dict):
+            raise EnvrError(f"{self.display_name} API returned an unexpected response")
+        return value
+
+
+class ExoscaleAPI:
+    """Exoscale v2 adapter exposing envr's normalized cloud contract."""
+
+    provider_name = "exoscale"
+    display_name = "Exoscale"
+    api_host = "api-de-fra-1.exoscale.com"
+    plan_ids = PROVIDER_PLAN_IDS["exoscale"]
+    regions = PROVIDER_REGIONS["exoscale"]
+    security_group_name = "envr-managed"
+
+    def __init__(
+        self,
+        credentials: str,
+        base_url: str | None = None,
+        opener: urllib.request.OpenerDirector | None = None,
+        opener_factory: Callable[[str], urllib.request.OpenerDirector] | None = None,
+    ):
+        values = credentials.splitlines()
+        if len(values) != 2 or not all(value.strip() for value in values):
+            raise EnvrError("Exoscale credentials must contain an API key and secret")
+        self.api_key, self.api_secret = (value.strip() for value in values)
+        self.base_url = base_url.rstrip("/") if base_url else None
+        self.opener = opener
+        self.opener_factory = opener_factory
+        self._plans: dict[str, dict[str, Any]] = {}
+        self._template_zones: set[str] = set()
+        self._instance_zones: dict[str, str] = {}
+        self._key_material: dict[str, str] = {}
+        self._security_group_ids: dict[str, str] = {}
+
+    @staticmethod
+    def api_host_for_zone(zone: str) -> str:
+        return f"api-{zone}.exoscale.com"
+
+    @staticmethod
+    def authorization(
+        api_key: str,
+        api_secret: str,
+        method: str,
+        path: str,
+        body: bytes,
+        query: dict[str, str | int] | None,
+        expires: int,
+    ) -> str:
+        signed = sorted(str(name) for name in (query or {}))
+        values = "".join(str((query or {})[name]) for name in signed)
+        message = "\n".join(
+            (f"{method} {path}", body.decode("utf-8"), values, "", str(expires))
+        )
+        signature = base64.b64encode(
+            hmac.new(api_secret.encode(), message.encode(), hashlib.sha256).digest()
+        ).decode()
+        parts = [f"EXO2-HMAC-SHA256 credential={api_key}"]
+        if signed:
+            parts.append("signed-query-args=" + ";".join(signed))
+        parts.extend((f"expires={expires}", f"signature={signature}"))
+        return ",".join(parts)
+
+    def raw_request(
+        self,
+        zone: str,
+        method: str,
+        resource: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        host = self.api_host_for_zone(zone)
+        base = self.base_url or f"https://{host}/v2"
+        path = "/v2/" + resource.lstrip("/")
+        url = base + "/" + resource.lstrip("/")
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        body = b"" if payload is None else json.dumps(
+            payload, separators=(",", ":")
+        ).encode()
+        expires = int(time.time()) + 600
+        headers = {
+            "Authorization": self.authorization(
+                self.api_key, self.api_secret, method, path, body, query, expires
+            ),
+            "Accept": "application/json",
+            "User-Agent": f"envr/{VERSION}",
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            url, data=body if payload is not None else None, headers=headers, method=method
+        )
+        try:
+            if self.opener_factory is not None:
+                open_request = self.opener_factory(host).open
+            elif self.opener is not None:
+                open_request = self.opener.open
+            else:
+                open_request = urllib.request.urlopen
+            with open_request(request, timeout=timeout) as response:
+                content = response.read()
+        except urllib.error.HTTPError as error:
+            try:
+                content = error.read()
+            finally:
+                error.close()
+            raise ApiError(
+                error.code,
+                VultrAPI._error_message(content, error.reason),
+                operation=f"{method} {path}",
+                provider=self.display_name,
+            ) from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise ApiError(
+                0,
+                f"{self.display_name} API network error: {error}",
+                provider=self.display_name,
+            ) from error
+        if not content:
+            return {}
+        try:
+            value = json.loads(content.decode())
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise EnvrError("Exoscale API returned malformed JSON") from error
+        if not isinstance(value, dict):
+            raise EnvrError("Exoscale API returned an unexpected response")
+        return value
+
+    def _operation(
+        self, zone: str, value: dict[str, Any], *, timeout: int = 300
+    ) -> dict[str, Any]:
+        operation = value
+        identifier = operation.get("id")
+        deadline = time.monotonic() + timeout
+        while operation.get("state") in (None, "pending"):
+            if not identifier:
+                raise EnvrError("Exoscale did not return an operation ID")
+            if time.monotonic() >= deadline:
+                raise ApiError(504, "operation timed out", provider=self.display_name)
+            time.sleep(1)
+            operation = self.raw_request(zone, "GET", f"operation/{identifier}")
+        if operation.get("state") != "success":
+            reason = str(operation.get("reason") or "operation failed")
+            message = str(operation.get("message") or reason)
+            status = 409 if reason in {"busy", "conflict", "unavailable"} else 400
+            raise ApiError(status, message, provider=self.display_name)
+        return operation
+
+    @staticmethod
+    def _instance(value: dict[str, Any], zone: str) -> dict[str, Any]:
+        instance_type = value.get("instance-type")
+        if not isinstance(instance_type, dict):
+            instance_type = {}
+        labels = value.get("labels") if isinstance(value.get("labels"), dict) else {}
+        state = str(value.get("state") or "pending")
+        running = state == "running"
+        return {
+            "id": str(value.get("id") or ""),
+            "provider": "exoscale",
+            "label": value.get("name"),
+            "hostname": value.get("name"),
+            "tags": [MANAGEMENT_TAG] if labels.get("envr") == "managed" else [],
+            "region": zone,
+            "ram": int(instance_type.get("memory") or 0),
+            "vcpu_count": int(instance_type.get("cpus") or 0),
+            "disk": int(value.get("disk-size") or 0),
+            "main_ip": str(value.get("public-ip") or "0.0.0.0"),
+            "status": "active" if running else state,
+            "power_status": "running" if running else "stopped",
+            "plan": (
+                f"{instance_type.get('family')}.{instance_type.get('size')}"
+                if instance_type.get("family") and instance_type.get("size") else ""
+            ),
+            "date_created": value.get("created-at") or "",
+        }
+
+    def _all_zone(self, zone: str, resource: str, key: str, timeout: int = 30) -> list[dict[str, Any]]:
+        response = self.raw_request(zone, "GET", resource, timeout=timeout)
+        values = response.get(key)
+        if not isinstance(values, list):
+            raise EnvrError(f"Exoscale API returned an invalid {key} list")
+        return [value for value in values if isinstance(value, dict)]
+
+    def _zone_for_instance(self, identifier: str, timeout: int = 30) -> str:
+        cached = self._instance_zones.get(identifier)
+        if cached:
+            return cached
+        for zone in self.regions:
+            try:
+                values = self._all_zone(zone, "instance", "instances", timeout)
+            except ApiError as error:
+                if error.status == 404:
+                    continue
+                raise
+            if any(str(value.get("id")) == identifier for value in values):
+                self._instance_zones[identifier] = zone
+                return zone
+        raise ApiError(404, "instance not found", provider=self.display_name)
+
+    def get(self, resource: str, *, query: dict[str, str | int] | None = None, timeout: int = 30) -> dict[str, Any]:
+        primary = self.regions[0]
+        if resource == "account":
+            value = self.raw_request(primary, "GET", "live-balance", timeout=timeout)
+            return {"account": {
+                "balance": -float(value.get("balance") or 0),
+                "pending_charges": 0,
+                "currency": str(value.get("currency") or "CHF"),
+                "credit_model": "prepaid",
+            }}
+        if resource == "ssh-keys":
+            values = self._all_zone(primary, "ssh-key", "ssh-keys", timeout)
+            return {"ssh_keys": [{
+                "id": str(value.get("name") or ""),
+                "name": value.get("name"),
+                "ssh_key": self._key_material.get(str(value.get("name") or "")),
+            } for value in values]}
+        if resource == "instances":
+            instances = []
+            for zone in self.regions:
+                for value in self._all_zone(zone, "instance", "instances", timeout):
+                    identifier = str(value.get("id") or "")
+                    if identifier:
+                        self._instance_zones[identifier] = zone
+                    instances.append(self._instance(value, zone))
+            return {"instances": instances}
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            zone = self._zone_for_instance(identifier, timeout)
+            value = self.raw_request(zone, "GET", f"instance/{identifier}", timeout=timeout)
+            return {"instance": self._instance(value, zone)}
+        if resource == "plans":
+            values = self._all_zone(primary, "instance-type", "instance-types", timeout)
+            plans = []
+            wanted = {alias: (name.split(".", 1)[1]) for alias, name in self.plan_ids.items()}
+            for requested, size in wanted.items():
+                candidates = [value for value in values if value.get("family") == "standard" and value.get("size") == size]
+                if len(candidates) != 1:
+                    continue
+                backing = candidates[0]
+                alias = {
+                    "id": self.plan_ids[requested],
+                    "provider_plan": str(backing.get("id") or ""),
+                    "ram": int(backing.get("memory") or 0),
+                    "vcpu_count": int(backing.get("cpus") or 0),
+                    "disk": 50,
+                    "hourly_cost": None,
+                    "monthly_cost": None,
+                    "locations": [str(zone) for zone in (backing.get("zones") or [])],
+                }
+                plans.append(alias)
+                self._plans[str(alias["id"])] = alias
+            return {"plans": list({str(plan["id"]): plan for plan in plans}.values())}
+        if resource == "os":
+            values = self._all_zone(primary, "template", "templates", timeout)
+            candidates = []
+            for value in values:
+                name = str(value.get("name") or "")
+                version = str(value.get("version") or "")
+                if "ubuntu" in name.lower() and ("24.04" in name or version.startswith("24.04")) and value.get("id"):
+                    candidates.append(value)
+            if not candidates:
+                return {"os": []}
+            selected = max(
+                candidates,
+                key=lambda value: (
+                    str(value.get("name") or "") == "Linux Ubuntu 24.04 LTS 64-bit",
+                    str(value.get("build") or ""),
+                    str(value.get("id") or ""),
+                ),
+            )
+            self._template_zones = {
+                str(zone) for zone in (selected.get("zones") or [])
+            }
+            return {"os": [{"id": selected["id"], "name": "Ubuntu 24.04 LTS x64", "family": "ubuntu", "arch": "x64"}]}
+        if resource.startswith("regions/") and resource.endswith("/availability"):
+            zone = resource.split("/")[1]
+            template_available = not self._template_zones or zone in self._template_zones
+            return {"available_plans": [
+                identifier
+                for identifier, plan in self._plans.items()
+                if template_available and zone in plan.get("locations", [])
+            ]}
+        raise EnvrError(f"unsupported Exoscale operation: GET {resource}")
+
+    def _ensure_security_group(self, zone: str) -> str:
+        cached = self._security_group_ids.get(zone)
+        if cached:
+            return cached
+        groups = self._all_zone(zone, "security-group", "security-groups")
+        group = next((value for value in groups if value.get("name") == self.security_group_name), None)
+        if group is None:
+            operation = self._operation(zone, self.raw_request(zone, "POST", "security-group", payload={"name": self.security_group_name, "description": "envr managed ingress"}))
+            reference = operation.get("reference")
+            identifier = str(reference.get("id") or "") if isinstance(reference, dict) else ""
+        else:
+            identifier = str(group.get("id") or "")
+        if not identifier:
+            raise EnvrError("Exoscale did not return the managed security-group ID")
+        self._security_group_ids[zone] = identifier
+        self._ensure_security_rule(zone, identifier, 22, "tcp")
+        return identifier
+
+    def _ensure_security_rule(self, zone: str, group_id: str, port: int, protocol: str) -> None:
+        group = self.raw_request(zone, "GET", f"security-group/{group_id}")
+        rules = group.get("rules") if isinstance(group.get("rules"), list) else []
+        if any(value.get("flow-direction") == "ingress" and value.get("protocol") == protocol and int(value.get("start-port") or 0) == port and int(value.get("end-port") or 0) == port and value.get("network") == "0.0.0.0/0" for value in rules if isinstance(value, dict)):
+            return
+        self._operation(zone, self.raw_request(zone, "POST", f"security-group/{group_id}/rules", payload={"flow-direction": "ingress", "protocol": protocol, "start-port": port, "end-port": port, "network": "0.0.0.0/0", "description": f"envr port {port}"}))
+
+    def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        primary = self.regions[0]
+        if resource == "ssh-keys":
+            name, public_key = str(payload["name"]), str(payload["ssh_key"])
+            try:
+                self._operation(primary, self.raw_request(primary, "POST", "ssh-key", payload={"name": name, "public-key": public_key}))
+            except ApiError as error:
+                if error.status != 409:
+                    raise
+            self._key_material[name] = public_key
+            return {"ssh_key": {"id": name, "name": name, "ssh_key": public_key}}
+        if resource == "instances":
+            zone = str(payload["region"])
+            plan = self._plans.get(str(payload["plan"])) or {}
+            security_group = self._ensure_security_group(zone)
+            operation = self._operation(zone, self.raw_request(zone, "POST", "instance", payload={
+                "name": payload["label"],
+                "instance-type": {"id": plan.get("provider_plan")},
+                "template": {"id": payload["os_id"]},
+                "disk-size": int(plan.get("disk") or 50),
+                "public-ip-assignment": "inet4",
+                "labels": {"envr": "managed"},
+                "security-groups": [{"id": security_group}],
+                "ssh-keys": [{"name": name} for name in (payload.get("sshkey_id") or [])],
+                "user-data": payload["user_data"],
+                "auto-start": True,
+            }))
+            reference = operation.get("reference")
+            identifier = str(reference.get("id") or "") if isinstance(reference, dict) else ""
+            if not identifier:
+                raise EnvrError("Exoscale did not return the created instance ID")
+            self._instance_zones[identifier] = zone
+            value = self.raw_request(zone, "GET", f"instance/{identifier}")
+            return {"instance": self._instance(value, zone)}
+        raise EnvrError(f"unsupported Exoscale operation: POST {resource}")
+
+    def patch(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            zone = self._zone_for_instance(identifier)
+            self._operation(zone, self.raw_request(zone, "PUT", f"instance/{identifier}", payload={"name": payload["label"]}))
+            return {}
+        raise EnvrError(f"unsupported Exoscale operation: PATCH {resource}")
+
+    def delete(self, resource: str) -> None:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            zone = self._zone_for_instance(identifier)
+            self._operation(zone, self.raw_request(zone, "DELETE", f"instance/{identifier}"))
+            return
+        raise EnvrError(f"unsupported Exoscale operation: DELETE {resource}")
+
+    def request(self, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
+        if method == "POST" and resource.startswith("instances/") and resource.endswith("/start"):
+            identifier = resource.split("/")[1]
+            zone = self._zone_for_instance(identifier)
+            self._operation(zone, self.raw_request(zone, "PUT", f"instance/{identifier}:start", payload={}))
+            return {}
+        if method == "GET":
+            return self.get(resource, query=kwargs.get("query"), timeout=kwargs.get("timeout", 30))
+        raise EnvrError(f"unsupported Exoscale operation: {method} {resource}")
+
+    def open_port(self, instance: dict[str, Any], port: int) -> None:
+        zone = str(instance.get("region") or self.regions[0])
+        identifier = self._ensure_security_group(zone)
+        self._ensure_security_rule(zone, identifier, port, "tcp")
+        self._ensure_security_rule(zone, identifier, port, "udp")
+
+
+class AkamaiAPI:
+    """Akamai/Linode adapter exposing envr's normalized cloud contract."""
+
+    provider_name = "akamai"
+    display_name = "Akamai Cloud"
+    api_host = "api.linode.com"
+    plan_ids = PROVIDER_PLAN_IDS["akamai"]
+    regions = PROVIDER_REGIONS["akamai"]
+
+    def __init__(
+        self,
+        token: str,
+        base_url: str | None = None,
+        opener: urllib.request.OpenerDirector | None = None,
+    ):
+        self.raw = JSONAPI(
+            token,
+            base_url or AKAMAI_API_BASE,
+            self.display_name,
+            opener=opener,
+        )
+        self._keys: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _tags(value: object) -> list[str]:
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    def _instance(self, value: dict[str, Any]) -> dict[str, Any]:
+        specs = value.get("specs") if isinstance(value.get("specs"), dict) else {}
+        addresses = value.get("ipv4") if isinstance(value.get("ipv4"), list) else []
+        main_ip = next(
+            (str(item) for item in addresses if not str(item).startswith("192.168.")),
+            "0.0.0.0",
+        )
+        running = value.get("status") == "running"
+        return {
+            "id": str(value.get("id") or ""),
+            "provider": self.provider_name,
+            "label": value.get("label"),
+            "hostname": value.get("label"),
+            "tags": self._tags(value.get("tags")),
+            "region": value.get("region"),
+            "ram": int(specs.get("memory") or 0),
+            "vcpu_count": int(specs.get("vcpus") or 0),
+            "disk": int(specs.get("disk") or 0) // 1024,
+            "main_ip": main_ip,
+            "status": "active" if running else str(value.get("status") or "pending"),
+            "power_status": "running" if running else "stopped",
+            "plan": value.get("type"),
+            "date_created": value.get("created") or "",
+        }
+
+    def _all(self, resource: str, *, timeout: int = 30) -> list[dict[str, Any]]:
+        response = self.raw.request(
+            "GET", resource, query={"page_size": 500}, timeout=timeout
+        )
+        values = response.get("data")
+        if not isinstance(values, list):
+            raise EnvrError(f"{self.display_name} API returned an invalid list")
+        return [value for value in values if isinstance(value, dict)]
+
+    def get(
+        self,
+        resource: str,
+        *,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        if resource == "account":
+            value = self.raw.request("GET", "account", timeout=timeout)
+            return {
+                "account": {
+                    "balance": float(value.get("balance") or 0),
+                    "pending_charges": float(value.get("balance_uninvoiced") or 0),
+                    "currency": "USD",
+                    "credit_model": "postpaid",
+                }
+            }
+        if resource == "ssh-keys":
+            values = self._all("profile/sshkeys", timeout=timeout)
+            keys = [
+                {
+                    "id": str(value.get("id") or ""),
+                    "name": value.get("label"),
+                    "ssh_key": value.get("ssh_key"),
+                }
+                for value in values
+            ]
+            self._keys = {str(key["id"]): key for key in keys}
+            return {"ssh_keys": keys}
+        if resource == "instances":
+            return {"instances": [self._instance(v) for v in self._all("linode/instances", timeout=timeout)]}
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            value = self.raw.request("GET", f"linode/instances/{identifier}", timeout=timeout)
+            return {"instance": self._instance(value)}
+        if resource == "plans":
+            plans = []
+            for value in self._all("linode/types", timeout=timeout):
+                price = value.get("price") if isinstance(value.get("price"), dict) else {}
+                plans.append(
+                    {
+                        "id": value.get("id"),
+                        "ram": int(value.get("memory") or 0),
+                        "vcpu_count": int(value.get("vcpus") or 0),
+                        "disk": int(value.get("disk") or 0) // 1024,
+                        "hourly_cost": price.get("hourly"),
+                        "monthly_cost": price.get("monthly"),
+                        "locations": list(self.regions),
+                    }
+                )
+            return {"plans": plans}
+        if resource == "os":
+            systems = []
+            for value in self._all("images", timeout=timeout):
+                identifier = str(value.get("id") or "")
+                label = str(value.get("label") or "")
+                capabilities = value.get("capabilities") or []
+                if (
+                    identifier == "linode/ubuntu24.04"
+                    or label == "Ubuntu 24.04 LTS"
+                ) and "cloud-init" in capabilities:
+                    systems.append(
+                        {
+                            "id": identifier,
+                            "name": "Ubuntu 24.04 LTS x64",
+                            "family": "ubuntu",
+                            "arch": "x64",
+                        }
+                    )
+            return {"os": systems}
+        if resource.startswith("regions/") and resource.endswith("/availability"):
+            region = resource.split("/")[1]
+            regions = self._all("regions", timeout=timeout)
+            exists = any(
+                value.get("id") == region and "Metadata" in (value.get("capabilities") or [])
+                for value in regions
+            )
+            return {"available_plans": list(self.plan_ids.values()) if exists else []}
+        raise EnvrError(f"unsupported {self.display_name} operation: GET {resource}")
+
+    def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource == "ssh-keys":
+            value = self.raw.request(
+                "POST",
+                "profile/sshkeys",
+                payload={"label": payload["name"], "ssh_key": payload["ssh_key"]},
+            )
+            key = {
+                "id": str(value.get("id") or ""),
+                "name": value.get("label"),
+                "ssh_key": value.get("ssh_key"),
+            }
+            self._keys[str(key["id"])] = key
+            return {"ssh_key": key}
+        if resource == "instances":
+            password = strong_password()
+            raw_payload = {
+                "region": payload["region"],
+                "type": payload["plan"],
+                "image": payload["os_id"],
+                "label": payload["label"],
+                "tags": payload["tags"],
+                "authorized_keys": payload.get("public_keys") or [],
+                "root_pass": password,
+                "metadata": {"user_data": payload["user_data"]},
+                "booted": True,
+                "backups_enabled": False,
+            }
+            value = self.raw.request("POST", "linode/instances", payload=raw_payload)
+            instance = self._instance(value)
+            instance["default_password"] = password
+            return {"instance": instance}
+        raise EnvrError(f"unsupported {self.display_name} operation: POST {resource}")
+
+    def patch(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            self.raw.request(
+                "PUT", f"linode/instances/{identifier}", payload={"label": payload["label"]}
+            )
+            return {}
+        raise EnvrError(f"unsupported {self.display_name} operation: PATCH {resource}")
+
+    def delete(self, resource: str) -> None:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            self.raw.request("DELETE", f"linode/instances/{identifier}")
+            return
+        raise EnvrError(f"unsupported {self.display_name} operation: DELETE {resource}")
+
+    def request(self, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
+        if method == "POST" and resource.startswith("instances/") and resource.endswith("/start"):
+            identifier = resource.split("/")[1]
+            return self.raw.request("POST", f"linode/instances/{identifier}/boot")
+        if method == "GET":
+            return self.get(resource, query=kwargs.get("query"), timeout=kwargs.get("timeout", 30))
+        raise EnvrError(f"unsupported {self.display_name} operation: {method} {resource}")
+
+
+class DigitalOceanAPI:
+    """DigitalOcean adapter exposing envr's normalized cloud contract."""
+
+    provider_name = "digitalocean"
+    display_name = "DigitalOcean"
+    api_host = "api.digitalocean.com"
+    plan_ids = PROVIDER_PLAN_IDS["digitalocean"]
+    regions = PROVIDER_REGIONS["digitalocean"]
+
+    def __init__(
+        self,
+        token: str,
+        base_url: str | None = None,
+        opener: urllib.request.OpenerDirector | None = None,
+    ):
+        self.raw = JSONAPI(
+            token,
+            base_url or DIGITALOCEAN_API_BASE,
+            self.display_name,
+            opener=opener,
+        )
+
+    def _all(
+        self,
+        resource: str,
+        key: str,
+        *,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> list[dict[str, Any]]:
+        parameters = {"per_page": 200, **(query or {})}
+        result: list[dict[str, Any]] = []
+        for page in range(1, 101):
+            response = self.raw.request(
+                "GET",
+                resource,
+                query={**parameters, "page": page},
+                timeout=timeout,
+            )
+            values = response.get(key)
+            if not isinstance(values, list):
+                raise EnvrError(
+                    f"{self.display_name} API returned an invalid {key} list"
+                )
+            result.extend(value for value in values if isinstance(value, dict))
+            links = response.get("links")
+            pages = links.get("pages") if isinstance(links, dict) else None
+            if not isinstance(pages, dict) or not pages.get("next"):
+                return result
+        raise EnvrError(f"{self.display_name} API pagination did not terminate")
+
+    @staticmethod
+    def _instance(value: dict[str, Any]) -> dict[str, Any]:
+        networks = value.get("networks")
+        ipv4 = networks.get("v4") if isinstance(networks, dict) else []
+        main_ip = "0.0.0.0"
+        if isinstance(ipv4, list):
+            for item in ipv4:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "public"
+                    and item.get("ip_address")
+                ):
+                    main_ip = str(item["ip_address"])
+                    break
+        region = value.get("region")
+        region_slug = region.get("slug") if isinstance(region, dict) else region
+        status = str(value.get("status") or "new")
+        running = status == "active"
+        return {
+            "id": str(value.get("id") or ""),
+            "provider": "digitalocean",
+            "label": value.get("name"),
+            "hostname": value.get("name"),
+            "tags": [str(item) for item in (value.get("tags") or [])],
+            "region": region_slug,
+            "ram": int(value.get("memory") or 0),
+            "vcpu_count": int(value.get("vcpus") or 0),
+            "disk": int(value.get("disk") or 0),
+            "main_ip": main_ip,
+            "status": "active" if running else status,
+            "power_status": "running" if running else "stopped",
+            "plan": value.get("size_slug"),
+            "date_created": value.get("created_at") or "",
+        }
+
+    def get(
+        self,
+        resource: str,
+        *,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        if resource == "account":
+            # Validate the token independently of the optional billing scope.
+            self.raw.request("GET", "account", timeout=timeout)
+            try:
+                balance = self.raw.request(
+                    "GET", "customers/my/balance", timeout=timeout
+                )
+            except ApiError as error:
+                if error.status != 403:
+                    raise
+                return {
+                    "account": {
+                        "balance": 0,
+                        "pending_charges": 0,
+                        "currency": "USD",
+                        "credit_model": "postpaid",
+                        "billing_available": False,
+                    }
+                }
+            return {
+                "account": {
+                    "balance": float(balance.get("account_balance") or 0),
+                    "pending_charges": float(
+                        balance.get("month_to_date_usage") or 0
+                    ),
+                    "currency": "USD",
+                    "credit_model": "postpaid",
+                    "billing_available": True,
+                }
+            }
+        if resource == "ssh-keys":
+            keys = []
+            for value in self._all("account/keys", "ssh_keys", timeout=timeout):
+                keys.append(
+                    {
+                        "id": str(value.get("id") or ""),
+                        "name": value.get("name"),
+                        "ssh_key": value.get("public_key"),
+                    }
+                )
+            return {"ssh_keys": keys}
+        if resource == "instances":
+            values = self._all("droplets", "droplets", timeout=timeout)
+            return {"instances": [self._instance(value) for value in values]}
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            response = self.raw.request(
+                "GET", f"droplets/{identifier}", timeout=timeout
+            )
+            value = response.get("droplet")
+            if not isinstance(value, dict):
+                raise EnvrError("DigitalOcean returned invalid Droplet details")
+            return {"instance": self._instance(value)}
+        if resource == "plans":
+            plans = []
+            for value in self._all("sizes", "sizes", timeout=timeout):
+                if not value.get("available"):
+                    continue
+                plans.append(
+                    {
+                        "id": value.get("slug"),
+                        "ram": int(value.get("memory") or 0),
+                        "vcpu_count": int(value.get("vcpus") or 0),
+                        "disk": int(value.get("disk") or 0),
+                        "hourly_cost": value.get("price_hourly"),
+                        "monthly_cost": value.get("price_monthly"),
+                        "locations": [str(item) for item in (value.get("regions") or [])],
+                    }
+                )
+            return {"plans": plans}
+        if resource == "os":
+            systems = []
+            for value in self._all(
+                "images",
+                "images",
+                query={"type": "distribution"},
+                timeout=timeout,
+            ):
+                if (
+                    value.get("slug") == "ubuntu-24-04-x64"
+                    and value.get("distribution") == "Ubuntu"
+                    and value.get("available", True)
+                ):
+                    systems.append(
+                        {
+                            "id": "ubuntu-24-04-x64",
+                            "name": "Ubuntu 24.04 LTS x64",
+                            "family": "ubuntu",
+                            "arch": "x64",
+                        }
+                    )
+            return {"os": systems}
+        if resource.startswith("regions/") and resource.endswith("/availability"):
+            region = resource.split("/")[1]
+            values = self._all("regions", "regions", timeout=timeout)
+            available = any(
+                value.get("slug") == region and value.get("available")
+                for value in values
+            )
+            return {
+                "available_plans": list(dict.fromkeys(self.plan_ids.values()))
+                if available
+                else []
+            }
+        raise EnvrError(f"unsupported DigitalOcean operation: GET {resource}")
+
+    def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource == "ssh-keys":
+            response = self.raw.request(
+                "POST",
+                "account/keys",
+                payload={
+                    "name": payload["name"],
+                    "public_key": payload["ssh_key"],
+                },
+            )
+            value = response.get("ssh_key")
+            if not isinstance(value, dict):
+                raise EnvrError("DigitalOcean did not return the created SSH key")
+            return {
+                "ssh_key": {
+                    "id": str(value.get("id") or ""),
+                    "name": value.get("name"),
+                    "ssh_key": value.get("public_key"),
+                }
+            }
+        if resource == "instances":
+            ssh_keys = [
+                int(value) if str(value).isdigit() else value
+                for value in (payload.get("sshkey_id") or [])
+            ]
+            raw_payload = {
+                "name": payload["label"],
+                "region": payload["region"],
+                "size": payload["plan"],
+                "image": payload["os_id"],
+                "ssh_keys": ssh_keys,
+                "backups": False,
+                "ipv6": False,
+                "monitoring": False,
+                "tags": payload.get("tags") or [],
+                "user_data": base64.b64decode(payload["user_data"]).decode(),
+                "with_droplet_agent": False,
+            }
+            response = self.raw.request("POST", "droplets", payload=raw_payload)
+            value = response.get("droplet")
+            if not isinstance(value, dict):
+                raise EnvrError("DigitalOcean did not return the created Droplet")
+            return {"instance": self._instance(value)}
+        raise EnvrError(f"unsupported DigitalOcean operation: POST {resource}")
+
+    def patch(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            self.raw.request(
+                "PUT", f"droplets/{identifier}", payload={"name": payload["label"]}
+            )
+            return {}
+        raise EnvrError(f"unsupported DigitalOcean operation: PATCH {resource}")
+
+    def delete(self, resource: str) -> None:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            self.raw.request("DELETE", f"droplets/{identifier}")
+            return
+        raise EnvrError(f"unsupported DigitalOcean operation: DELETE {resource}")
+
+    def request(self, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
+        if (
+            method == "POST"
+            and resource.startswith("instances/")
+            and resource.endswith("/start")
+        ):
+            identifier = resource.split("/")[1]
+            return self.raw.request(
+                "POST", f"droplets/{identifier}/actions", payload={"type": "power_on"}
+            )
+        if method == "GET":
+            return self.get(
+                resource,
+                query=kwargs.get("query"),
+                timeout=kwargs.get("timeout", 30),
+            )
+        raise EnvrError(
+            f"unsupported DigitalOcean operation: {method} {resource}"
+        )
+
+
+class GcoreAPI:
+    """Gcore Cloud adapter exposing envr's normalized cloud contract."""
+
+    provider_name = "gcore"
+    display_name = "Gcore"
+    api_host = "api.gcore.com"
+    plan_ids = PROVIDER_PLAN_IDS["gcore"]
+    regions = PROVIDER_REGIONS["gcore"]
+    security_group_name = "envr-managed"
+
+    def __init__(
+        self,
+        token: str,
+        base_url: str | None = None,
+        opener: urllib.request.OpenerDirector | None = None,
+    ):
+        self.raw = JSONAPI(
+            token,
+            base_url or GCORE_API_BASE,
+            self.display_name,
+            opener=opener,
+            auth_scheme="APIKey",
+        )
+        self._project_id: int | None = None
+        self._region_ids: dict[str, int] = {}
+        self._volume_types: dict[str, list[str]] = {}
+        self._plans: dict[str, dict[str, Any]] = {}
+        self._region_plans: dict[tuple[str, str], dict[str, Any]] = {}
+        self._region_images: dict[str, str] = {}
+        self._instance_regions: dict[str, str] = {}
+        self._security_group_ids: dict[str, str] = {}
+
+    def _all(
+        self,
+        resource: str,
+        *,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> list[dict[str, Any]]:
+        offset = 0
+        values: list[dict[str, Any]] = []
+        while True:
+            page_query = dict(query or {})
+            page_query.update({"limit": 1000, "offset": offset})
+            response = self.raw.request(
+                "GET", resource, query=page_query, timeout=timeout
+            )
+            page = response.get("results")
+            if not isinstance(page, list):
+                raise EnvrError(f"Gcore API returned an invalid {resource} list")
+            items = [item for item in page if isinstance(item, dict)]
+            values.extend(items)
+            count = response.get("count")
+            if len(page) < 1000 or (
+                isinstance(count, int) and len(values) >= count
+            ):
+                return values
+            offset += len(page)
+
+    def _project(self, *, timeout: int = 30) -> int:
+        if self._project_id is not None:
+            return self._project_id
+        projects = self._all("cloud/v1/projects", timeout=timeout)
+        defaults = [
+            item for item in projects
+            if item.get("is_default") is True
+            and str(item.get("state") or "ACTIVE").upper() == "ACTIVE"
+        ]
+        if len(defaults) != 1:
+            raise EnvrError("Gcore account must have exactly one active default project")
+        try:
+            self._project_id = int(defaults[0]["id"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise EnvrError("Gcore default project has no valid ID") from error
+        return self._project_id
+
+    def _load_regions(self, *, timeout: int = 30) -> None:
+        if self._region_ids:
+            return
+        values = self._all(
+            "cloud/v1/regions",
+            query={"show_volume_types": "true"},
+            timeout=timeout,
+        )
+        wanted = set(self.regions)
+        for value in values:
+            slug = str(value.get("slug") or "")
+            if (
+                slug not in wanted
+                or str(value.get("state") or "ACTIVE").upper() != "ACTIVE"
+                or value.get("has_kvm") is False
+            ):
+                continue
+            try:
+                self._region_ids[slug] = int(value["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            volume_types = value.get("available_volume_types")
+            if isinstance(volume_types, list):
+                self._volume_types[slug] = [str(item) for item in volume_types]
+
+    def _region_id(self, region: str, *, timeout: int = 30) -> int:
+        self._load_regions(timeout=timeout)
+        if region not in self._region_ids:
+            raise EnvrError(f"Gcore region {region} is unavailable")
+        return self._region_ids[region]
+
+    def _tasks(
+        self, response: dict[str, Any], *, timeout: int = 600
+    ) -> list[dict[str, Any]]:
+        identifiers = response.get("tasks")
+        if not isinstance(identifiers, list) or not identifiers:
+            raise EnvrError("Gcore did not return an operation task")
+        completed = []
+        deadline = time.monotonic() + timeout
+        for raw_identifier in identifiers:
+            identifier = str(raw_identifier)
+            while True:
+                task = self.raw.request("GET", f"cloud/v1/tasks/{identifier}")
+                state = str(task.get("state") or "").upper()
+                if state == "FINISHED":
+                    completed.append(task)
+                    break
+                if state == "ERROR":
+                    raise ApiError(
+                        400,
+                        str(task.get("error") or "operation failed"),
+                        provider=self.display_name,
+                    )
+                if time.monotonic() >= deadline:
+                    raise ApiError(504, "operation timed out", provider=self.display_name)
+                time.sleep(1)
+        return completed
+
+    @staticmethod
+    def _tags(value: dict[str, Any]) -> dict[str, str]:
+        tags = value.get("tags")
+        if isinstance(tags, dict):
+            return {str(key): str(item) for key, item in tags.items()}
+        tags_v2 = value.get("tags_v2")
+        if isinstance(tags_v2, list):
+            return {
+                str(item.get("key")): str(item.get("value"))
+                for item in tags_v2 if isinstance(item, dict) and item.get("key")
+            }
+        return {}
+
+    def _instance(self, value: dict[str, Any], region: str) -> dict[str, Any]:
+        flavor = value.get("flavor") if isinstance(value.get("flavor"), dict) else {}
+        assignments = value.get("fixed_ip_assignments")
+        main_ip = "0.0.0.0"
+        if isinstance(assignments, list):
+            for item in assignments:
+                if not isinstance(item, dict) or item.get("external") is not True:
+                    continue
+                candidate = str(item.get("ip_address") or "")
+                if candidate:
+                    main_ip = candidate
+                    break
+        status = str(value.get("status") or value.get("vm_state") or "pending")
+        running = status.lower() in {"active", "running"}
+        identifier = str(value.get("id") or "")
+        if identifier:
+            self._instance_regions[identifier] = region
+        return {
+            "id": identifier,
+            "provider": self.provider_name,
+            "label": value.get("name"),
+            "hostname": value.get("name"),
+            "tags": [MANAGEMENT_TAG] if self._tags(value).get("envr") == "managed" else [],
+            "region": region,
+            "ram": int(flavor.get("ram") or value.get("ram") or 0),
+            "vcpu_count": int(flavor.get("vcpus") or value.get("vcpus") or 0),
+            "main_ip": main_ip,
+            "status": "active" if running else status.lower(),
+            "power_status": "running" if running else "stopped",
+            "plan": str(flavor.get("flavor_id") or value.get("flavor_id") or ""),
+            "date_created": value.get("created_at") or "",
+        }
+
+    def _region_for_instance(self, identifier: str, *, timeout: int = 30) -> str:
+        cached = self._instance_regions.get(identifier)
+        if cached:
+            return cached
+        self._load_regions(timeout=timeout)
+        for region in self.regions:
+            if region not in self._region_ids:
+                continue
+            region_id = self._region_id(region, timeout=timeout)
+            values = self._all(
+                f"cloud/v1/instances/{self._project()}/{region_id}",
+                timeout=timeout,
+            )
+            if any(str(item.get("id") or "") == identifier for item in values):
+                self._instance_regions[identifier] = region
+                return region
+        raise ApiError(404, "instance not found", provider=self.display_name)
+
+    def _flavors(self, region: str, *, timeout: int = 30) -> list[dict[str, Any]]:
+        return self._all(
+            f"cloud/v1/flavors/{self._project()}/{self._region_id(region)}",
+            query={"include_prices": "true"},
+            timeout=timeout,
+        )
+
+    def get(
+        self,
+        resource: str,
+        *,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        project = self._project(timeout=timeout)
+        if resource == "account":
+            value = self.raw.request("GET", "iam/clients/me", timeout=timeout)
+            return {"account": {
+                "billing_available": False,
+                "billing_reason": "not exposed by the Gcore Cloud API",
+                "currency": "EUR",
+                "credit_model": "unknown",
+                "status": value.get("status"),
+            }}
+        if resource == "ssh-keys":
+            values = self._all(f"cloud/v1/ssh_keys/{project}", timeout=timeout)
+            return {"ssh_keys": [{
+                "id": str(value.get("id") or value.get("name") or ""),
+                "name": value.get("name"),
+                "ssh_key": value.get("public_key"),
+            } for value in values]}
+        if resource == "instances":
+            result = []
+            self._load_regions(timeout=timeout)
+            for region in self.regions:
+                if region not in self._region_ids:
+                    continue
+                region_id = self._region_id(region, timeout=timeout)
+                result.extend(
+                    self._instance(value, region)
+                    for value in self._all(
+                        f"cloud/v1/instances/{project}/{region_id}", timeout=timeout
+                    )
+                )
+            return {"instances": result}
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            region = self._region_for_instance(identifier, timeout=timeout)
+            value = self.raw.request(
+                "GET",
+                f"cloud/v1/instances/{project}/{self._region_id(region)}/{identifier}",
+                timeout=timeout,
+            )
+            return {"instance": self._instance(value, region)}
+        if resource == "plans":
+            self._load_regions(timeout=timeout)
+            by_region = {
+                region: [
+                    item for item in self._flavors(region, timeout=timeout)
+                    if not item.get("disabled")
+                    and str(item.get("architecture") or "x86_64") == "x86_64"
+                    and str(item.get("os_type") or "linux").lower() == "linux"
+                    and any(
+                        marker in str(
+                            item.get("flavor_name") or item.get("flavor_id") or ""
+                        ).lower()
+                        for marker in ("standard", "basic")
+                    )
+                ]
+                for region in self.regions if region in self._region_ids
+            }
+            backing_plans: dict[str, dict[str, Any]] = {}
+            for region, values in by_region.items():
+                for item in values:
+                    identifier = str(item.get("flavor_id") or "")
+                    if not identifier:
+                        continue
+                    plan = backing_plans.setdefault(identifier, {
+                        "id": identifier,
+                        "ram": int(item.get("ram") or 0),
+                        "vcpu_count": int(item.get("vcpus") or 0),
+                        "disk": 50,
+                        "hourly_cost": (
+                            float(item["price_per_hour"])
+                            if item.get("price_per_hour") is not None else None
+                        ),
+                        "monthly_cost": (
+                            float(item["price_per_month"])
+                            if item.get("price_per_month") is not None else None
+                        ),
+                        "currency": str(item.get("currency_code") or "USD"),
+                        "locations": [],
+                    })
+                    plan["locations"].append(region)
+            plans = list(backing_plans.values())
+            desired_cpu = {1: 1, 2: 1, 4: 2, 8: 4, 12: 4, 16: 6, 24: 8, 32: 8}
+            for requested, alias_id in self.plan_ids.items():
+                available_sizes = sorted({
+                    int(item.get("ram") or 0)
+                    for values in by_region.values() for item in values
+                    if (
+                        int(item.get("ram") or 0) >= requested * 1024
+                        if requested in {12, 24}
+                        else int(item.get("ram") or 0) == requested * 1024
+                    )
+                })
+                if not available_sizes:
+                    continue
+                target = available_sizes[0]
+                locations = []
+                selected: dict[str, Any] | None = None
+                for region, values in by_region.items():
+                    candidates = [item for item in values if int(item.get("ram") or 0) == target]
+                    if not candidates:
+                        continue
+                    backing = min(candidates, key=lambda item: (
+                        "standard" not in str(item.get("flavor_name") or item.get("flavor_id") or "").lower(),
+                        abs(int(item.get("vcpus") or 0) - desired_cpu[requested]),
+                        int(item.get("vcpus") or 0),
+                    ))
+                    self._region_plans[(alias_id, region)] = backing
+                    locations.append(region)
+                    selected = selected or backing
+                if selected is None:
+                    continue
+                hourly = selected.get("price_per_hour")
+                monthly = selected.get("price_per_month")
+                plan = {
+                    "id": alias_id,
+                    "provider_plan": str(selected.get("flavor_id") or ""),
+                    "ram": target,
+                    "vcpu_count": int(selected.get("vcpus") or 0),
+                    "disk": 50,
+                    "hourly_cost": float(hourly) if hourly is not None else None,
+                    "monthly_cost": float(monthly) if monthly is not None else None,
+                    "currency": str(selected.get("currency_code") or "USD"),
+                    "locations": locations,
+                }
+                plans.append(plan)
+                self._plans[alias_id] = plan
+            return {"plans": plans}
+        if resource == "os":
+            self._load_regions(timeout=timeout)
+            for region in self.regions:
+                if region not in self._region_ids:
+                    continue
+                values = self._all(
+                    f"cloud/v1/images/{project}/{self._region_id(region)}",
+                    query={
+                        "os_distro": "ubuntu", "os_version": "24.04",
+                        "architecture": "x86_64", "visibility": "public",
+                    },
+                    timeout=timeout,
+                )
+                candidates = [
+                    item for item in values
+                    if item.get("id") and str(item.get("status") or "active").lower() == "active"
+                ]
+                if candidates:
+                    selected = max(candidates, key=lambda item: (
+                        "24.04" in str(item.get("name") or ""),
+                        str(item.get("updated_at") or item.get("created_at") or ""),
+                    ))
+                    self._region_images[region] = str(selected["id"])
+            return {"os": ([{
+                "id": "gcore-ubuntu-24.04-x86_64",
+                "name": "Ubuntu 24.04 LTS x64", "family": "ubuntu", "arch": "x64",
+            }] if self._region_images else [])}
+        if resource.startswith("regions/") and resource.endswith("/availability"):
+            region = resource.split("/")[1]
+            return {"available_plans": [
+                plan_id for plan_id in self.plan_ids.values()
+                if (plan_id, region) in self._region_plans and region in self._region_images
+            ]}
+        raise EnvrError(f"unsupported Gcore operation: GET {resource}")
+
+    def _ensure_security_group(self, region: str) -> str:
+        cached = self._security_group_ids.get(region)
+        if cached:
+            return cached
+        project, region_id = self._project(), self._region_id(region)
+        groups = self._all(f"cloud/v1/securitygroups/{project}/{region_id}")
+        group = next(
+            (item for item in groups if item.get("name") == self.security_group_name), None
+        )
+        if group is None:
+            tasks = self._tasks(self.raw.request(
+                "POST", f"cloud/v2/security_groups/{project}/{region_id}",
+                payload={
+                    "name": self.security_group_name,
+                    "description": "envr managed ingress",
+                    "tags": {"envr": "managed"},
+                    "rules": [{
+                        "direction": "ingress", "ethertype": "IPv4",
+                        "protocol": "tcp", "port_range_min": 22,
+                        "port_range_max": 22, "remote_ip_prefix": "0.0.0.0/0",
+                    }, {
+                        "direction": "egress", "ethertype": "IPv4",
+                        "protocol": None, "remote_ip_prefix": "0.0.0.0/0",
+                    }, {
+                        "direction": "egress", "ethertype": "IPv6",
+                        "protocol": None, "remote_ip_prefix": "::/0",
+                    }],
+                },
+            ))
+            created = [
+                item
+                for task in tasks
+                for item in (
+                    task.get("created_resources", {}).get("security_groups", [])
+                    if isinstance(task.get("created_resources"), dict) else []
+                )
+            ]
+            identifier = str(created[0]) if created else ""
+            if not identifier:
+                groups = self._all(f"cloud/v1/securitygroups/{project}/{region_id}")
+                group = next((item for item in groups if item.get("name") == self.security_group_name), None)
+                identifier = str(group.get("id") or "") if group else ""
+        else:
+            identifier = str(group.get("id") or "")
+        if not identifier:
+            raise EnvrError("Gcore did not return the managed security-group ID")
+        self._security_group_ids[region] = identifier
+        self._ensure_security_rule(region, identifier, 22, "tcp")
+        self._ensure_security_egress(region, identifier, "IPv4", "0.0.0.0/0")
+        self._ensure_security_egress(region, identifier, "IPv6", "::/0")
+        return identifier
+
+    def _ensure_security_egress(
+        self, region: str, group_id: str, ethertype: str, prefix: str
+    ) -> None:
+        project, region_id = self._project(), self._region_id(region)
+        groups = self._all(f"cloud/v1/securitygroups/{project}/{region_id}")
+        group = next((item for item in groups if str(item.get("id")) == group_id), {})
+        rules = group.get("security_group_rules") if isinstance(group, dict) else []
+        if isinstance(rules, list) and any(
+            isinstance(item, dict)
+            and item.get("direction") == "egress"
+            and item.get("ethertype") == ethertype
+            and item.get("protocol") in {None, "any"}
+            and item.get("remote_ip_prefix") == prefix
+            for item in rules
+        ):
+            return
+        self._tasks(self.raw.request(
+            "POST", f"cloud/v2/security_groups/{project}/{region_id}/{group_id}/rules",
+            payload={
+                "direction": "egress", "ethertype": ethertype,
+                "protocol": None, "remote_ip_prefix": prefix,
+            },
+        ))
+
+    def _ensure_security_rule(self, region: str, group_id: str, port: int, protocol: str) -> None:
+        project, region_id = self._project(), self._region_id(region)
+        groups = self._all(f"cloud/v1/securitygroups/{project}/{region_id}")
+        group = next((item for item in groups if str(item.get("id")) == group_id), {})
+        rules = group.get("security_group_rules") if isinstance(group, dict) else []
+        if isinstance(rules, list) and any(
+            isinstance(item, dict)
+            and item.get("direction") == "ingress"
+            and item.get("protocol") == protocol
+            and int(item.get("port_range_min") or 0) == port
+            and int(item.get("port_range_max") or 0) == port
+            for item in rules
+        ):
+            return
+        self._tasks(self.raw.request(
+            "POST", f"cloud/v2/security_groups/{project}/{region_id}/{group_id}/rules",
+            payload={
+                "direction": "ingress", "ethertype": "IPv4", "protocol": protocol,
+                "port_range_min": port, "port_range_max": port,
+                "remote_ip_prefix": "0.0.0.0/0",
+            },
+        ))
+
+    def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        project = self._project()
+        if resource == "ssh-keys":
+            value = self.raw.request(
+                "POST", f"cloud/v1/ssh_keys/{project}",
+                payload={
+                    "name": payload["name"], "public_key": payload["ssh_key"],
+                    "shared_in_project": True,
+                },
+            )
+            return {"ssh_key": {
+                "id": str(value.get("id") or value.get("name") or ""),
+                "name": value.get("name") or payload["name"],
+                "ssh_key": value.get("public_key") or payload["ssh_key"],
+            }}
+        if resource == "instances":
+            region = str(payload["region"])
+            region_id = self._region_id(region)
+            backing = self._region_plans.get((str(payload["plan"]), region))
+            image_id = self._region_images.get(region)
+            if not backing or not image_id:
+                raise EnvrError(f"Gcore catalog for {region} is incomplete")
+            group_id = self._ensure_security_group(region)
+            volume_types = self._volume_types.get(region, [])
+            volume_type = "standard" if "standard" in volume_types or not volume_types else volume_types[0]
+            keys = self.get("ssh-keys")["ssh_keys"]
+            key_ids = {str(item) for item in (payload.get("sshkey_id") or [])}
+            key = next((item for item in keys if str(item.get("id")) in key_ids), None)
+            if key is None or not key.get("name"):
+                raise EnvrError("Gcore could not resolve the managed SSH key name")
+            tasks = self._tasks(self.raw.request(
+                "POST", f"cloud/v2/instances/{project}/{region_id}",
+                payload={
+                    "name": payload["label"],
+                    "flavor": backing["flavor_id"],
+                    "interfaces": [{
+                        "type": "external", "ip_family": "ipv4",
+                        "security_groups": [{"id": group_id}],
+                    }],
+                    "volumes": [{
+                        "source": "image", "image_id": image_id,
+                        "size": 50, "type_name": volume_type,
+                        "boot_index": 0, "delete_on_termination": True,
+                    }],
+                    "ssh_key_name": key["name"],
+                    "tags": {"envr": "managed"},
+                    "user_data": payload["user_data"],
+                },
+            ))
+            created = [
+                item
+                for task in tasks
+                for item in (
+                    task.get("created_resources", {}).get("instances", [])
+                    if isinstance(task.get("created_resources"), dict) else []
+                )
+            ]
+            identifier = str(created[0]) if created else ""
+            if not identifier:
+                candidates = self._all(f"cloud/v1/instances/{project}/{region_id}")
+                matches = [item for item in candidates if item.get("name") == payload["label"]]
+                if len(matches) != 1:
+                    raise EnvrError("Gcore completed creation but did not identify the instance")
+                identifier = str(matches[0].get("id") or "")
+            self._instance_regions[identifier] = region
+            return self.get(f"instances/{identifier}")
+        raise EnvrError(f"unsupported Gcore operation: POST {resource}")
+
+    def patch(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            region = self._region_for_instance(identifier)
+            value = self.raw.request(
+                "PATCH",
+                f"cloud/v1/instances/{self._project()}/{self._region_id(region)}/{identifier}",
+                payload={"name": payload["label"]},
+            )
+            return {"instance": self._instance(value, region)}
+        raise EnvrError(f"unsupported Gcore operation: PATCH {resource}")
+
+    def delete(self, resource: str) -> None:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            region = self._region_for_instance(identifier)
+            response = self.raw.request(
+                "DELETE",
+                f"cloud/v1/instances/{self._project()}/{self._region_id(region)}/{identifier}",
+            )
+            if response:
+                self._tasks(response)
+            return
+        raise EnvrError(f"unsupported Gcore operation: DELETE {resource}")
+
+    def request(self, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
+        if method == "POST" and resource.startswith("instances/") and resource.endswith("/start"):
+            identifier = resource.split("/")[1]
+            region = self._region_for_instance(identifier)
+            response = self.raw.request(
+                "POST",
+                f"cloud/v2/instances/{self._project()}/{self._region_id(region)}/{identifier}/action",
+                payload={"action": "start"},
+            )
+            self._tasks(response)
+            return {}
+        if method == "GET":
+            return self.get(resource, query=kwargs.get("query"), timeout=kwargs.get("timeout", 30))
+        raise EnvrError(f"unsupported Gcore operation: {method} {resource}")
+
+    def open_port(self, instance: dict[str, Any], port: int) -> None:
+        region = str(instance.get("region") or self._region_for_instance(str(instance["id"])))
+        group = self._ensure_security_group(region)
+        for protocol in ("tcp", "udp"):
+            self._ensure_security_rule(region, group, port, protocol)
+
+
+class UpCloudAPI:
+    """UpCloud adapter exposing envr's normalized cloud contract."""
+
+    provider_name = "upcloud"
+    display_name = "UpCloud"
+    api_host = "api.upcloud.com"
+    plan_ids = PROVIDER_PLAN_IDS["upcloud"]
+    regions = PROVIDER_REGIONS["upcloud"]
+
+    def __init__(
+        self,
+        token: str,
+        base_url: str | None = None,
+        opener: urllib.request.OpenerDirector | None = None,
+    ):
+        self.raw = JSONAPI(
+            token,
+            base_url or UPCLOUD_API_BASE,
+            self.display_name,
+            opener=opener,
+        )
+        self._plans: dict[str, dict[str, Any]] = {}
+        self._template: str | None = None
+        self._deleted_storages: dict[str, list[str]] = {}
+
+    @staticmethod
+    def _labels(value: object) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        items = value.get("label")
+        if not isinstance(items, list):
+            return {}
+        return {
+            str(item.get("key")): str(item.get("value"))
+            for item in items
+            if isinstance(item, dict) and item.get("key")
+        }
+
+    @staticmethod
+    def _items(value: object, outer: str, inner: str) -> list[dict[str, Any]]:
+        if not isinstance(value, dict):
+            return []
+        container = value.get(outer)
+        if not isinstance(container, dict):
+            return []
+        items = container.get(inner)
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+    def _instance(self, value: dict[str, Any]) -> dict[str, Any]:
+        addresses = value.get("ip_addresses")
+        address_items = []
+        if isinstance(addresses, dict) and isinstance(addresses.get("ip_address"), list):
+            address_items = addresses["ip_address"]
+        main_ip = "0.0.0.0"
+        for item in address_items:
+            if not isinstance(item, dict) or item.get("family") != "IPv4":
+                continue
+            candidate = str(item.get("address") or "")
+            if candidate and item.get("access") == "public":
+                main_ip = candidate
+                break
+        labels = self._labels(value.get("labels"))
+        state = str(value.get("state") or "pending")
+        return {
+            "id": str(value.get("uuid") or ""),
+            "provider": self.provider_name,
+            "label": value.get("title"),
+            "hostname": value.get("hostname"),
+            "tags": [MANAGEMENT_TAG] if labels.get("envr") == "managed" else [],
+            "region": value.get("zone"),
+            "ram": int(value.get("memory_amount") or 0),
+            "vcpu_count": int(value.get("core_number") or 0),
+            "main_ip": main_ip,
+            "status": "active" if state == "started" else state,
+            "power_status": "running" if state == "started" else "stopped",
+            "plan": value.get("plan"),
+            "date_created": value.get("created") or "",
+        }
+
+    def _server_details(self, identifier: str, *, timeout: int = 30) -> dict[str, Any]:
+        response = self.raw.request("GET", f"server/{identifier}", timeout=timeout)
+        value = response.get("server")
+        if not isinstance(value, dict):
+            raise EnvrError("UpCloud API returned invalid server details")
+        return value
+
+    def _zones(self, *, timeout: int = 30) -> list[str]:
+        response = self.raw.request("GET", "zone", timeout=timeout)
+        values = self._items(response, "zones", "zone")
+        return [str(value.get("id")) for value in values if value.get("id")]
+
+    def _zone_prices(self, region: str, *, timeout: int = 30) -> dict[str, Any]:
+        response = self.raw.request("GET", "price", timeout=timeout)
+        prices = response.get("prices")
+        zones = prices.get("zone") if isinstance(prices, dict) else None
+        if not isinstance(zones, list):
+            raise EnvrError("UpCloud API returned an invalid price list")
+        value = next(
+            (
+                item for item in zones
+                if isinstance(item, dict) and str(item.get("name")) == region
+            ),
+            None,
+        )
+        if value is None:
+            raise EnvrError(f"UpCloud has no live pricing for {region}")
+        return value
+
+    @staticmethod
+    def _hourly_price(price: object) -> float | None:
+        if not isinstance(price, dict):
+            return None
+        try:
+            # UpCloud's price list is expressed in hundredths of the account
+            # currency per hour.
+            return float(price["price"]) / 100
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def get(
+        self,
+        resource: str,
+        *,
+        query: dict[str, str | int] | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        if resource == "account":
+            response = self.raw.request("GET", "account", timeout=timeout)
+            value = response.get("account")
+            if not isinstance(value, dict):
+                raise EnvrError("UpCloud API returned invalid account information")
+            credits = float(value.get("credits") or 0) / 100
+            return {
+                "account": {
+                    "balance": -credits,
+                    "pending_charges": 0,
+                    "currency": str(value.get("currency") or "EUR"),
+                    "credit_model": "prepaid",
+                }
+            }
+        if resource == "ssh-keys":
+            # UpCloud injects keys directly at creation. Running VPS enrollment
+            # and the copied authorized_keys file remain authoritative.
+            return {"ssh_keys": []}
+        if resource == "instances":
+            response = self.raw.request("GET", "server", timeout=timeout)
+            values = self._items(response, "servers", "server")
+            normalized = []
+            for value in values:
+                if value.get("title") in {LABEL, RESIZE_TARGET_LABEL, RESIZE_SOURCE_LABEL}:
+                    value = self._server_details(str(value.get("uuid")), timeout=timeout)
+                normalized.append(self._instance(value))
+            return {"instances": normalized}
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            return {"instance": self._instance(self._server_details(identifier, timeout=timeout))}
+        if resource == "plans":
+            response = self.raw.request("GET", "plan", timeout=timeout)
+            values = self._items(response, "plans", "plan")
+            regions = [region for region in self.regions if region in self._zones(timeout=timeout)]
+            if not regions:
+                raise EnvrError("UpCloud has no configured European region")
+            prices = self._zone_prices(regions[0], timeout=timeout)
+            plans = []
+            for value in values:
+                if str(value.get("current_offering", "yes")) != "yes":
+                    continue
+                plan = {
+                    "id": value.get("name"),
+                    "ram": int(value.get("memory_amount") or 0),
+                    "vcpu_count": int(value.get("core_number") or 0),
+                    "disk": int(value.get("storage_size") or 0),
+                    "storage_tier": str(value.get("storage_tier") or "maxiops"),
+                    "hourly_cost": self._hourly_price(
+                        prices.get(f"server_plan_{value.get('name')}")
+                    ),
+                    "locations": regions,
+                }
+                if plan["hourly_cost"] is not None:
+                    plan["monthly_cost"] = round(plan["hourly_cost"] * 672, 2)
+                else:
+                    plan["monthly_cost"] = None
+                plans.append(plan)
+                self._plans[str(plan["id"])] = plan
+            # UpCloud plan names may evolve. Present stable envr aliases while
+            # retaining the live backing plan selected by memory and CPU.
+            desired_cpu = {1: 1, 2: 1, 4: 2, 8: 4, 16: 6, 32: 8}
+            for ram_gb, cpu in desired_cpu.items():
+                candidates = [
+                    item for item in plans
+                    if int(item.get("ram") or 0) == ram_gb * 1024
+                ]
+                if not candidates:
+                    continue
+                backing = min(
+                    candidates,
+                    key=lambda item: (
+                        abs(int(item.get("vcpu_count") or 0) - cpu),
+                        int(item.get("vcpu_count") or 0) < cpu,
+                    ),
+                )
+                alias = dict(backing)
+                alias["id"] = self.plan_ids[ram_gb]
+                alias["provider_plan"] = backing["id"]
+                plans.append(alias)
+                self._plans[str(alias["id"])] = alias
+            for ram_gb, cpu, disk in ((12, 4, 80), (24, 8, 160)):
+                custom = {
+                    "id": self.plan_ids[ram_gb],
+                    "ram": ram_gb * 1024,
+                    "vcpu_count": cpu,
+                    "disk": disk,
+                    "storage_tier": "maxiops",
+                    "hourly_cost": None,
+                    "monthly_cost": None,
+                    "locations": regions,
+                    "custom": True,
+                }
+                components = (
+                    ("server_core", cpu),
+                    ("server_memory", ram_gb * 1024),
+                    ("storage_maxiops", disk),
+                    ("ipv4_address", 1),
+                )
+                custom_cents = 0.0
+                valid_price = True
+                for name, quantity in components:
+                    component = prices.get(name)
+                    try:
+                        custom_cents += (
+                            float(component["price"])
+                            * quantity
+                            / float(component["amount"])
+                        )
+                    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                        valid_price = False
+                        break
+                if valid_price:
+                    custom["hourly_cost"] = custom_cents / 100
+                    custom["monthly_cost"] = round(custom_cents / 100 * 672, 2)
+                plans.append(custom)
+                self._plans[str(custom["id"])] = custom
+            return {"plans": plans}
+        if resource == "os":
+            response = self.raw.request("GET", "storage/template", timeout=timeout)
+            values = self._items(response, "storages", "storage")
+            systems = []
+            for value in values:
+                title = str(value.get("title") or "")
+                if "Ubuntu Server 24.04" in title or title == "Ubuntu 24.04 LTS":
+                    identifier = str(value.get("uuid") or "")
+                    systems.append(
+                        {
+                            "id": identifier,
+                            "name": "Ubuntu 24.04 LTS x64",
+                            "family": "ubuntu",
+                            "arch": "x64",
+                        }
+                    )
+                    self._template = identifier
+            return {"os": systems}
+        if resource.startswith("regions/") and resource.endswith("/availability"):
+            region = resource.split("/")[1]
+            return {
+                "available_plans": list(self.plan_ids.values())
+                if region in self._zones(timeout=timeout)
+                else []
+            }
+        raise EnvrError(f"unsupported UpCloud operation: GET {resource}")
+
+    def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource == "ssh-keys":
+            identifier = hashlib.sha256(str(payload["ssh_key"]).encode()).hexdigest()[:12]
+            return {
+                "ssh_key": {
+                    "id": identifier,
+                    "name": payload["name"],
+                    "ssh_key": payload["ssh_key"],
+                }
+            }
+        if resource == "instances":
+            plan = self._plans.get(str(payload["plan"])) or {}
+            disk = int(plan.get("disk") or 160)
+            custom = bool(plan.get("custom"))
+            server: dict[str, Any] = {
+                "zone": payload["region"],
+                "title": payload["label"],
+                "hostname": payload["hostname"],
+                "metadata": "yes",
+                "user_data": base64.b64decode(payload["user_data"]).decode(),
+                "password_delivery": "none",
+                "login_user": {
+                    "username": "root",
+                    "create_password": "no",
+                    "ssh_keys": {"ssh_key": payload.get("public_keys") or []},
+                },
+                "labels": {"label": [{"key": "envr", "value": "managed"}]},
+                "storage_devices": {
+                    "storage_device": [
+                        {
+                            "action": "clone",
+                            "storage": payload["os_id"],
+                            "title": f"{payload['label']}-system",
+                            "size": str(disk),
+                            "tier": str(plan.get("storage_tier") or "maxiops"),
+                        }
+                    ]
+                },
+            }
+            if custom:
+                server.update(
+                    {
+                        "plan": "custom",
+                        "core_number": int(plan.get("vcpu_count") or 8),
+                        "memory_amount": int(plan.get("ram") or 24 * 1024),
+                    }
+                )
+            else:
+                server["plan"] = str(plan.get("provider_plan") or payload["plan"])
+            response = self.raw.request("POST", "server", payload={"server": server})
+            value = response.get("server")
+            if not isinstance(value, dict):
+                raise EnvrError("UpCloud did not return the created server")
+            return {"instance": self._instance(value)}
+        raise EnvrError(f"unsupported UpCloud operation: POST {resource}")
+
+    def patch(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            self.raw.request(
+                "PUT", f"server/{identifier}", payload={"server": {"title": payload["label"]}}
+            )
+            return {}
+        raise EnvrError(f"unsupported UpCloud operation: PATCH {resource}")
+
+    def delete(self, resource: str) -> None:
+        if resource.startswith("instances/"):
+            identifier = resource.split("/", 1)[1]
+            details = self._server_details(identifier)
+            devices = details.get("storage_devices")
+            device_items = (
+                devices.get("storage_device") if isinstance(devices, dict) else []
+            )
+            storage_ids = [
+                str(item.get("storage"))
+                for item in device_items
+                if isinstance(item, dict) and item.get("storage")
+            ] if isinstance(device_items, list) else []
+            self.raw.request("DELETE", f"server/{identifier}", query={"storages": 1})
+            self._deleted_storages[identifier] = storage_ids
+            return
+        raise EnvrError(f"unsupported UpCloud operation: DELETE {resource}")
+
+    def verify_instance_deleted(self, identifier: str) -> bool:
+        for storage_id in self._deleted_storages.get(identifier, []):
+            try:
+                self.raw.request("GET", f"storage/{storage_id}", timeout=10)
+            except ApiError as error:
+                if error.status == 404:
+                    continue
+                raise
+            return False
+        self._deleted_storages.pop(identifier, None)
+        return True
+
+    def request(self, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
+        if method == "POST" and resource.startswith("instances/") and resource.endswith("/start"):
+            identifier = resource.split("/")[1]
+            return self.raw.request("POST", f"server/{identifier}/start")
+        if method == "GET":
+            return self.get(resource, query=kwargs.get("query"), timeout=kwargs.get("timeout", 30))
+        raise EnvrError(f"unsupported UpCloud operation: {method} {resource}")
+
+
 class Envr:
     def __init__(self, root: Path | None = None):
         self.root = root or data_root()
         self.token_path = self.root / "api"
+        self.cloud_path = self.root / "cloud.json"
+        self.providers_root = self.root / "providers"
         self.auth_path = self.root / "codex" / "auth.json"
         self.git_root = self.root / "git"
         self.ssh_root = self.root / "ssh"
@@ -617,8 +2641,8 @@ class Envr:
         self.relay_key = self.relay_root / "id_ed25519"
         self.relay_public_key = self.relay_root / "id_ed25519.pub"
         self.relay_known_hosts = self.relay_root / "known_hosts"
-        self._api_tunnel: RelayAPITunnel | None = None
-        self._api_opener: urllib.request.OpenerDirector | None = None
+        self._api_tunnels: dict[str, RelayAPITunnel] = {}
+        self._api_openers: dict[str, urllib.request.OpenerDirector] = {}
         self.repos_path = self.root / "repos.json"
         self.state_path = self.root / "state.json"
         self.password_path = self.root / "instance-password"
@@ -640,6 +2664,8 @@ class Envr:
             "instance-password",
             "client-id",
             "relay",
+            "cloud.json",
+            "providers",
         )
         candidates = [name for name in names if (legacy / name).exists()]
         if not candidates:
@@ -662,6 +2688,7 @@ class Envr:
         ensure_private_dir(self.git_root)
         ensure_private_dir(self.ssh_root)
         ensure_private_dir(self.auth_path.parent)
+        ensure_private_dir(self.providers_root)
         if self.relay_root.exists():
             ensure_private_dir(self.relay_root)
 
@@ -681,10 +2708,13 @@ class Envr:
         atomic_write_json(self.repos_path, value)
 
     def state(self) -> dict[str, Any]:
-        return load_json(
+        value = load_json(
             self.state_path,
             default={"schema": SCHEMA_VERSION, "instance_id": None},
         )
+        if value.get("instance_id") and not value.get("provider"):
+            value["provider"] = "vultr"
+        return value
 
     def save_state(self, value: dict[str, Any]) -> None:
         value["schema"] = SCHEMA_VERSION
@@ -701,16 +2731,36 @@ class Envr:
         if not instance_id:
             raise EnvrError("cannot cache an instance without an ID")
         existing = self.state()
-        if existing.get("instance_id") != instance_id:
+        provider = str(instance.get("provider") or existing.get("provider") or "vultr")
+        identity_changed = (
+            existing.get("instance_id") != instance_id
+            or str(existing.get("provider") or "vultr") != provider
+        )
+        if identity_changed:
             existing = {}
         main_ip = str(instance.get("main_ip") or existing.get("main_ip") or "")
+        detected_ram = int(instance.get("ram") or 0) // 1024
+        instance_plan = str(instance.get("plan") or "")
+        requested_matches = [
+            requested
+            for requested, plan_id in PROVIDER_PLAN_IDS.get(provider, {}).items()
+            if instance_plan == plan_id
+        ]
+        if len(requested_matches) == 1:
+            detected_ram = requested_matches[0]
+        elif detected_ram not in requested_matches and requested_matches:
+            detected_ram = requested_matches[0]
         value: dict[str, Any] = {
             "schema": SCHEMA_VERSION,
             "instance_id": instance_id,
+            "provider": provider,
             "ram_gb": (
                 ram_gb
                 if ram_gb is not None
-                else int(instance.get("ram") or 0) // 1024
+                else int(
+                    existing.get("ram_gb")
+                    or detected_ram
+                )
             ),
             "region": region or instance.get("region") or existing.get("region"),
         }
@@ -718,7 +2768,7 @@ class Envr:
             try:
                 address = ipaddress.ip_address(main_ip)
             except ValueError as error:
-                raise EnvrError("Vultr returned an invalid instance IP address") from error
+                raise EnvrError("provider returned an invalid instance IP address") from error
             if address.version != 4:
                 raise EnvrError("envr requires a public IPv4 address")
             value["main_ip"] = main_ip
@@ -726,6 +2776,9 @@ class Envr:
         password = str(instance.get("default_password") or "").strip()
         if password:
             atomic_write_text(self.password_path, password + "\n")
+        elif identity_changed:
+            with contextlib.suppress(FileNotFoundError):
+                self.password_path.unlink()
 
     def cached_instance(self, ram_gb: int | None = None) -> dict[str, Any] | None:
         state = self.state()
@@ -768,6 +2821,7 @@ class Envr:
             "region": state.get("region"),
             "status": "active",
             "power_status": "running",
+            "provider": str(state.get("provider") or "vultr"),
         }
 
     def single_known_host_ip(self) -> str | None:
@@ -943,17 +2997,17 @@ class Envr:
         )
 
     @staticmethod
-    def relay_api_ipv4() -> str:
+    def relay_api_ipv4(api_host: str = "api.vultr.com") -> str:
         try:
             answers = socket.getaddrinfo(
-                RELAY_API_HOST,
+                api_host,
                 443,
                 family=socket.AF_INET,
                 type=socket.SOCK_STREAM,
             )
         except socket.gaierror as error:
             raise EnvrError(
-                f"could not resolve an IPv4 address for {RELAY_API_HOST}: {error}"
+                f"could not resolve an IPv4 address for {api_host}: {error}"
             ) from error
         addresses = [
             str(answer[4][0])
@@ -962,15 +3016,18 @@ class Envr:
         ]
         if not addresses:
             raise EnvrError(
-                f"{RELAY_API_HOST} did not resolve to an IPv4 address"
+                f"{api_host} did not resolve to an IPv4 address"
             )
         return addresses[0]
 
     def verify_relay(self, relay: RelayConfig) -> None:
+        provider = self.selected_provider()
+        api_host = PROVIDER_API_HOSTS[provider]
         tunnel = RelayAPITunnel(
             self.relay_ssh_options(relay, multiplex=False),
             relay.target,
-            self.relay_api_ipv4(),
+            self.relay_api_ipv4(api_host),
+            api_host,
         )
         try:
             tunnel.start()
@@ -1063,63 +3120,257 @@ class Envr:
                 continue
             print("Choose E, D, or Q.")
 
-    def ensure_api_tunnel(self, relay: RelayConfig) -> urllib.request.OpenerDirector:
-        if self._api_opener is not None:
-            return self._api_opener
+    def ensure_api_host_tunnel(
+        self, relay: RelayConfig, api_host: str
+    ) -> urllib.request.OpenerDirector:
+        if api_host in self._api_openers:
+            return self._api_openers[api_host]
         ensure_commands(("ssh",))
-        custom_api = os.environ.get("ENVR_VULTR_API")
-        if custom_api:
-            parsed = urllib.parse.urlsplit(custom_api)
-            if parsed.scheme != "https" or parsed.hostname != RELAY_API_HOST:
-                raise EnvrError(
-                    "a custom Vultr API endpoint cannot use the SSH relay"
-                )
         tunnel = RelayAPITunnel(
             self.relay_ssh_options(relay, multiplex=False),
             relay.target,
-            self.relay_api_ipv4(),
+            self.relay_api_ipv4(api_host),
+            api_host,
         )
         try:
             opener = tunnel.start()
         except BaseException:
             tunnel.close()
             raise
-        self._api_tunnel = tunnel
-        self._api_opener = opener
+        self._api_tunnels[api_host] = tunnel
+        self._api_openers[api_host] = opener
         return opener
 
-    def close_api_tunnel(self) -> None:
-        if self._api_tunnel is not None:
-            self._api_tunnel.close()
-        self._api_tunnel = None
-        self._api_opener = None
+    def ensure_api_tunnel(
+        self, relay: RelayConfig, provider: str
+    ) -> urllib.request.OpenerDirector:
+        api_host = PROVIDER_API_HOSTS[provider]
+        custom_api = os.environ.get("ENVR_VULTR_API") if provider == "vultr" else None
+        if custom_api:
+            parsed = urllib.parse.urlsplit(custom_api)
+            if parsed.scheme != "https" or parsed.hostname != api_host:
+                raise EnvrError(
+                    "a custom Vultr API endpoint cannot use the SSH relay"
+                )
+        return self.ensure_api_host_tunnel(relay, api_host)
 
-    def api_token(self) -> str:
+    def close_api_tunnel(self) -> None:
+        for tunnel in self._api_tunnels.values():
+            tunnel.close()
+        self._api_tunnels.clear()
+        self._api_openers.clear()
+
+    def provider_token_path(self, provider: str) -> Path:
+        if provider == "vultr":
+            return self.token_path
+        return self.providers_root / provider / "api"
+
+    def cloud_config(self) -> dict[str, Any]:
+        value = load_json(
+            self.cloud_path,
+            default={"schema": SCHEMA_VERSION, "selected": "vultr"},
+        )
+        selected = str(value.get("selected") or "vultr")
+        if selected not in PROVIDER_NAMES:
+            raise EnvrError(f"{self.cloud_path} has an invalid selected provider")
+        value["selected"] = selected
+        return value
+
+    def selected_provider(self) -> str:
+        return str(self.cloud_config()["selected"])
+
+    def configured_providers(self) -> list[str]:
+        return [
+            provider
+            for provider in PROVIDER_NAMES
+            if self.provider_token_path(provider).is_file()
+            and bool(self.provider_token_path(provider).read_text(encoding="utf-8").strip())
+        ]
+
+    @staticmethod
+    def provider_name(api: Any) -> str:
+        return str(getattr(api, "provider_name", "vultr"))
+
+    @staticmethod
+    def provider_label(api: Any) -> str:
+        return str(getattr(api, "display_name", "Vultr"))
+
+    def instance_api(self, instance: dict[str, Any], *, prompt: bool = False) -> Any:
+        return self.api(str(instance.get("provider") or "vultr"), prompt=prompt)
+
+    def provider_inventories(
+        self, *, include_selected: bool = False
+    ) -> list[tuple[Any, list[dict[str, Any]]]]:
+        providers = self.configured_providers()
+        selected = self.selected_provider()
+        prompt_provider: str | None = None
+        if not providers:
+            providers.append(selected)
+            prompt_provider = selected
+        if include_selected and selected not in providers:
+            providers.append(selected)
+        results = []
+        for provider in PROVIDER_NAMES:
+            if provider not in providers:
+                continue
+            api = self.api(
+                provider,
+                prompt=(provider == prompt_provider)
+                or (include_selected and provider == selected),
+            )
+            results.append((api, self.all_instances(api)))
+        return results
+
+    def active_inventory(
+        self, *, include_selected: bool = False
+    ) -> tuple[Any, dict[str, Any]] | None:
+        matches: list[tuple[Any, dict[str, Any]]] = []
+        resizing: list[tuple[Any, dict[str, Any]]] = []
+        for api, inventory in self.provider_inventories(include_selected=include_selected):
+            matches.extend((api, item) for item in self.managed_from(inventory))
+            resizing.extend((api, item) for item in self.resize_from(inventory))
+        if resizing:
+            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
+        if len(matches) > 1:
+            raise EnvrError(
+                f"conflict: {len(matches)} envr instances exist across configured clouds; "
+                "run envr status"
+            )
+        return matches[0] if matches else None
+
+    def api_token(self, provider: str = "vultr", *, prompt: bool = True) -> str:
         self.ensure_layout()
-        if self.token_path.exists():
-            self.token_path.chmod(0o600)
-            token = self.token_path.read_text(encoding="utf-8").strip()
+        path = self.provider_token_path(provider)
+        if path.exists():
+            path.chmod(0o600)
+            token = path.read_text(encoding="utf-8").strip()
             if token:
                 return token
-        token = getpass.getpass("Vultr API token: ").strip()
+        if not prompt:
+            raise EnvrError(f"{PROVIDER_LABELS[provider]} is not configured")
+        return self.prompt_api_credentials(provider)
+
+    @staticmethod
+    def prompt_api_credentials(provider: str, *, replacement: bool = False) -> str:
+        prefix = "New " if replacement else ""
+        if provider == "exoscale":
+            api_key = getpass.getpass(f"{prefix}Exoscale API key: ").strip()
+            api_secret = getpass.getpass(f"{prefix}Exoscale API secret: ").strip()
+            if not api_key or not api_secret:
+                raise EnvrError("Exoscale API key and secret cannot be empty")
+            return api_key + "\n" + api_secret
+        token = getpass.getpass(
+            f"{prefix}{PROVIDER_LABELS[provider]} API token: "
+        ).strip()
         if not token:
-            raise EnvrError("Vultr API token cannot be empty")
+            raise EnvrError(f"{PROVIDER_LABELS[provider]} API token cannot be empty")
         return token
 
-    def api(self) -> VultrAPI:
-        saved = self.token_path.exists() and bool(
-            self.token_path.read_text(encoding="utf-8").strip()
+    def api_from_credentials(
+        self, provider: str, credentials: str, relay: RelayConfig | None
+    ) -> Any:
+        if provider == "exoscale":
+            factory = (
+                (lambda host: self.ensure_api_host_tunnel(relay, host))
+                if relay is not None else None
+            )
+            return ExoscaleAPI(credentials, opener_factory=factory)
+        opener = self.ensure_api_tunnel(relay, provider) if relay is not None else None
+        classes = {
+            "vultr": VultrAPI,
+            "akamai": AkamaiAPI,
+            "upcloud": UpCloudAPI,
+            "digitalocean": DigitalOceanAPI,
+            "gcore": GcoreAPI,
+        }
+        return classes[provider](credentials, opener=opener)
+
+    def api(self, provider: str | None = None, *, prompt: bool = True) -> Any:
+        provider = provider or self.selected_provider()
+        if provider not in PROVIDER_NAMES:
+            raise EnvrError(f"unknown cloud provider: {provider}")
+        path = self.provider_token_path(provider)
+        saved = path.exists() and bool(
+            path.read_text(encoding="utf-8").strip()
         )
-        token = self.api_token()
+        token = self.api_token(provider, prompt=prompt)
         relay = self.relay_config()
-        opener = self.ensure_api_tunnel(relay) if relay is not None else None
-        api = VultrAPI(token, opener=opener)
+        api = self.api_from_credentials(provider, token, relay)
         if not saved:
-            print("Verifying Vultr API token...")
+            print(f"Verifying {api.display_name} API credentials...")
             api.get("account")
-            atomic_write_text(self.token_path, token + "\n")
-            print(f"Vultr API token verified and saved to {self.token_path}")
+            atomic_write_text(path, token + "\n")
+            print(f"{api.display_name} API credentials verified and saved to {path}")
         return api
+
+    def cloud_menu(self) -> None:
+        """Configure one provider and choose where the next VPS is created."""
+        self.ensure_layout()
+        while True:
+            selected = self.selected_provider()
+            configured = set(self.configured_providers())
+            print("\nCloud")
+            for index, provider in enumerate(PROVIDER_NAMES, 1):
+                marker = "*" if provider == selected else " "
+                state = "ready" if provider in configured else "not configured"
+                print(f"  {index}. {marker} {PROVIDER_LABELS[provider]:<13} {state}")
+            print("\nThe * provider is used by envr up and as the resize destination.")
+            choice = input(
+                f"Select 1-{len(PROVIDER_NAMES)}, [R] replace credentials, "
+                "[D] forget selected, [Q] quit: "
+            ).strip().lower()
+            if choice in {"", "q"}:
+                return
+            if choice == "r":
+                provider = selected
+                path = self.provider_token_path(provider)
+                token = self.prompt_api_credentials(provider, replacement=True)
+                relay = self.relay_config()
+                candidate = self.api_from_credentials(provider, token, relay)
+                candidate.get("account")
+                atomic_write_text(path, token + "\n")
+                print(f"{candidate.display_name} credentials replaced.")
+                return
+            if choice == "d":
+                state = self.state()
+                if (
+                    state.get("instance_id")
+                    and str(state.get("provider") or "vultr") == selected
+                ):
+                    raise EnvrError(
+                        "cannot forget the provider that owns the cached running VPS"
+                    )
+                if selected not in configured:
+                    print(f"{PROVIDER_LABELS[selected]} is not configured.")
+                    return
+                if not prompt_yes_no(f"Forget the local {PROVIDER_LABELS[selected]} credentials?"):
+                    print("Cancelled.")
+                    continue
+                path = self.provider_token_path(selected)
+                path.unlink()
+                remaining = [item for item in PROVIDER_NAMES if item in configured and item != selected]
+                replacement = remaining[0] if remaining else "vultr"
+                atomic_write_json(
+                    self.cloud_path,
+                    {"schema": SCHEMA_VERSION, "selected": replacement},
+                )
+                print(f"{PROVIDER_LABELS[selected]} credentials forgotten on this device.")
+                return
+            if not choice.isdigit() or not 1 <= int(choice) <= len(PROVIDER_NAMES):
+                numbers = ", ".join(
+                    str(index) for index in range(1, len(PROVIDER_NAMES) + 1)
+                )
+                print(f"Choose {numbers}, R, D, or Q.")
+                continue
+            provider = PROVIDER_NAMES[int(choice) - 1]
+            if provider not in configured:
+                self.api(provider)
+            atomic_write_json(
+                self.cloud_path,
+                {"schema": SCHEMA_VERSION, "selected": provider},
+            )
+            print(f"{PROVIDER_LABELS[provider]} selected.")
+            return
 
     def configure_git(self) -> None:
         ensure_commands(("ssh-keygen",))
@@ -1282,7 +3533,9 @@ class Envr:
         response = api.get("ssh-keys", query={"per_page": 500})
         keys = response.get("ssh_keys")
         if not isinstance(keys, list):
-            raise EnvrError("Vultr API returned an invalid SSH-key list")
+            raise EnvrError(
+                f"{self.provider_label(api)} API returned an invalid SSH-key list"
+            )
         normalized = public_key.strip()
         for key in keys:
             if isinstance(key, dict) and str(key.get("ssh_key", "")).strip() == normalized:
@@ -1296,7 +3549,9 @@ class Envr:
             },
         ).get("ssh_key")
         if not isinstance(created, dict) or not created.get("id"):
-            raise EnvrError("Vultr API did not return the uploaded SSH-key ID")
+            raise EnvrError(
+                f"{self.provider_label(api)} API did not return the uploaded SSH-key ID"
+            )
         return str(created["id"])
 
     def managed_vultr_ssh_keys(
@@ -1305,7 +3560,9 @@ class Envr:
         response = api.get("ssh-keys", query={"per_page": 500}, timeout=timeout)
         keys = response.get("ssh_keys")
         if not isinstance(keys, list):
-            raise EnvrError("Vultr API returned an invalid SSH-key list")
+            raise EnvrError(
+                f"{self.provider_label(api)} API returned an invalid SSH-key list"
+            )
         managed = [
             key
             for key in keys
@@ -1316,12 +3573,17 @@ class Envr:
         ]
         return sorted(managed, key=lambda key: str(key.get("id")))
 
-    def all_instances(self, api: VultrAPI) -> list[dict[str, Any]]:
+    def all_instances(self, api: Any) -> list[dict[str, Any]]:
         response = api.get("instances", query={"per_page": 500})
         instances = response.get("instances")
         if not isinstance(instances, list):
-            raise EnvrError("Vultr API returned an invalid instance list")
-        return [instance for instance in instances if isinstance(instance, dict)]
+            raise EnvrError(
+                f"{self.provider_label(api)} API returned an invalid instance list"
+            )
+        values = [instance for instance in instances if isinstance(instance, dict)]
+        for instance in values:
+            instance.setdefault("provider", getattr(api, "provider_name", "vultr"))
+        return values
 
     def managed_instances(self, api: VultrAPI) -> list[dict[str, Any]]:
         return self.managed_from(self.all_instances(api))
@@ -1380,22 +3642,26 @@ class Envr:
         self.save_instance_state(instance)
         return instance
 
-    def plan_catalog(self, api: VultrAPI) -> dict[str, dict[str, Any]]:
+    def plan_catalog(self, api: Any) -> dict[str, dict[str, Any]]:
         response = api.get("plans", query={"per_page": 500})
         plans = response.get("plans")
         if not isinstance(plans, list):
-            raise EnvrError("Vultr API returned an invalid plan catalog")
+            raise EnvrError(
+                f"{self.provider_label(api)} API returned an invalid plan catalog"
+            )
         return {
             str(plan["id"]): plan
             for plan in plans
             if isinstance(plan, dict) and plan.get("id")
         }
 
-    def ubuntu_os_id(self, api: VultrAPI) -> int:
+    def ubuntu_os_id(self, api: Any) -> str | int:
         response = api.get("os", query={"per_page": 500})
         systems = response.get("os")
         if not isinstance(systems, list):
-            raise EnvrError("Vultr API returned an invalid OS catalog")
+            raise EnvrError(
+                f"{self.provider_label(api)} API returned an invalid OS catalog"
+            )
         exact = [
             system
             for system in systems
@@ -1406,13 +3672,22 @@ class Envr:
         ]
         if len(exact) != 1:
             raise EnvrError("Ubuntu 24.04 LTS x64 is not uniquely available")
-        return int(exact[0]["id"])
+        identifier = exact[0].get("id")
+        if identifier in (None, ""):
+            raise EnvrError("Ubuntu 24.04 image has no provider ID")
+        return identifier
 
     def available_regions(
         self, api: VultrAPI, plan_id: str, plan: dict[str, Any]
     ) -> list[str]:
         advertised = plan.get("locations", [])
-        candidates = [region for region in REGIONS if region in advertised]
+        configured_regions = getattr(api, "regions", REGIONS)
+        preferred = (
+            tuple(configured_regions)
+            if isinstance(configured_regions, (tuple, list))
+            else REGIONS
+        )
+        candidates = [region for region in preferred if region in advertised]
         available = []
         for region in candidates:
             response = api.get(f"regions/{region}/availability")
@@ -1422,7 +3697,7 @@ class Envr:
         if not available:
             raise EnvrError(
                 f"{plan_id} is unavailable in configured regions: "
-                + ", ".join(REGIONS)
+                + ", ".join(preferred)
             )
         return available
 
@@ -1440,6 +3715,8 @@ class Envr:
         )
         scodex_encoded = base64.b64encode(SCODEX_SCRIPT.encode()).decode()
         return f"""#cloud-config
+hostname: envr
+manage_etc_hosts: true
 package_update: true
 package_upgrade: false
 ssh_pwauth: true
@@ -1466,6 +3743,8 @@ packages:
   - nodejs
   - npm
   - bubblewrap
+  - apparmor-profiles
+  - apparmor-utils
   - docker.io
   - ufw
   - fail2ban
@@ -1495,6 +3774,7 @@ runcmd:
   - [bash, -lc, {codex_config_command}]
   - [bash, -lc, "install -d -m 755 -o {REMOTE_USER} -g {REMOTE_USER} {REMOTE_ROOT}"]
   - [bash, -lc, "for i in 1 2 3; do npm install -g @openai/codex@latest && break; sleep 10; done; command -v codex"]
+  - [bash, -lc, "if test -r /sys/module/apparmor/parameters/enabled && grep -q '^Y' /sys/module/apparmor/parameters/enabled && test -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict; then install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict; apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict; fi"]
   - [bash, -lc, "ufw default deny incoming"]
   - [bash, -lc, "ufw default allow outgoing"]
   - [bash, -lc, "ufw allow 22/tcp"]
@@ -1518,20 +3798,30 @@ runcmd:
 
     def create_instance(
         self,
-        api: VultrAPI,
+        api: Any,
         ram_gb: int,
         *,
         label: str = LABEL,
         cache_state: bool = True,
         prepare_workspace: bool = True,
     ) -> dict[str, Any]:
-        plan_id = PLAN_IDS[ram_gb]
+        plan_ids = getattr(api, "plan_ids", None)
+        if not isinstance(plan_ids, dict):
+            plan_ids = PLAN_IDS
+        plan_id = plan_ids[ram_gb]
         catalog = self.plan_catalog(api)
         plan = catalog.get(plan_id)
         if not plan:
-            raise EnvrError(f"Vultr plan {plan_id} is not present in the live catalog")
-        if int(plan.get("ram", 0)) != ram_gb * 1024:
-            raise EnvrError(f"Vultr plan {plan_id} no longer matches {ram_gb} GB")
+            raise EnvrError(
+                f"{self.provider_label(api)} plan {plan_id} is not present in the live catalog"
+            )
+        actual_ram = int(plan.get("ram", 0)) // 1024
+        if actual_ram < ram_gb or (
+            actual_ram != ram_gb and ram_gb not in {12, 24}
+        ):
+            raise EnvrError(
+                f"{self.provider_label(api)} plan {plan_id} no longer matches {ram_gb} GB"
+            )
         os_id = self.ubuntu_os_id(api)
         regions = self.available_regions(api, plan_id, plan)
         public_key = self.ensure_vps_key()
@@ -1551,7 +3841,10 @@ runcmd:
 
         last_error: Exception | None = None
         for region in regions:
-            print(f"Creating {ram_gb} GB envr VPS in {region}...")
+            size = f"{ram_gb} GB"
+            if actual_ram != ram_gb:
+                size += f" request ({actual_ram} GB provider size)"
+            print(f"Creating {size} envr VPS on {self.provider_label(api)} in {region}...")
             payload = {
                 "region": region,
                 "plan": plan_id,
@@ -1560,6 +3853,7 @@ runcmd:
                 "hostname": REMOTE_HOSTNAME,
                 "tags": [self.management_tag()],
                 "sshkey_id": key_ids,
+                "public_keys": public_keys,
                 "user_data": user_data,
                 "backups": "disabled",
                 "enable_ipv6": False,
@@ -1571,7 +3865,9 @@ runcmd:
                 response = api.post("instances", payload)
                 instance = response.get("instance")
                 if not isinstance(instance, dict) or not instance.get("id"):
-                    raise EnvrError("Vultr did not return the created instance ID")
+                    raise EnvrError(
+                        f"{self.provider_label(api)} did not return the created instance ID"
+                    )
             except ApiError as error:
                 wait_seconds = 20 if error.status == 0 or error.status >= 500 else 0
                 discovered = self.reconcile_creation(
@@ -1782,13 +4078,16 @@ runcmd:
         if (
             not password
             and self.state().get("instance_id") == instance.get("id")
+            and str(self.state().get("provider") or "vultr")
+            == str(instance.get("provider") or "vultr")
             and self.password_path.exists()
         ):
             password = self.password_path.read_text(encoding="utf-8").strip()
         if not password:
             raise EnvrError(
-                "Vultr did not return the instance password; authorize this "
-                "device from an already-connected device or the Vultr console"
+                f"{self.provider_label(api)} did not return the instance password; "
+                "authorize this device from an already-connected device or the "
+                "provider console"
             )
         return password
 
@@ -2077,7 +4376,9 @@ runcmd:
                 or "\r" in public_key
                 or not public_key.startswith(("ssh-", "ecdsa-", "sk-"))
             ):
-                raise EnvrError("Vultr returned an invalid managed SSH public key")
+                raise EnvrError(
+                    f"{self.provider_label(api)} returned an invalid managed SSH public key"
+                )
             public_keys.append(public_key)
         if not public_keys:
             return
@@ -2103,14 +4404,16 @@ done
         )
 
     def try_cached_device_key_sync(self, instance: dict[str, Any]) -> None:
-        if not self.token_path.is_file():
+        provider = str(instance.get("provider") or "vultr")
+        token_path = self.provider_token_path(provider)
+        if not token_path.is_file():
             return
         try:
-            token = self.token_path.read_text(encoding="utf-8").strip()
+            token = token_path.read_text(encoding="utf-8").strip()
             if not token:
                 return
             self.sync_managed_device_keys(
-                self.api(),
+                self.api(provider, prompt=False),
                 instance,
                 api_timeout=5,
             )
@@ -2243,9 +4546,29 @@ done
     def ensure_remote_runtime(self, instance: dict[str, Any]) -> None:
         encoded = base64.b64encode(SCODEX_SCRIPT.encode()).decode()
         script = f"""set -euo pipefail
+needs_sandbox_packages=false
 if ! command -v bwrap >/dev/null 2>&1; then
+    needs_sandbox_packages=true
+fi
+if test -r /etc/os-release; then
+    . /etc/os-release
+    if test "${{ID:-}}" = ubuntu && test "${{VERSION_ID:-}}" = 24.04 \
+            && test ! -f /etc/apparmor.d/bwrap-userns-restrict; then
+        needs_sandbox_packages=true
+    fi
+fi
+if test "$needs_sandbox_packages" = true; then
     sudo apt-get update
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bubblewrap
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        bubblewrap apparmor-profiles apparmor-utils
+fi
+if test -r /sys/module/apparmor/parameters/enabled \
+        && grep -q '^Y' /sys/module/apparmor/parameters/enabled \
+        && test -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict; then
+    sudo install -m 0644 \
+        /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+        /etc/apparmor.d/bwrap-userns-restrict
+    sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
 fi
 temporary=$(mktemp)
 trap 'rm -f "$temporary"' EXIT
@@ -2648,6 +4971,12 @@ trap - EXIT
     def resize_marker_exists(self, instance: dict[str, Any]) -> bool:
         return self.resize_marker_state(instance) is not None
 
+    def resize_target_ram_gb(self, instance: dict[str, Any]) -> int:
+        marker = self.resize_marker_state(instance)
+        if marker is not None and marker[1] in PLAN_IDS:
+            return int(marker[1])
+        return self.requested_ram_gb(instance)
+
     def connect_shell(
         self,
         instance: dict[str, Any],
@@ -2808,19 +5137,9 @@ trap - EXIT
             print("VPS ready. Connect with envr go.")
             return
 
-        api = self.api()
-        api.get("account")
-        inventory = self.all_instances(api)
-        if self.resize_from(inventory):
-            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
-        instances = self.managed_from(inventory)
-        if len(instances) > 1:
-            raise EnvrError(
-                f"conflict: {len(instances)} envr instances exist; "
-                "run envr status, then envr destroy"
-            )
-        if instances:
-            instance = instances[0]
+        found = self.active_inventory(include_selected=True)
+        if found:
+            api, instance = found
             current_ram = int(instance.get("ram", 0)) // 1024
             self.save_instance_state(instance, ram_gb=current_ram)
             if instance.get("power_status") == "stopped":
@@ -2842,6 +5161,8 @@ trap - EXIT
                 )
             self.resume_initial_setup(instance)
         else:
+            api = self.api(self.selected_provider())
+            api.get("account")
             self.create_instance(api, ram_gb)
         print("VPS ready. Connect with envr go.")
 
@@ -2855,19 +5176,10 @@ trap - EXIT
             self.require_initial_setup_complete(cached)
             return self.prepare_go_instance(cached, folder)
 
-        api = self.api()
-        api.get("account")
-        inventory = self.all_instances(api)
-        if self.resize_from(inventory):
-            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
-        instances = self.managed_from(inventory)
-        if len(instances) > 1:
-            raise EnvrError(
-                f"conflict: {len(instances)} envr instances exist; run envr status"
-            )
-        if not instances:
+        found = self.active_inventory()
+        if not found:
             raise EnvrError("envr-codex is not running; run envr up RAM")
-        instance = instances[0]
+        api, instance = found
         current_ram = self.instance_ram_gb(instance)
         self.save_instance_state(instance, ram_gb=current_ram)
         if instance.get("power_status") == "stopped":
@@ -2899,6 +5211,27 @@ trap - EXIT
     @staticmethod
     def instance_ram_gb(instance: dict[str, Any]) -> int:
         return int(instance.get("ram") or 0) // 1024
+
+    def requested_ram_gb(self, instance: dict[str, Any]) -> int:
+        provider = str(instance.get("provider") or "vultr")
+        plan = str(instance.get("plan") or "")
+        state = self.state()
+        if str(state.get("instance_id") or "") == str(instance.get("id") or ""):
+            with contextlib.suppress(TypeError, ValueError):
+                saved = int(state.get("ram_gb") or 0)
+                if saved:
+                    return saved
+        actual = self.instance_ram_gb(instance)
+        matches = [
+            requested
+            for requested, plan_id in PROVIDER_PLAN_IDS.get(provider, {}).items()
+            if plan == plan_id
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if actual in matches:
+            return actual
+        return matches[0] if matches else actual
 
     def resize_roles(
         self, api: VultrAPI
@@ -3231,6 +5564,7 @@ sync_file() {
 sync_dir /home/remote/envr /home/remote/envr "$local_excludes"
 sync_dir /home/remote/.codex /home/remote/.codex
 sync_dir /home/remote/.ssh/envr /home/remote/.ssh/envr
+sync_file /home/remote/.ssh/authorized_keys /home/remote/.ssh/authorized_keys
 sync_file /home/remote/.config/envr/repos.json /home/remote/.config/envr/repos.json
 sync_file /home/remote/.config/envr/last-workspace /home/remote/.config/envr/last-workspace
 verify_dir() {
@@ -3262,6 +5596,7 @@ verify_file() {
 verify_dir /home/remote/envr /home/remote/envr "$local_excludes"
 verify_dir /home/remote/.codex /home/remote/.codex
 verify_dir /home/remote/.ssh/envr /home/remote/.ssh/envr
+verify_file /home/remote/.ssh/authorized_keys /home/remote/.ssh/authorized_keys
 verify_file /home/remote/.config/envr/repos.json /home/remote/.config/envr/repos.json
 verify_file /home/remote/.config/envr/last-workspace /home/remote/.config/envr/last-workspace
 """
@@ -3279,6 +5614,8 @@ verify_file /home/remote/.config/envr/last-workspace /home/remote/.config/envr/l
 test -d /home/remote/envr
 test -d /home/remote/.codex
 test -d /home/remote/.ssh/envr
+test -s /home/remote/.ssh/authorized_keys
+chmod 600 /home/remote/.ssh/authorized_keys
 manifest=/home/remote/.config/envr/repos.json
 test -f "$manifest" || exit 0
 jq -e '.schema == 1 and (.repositories | type == "object")' "$manifest" >/dev/null
@@ -3313,7 +5650,7 @@ done
         if target.get("label") == RESIZE_TARGET_LABEL:
             print("Promoting the validated VPS...")
             self.set_instance_label(api, target, LABEL)
-        self.save_instance_state(target, ram_gb=self.instance_ram_gb(target))
+        self.save_instance_state(target, ram_gb=self.resize_target_ram_gb(target))
         print("Synchronizing final device access and credentials...")
         self.ensure_device_access(api, target)
         self.ensure_recovery_password(target)
@@ -3332,13 +5669,204 @@ done
         print(f"Resize complete: {self.instance_ram_gb(target)} GB.")
         print("Connect with envr go.")
 
+    def finish_cross_provider_resize(
+        self,
+        source_api: Any,
+        target_api: Any,
+        target: dict[str, Any],
+        source: dict[str, Any],
+    ) -> None:
+        if target.get("label") == RESIZE_TARGET_LABEL:
+            print("Promoting the validated VPS...")
+            self.set_instance_label(target_api, target, LABEL)
+        print("Synchronizing final device access and credentials...")
+        self.ensure_device_access(target_api, target)
+        self.ensure_recovery_password(target)
+        self.repair_remote_repository_bindings(target)
+        self.sync_from_server(target)
+        print(
+            f"Deleting the old {self.provider_label(source_api)} "
+            f"{self.instance_ram_gb(source)} GB VPS..."
+        )
+        self.delete_instance(source_api, source)
+        if self.password_path.is_file():
+            target["default_password"] = self.password_path.read_text(
+                encoding="utf-8"
+            ).strip()
+        self.save_instance_state(target, ram_gb=self.resize_target_ram_gb(target))
+        self.remote_command(
+            target,
+            f"touch {shlex.quote(REMOTE_INITIAL_READY)} && "
+            f"chmod 600 {shlex.quote(REMOTE_INITIAL_READY)}",
+            quiet=True,
+            timeout=30,
+        )
+        self.clear_resize_marker(target)
+        print(
+            f"Resize complete: {self.instance_ram_gb(target)} GB on "
+            f"{self.provider_label(target_api)}."
+        )
+        print("Connect with envr go.")
+
+    def resize_cross_provider(
+        self, source_api: Any, target_api: Any, ram_gb: int
+    ) -> None:
+        source_current, _, source_old = self.resize_roles(source_api)
+        target_current, target_pending, _ = self.resize_roles(target_api)
+        if not source_current and not source_old and len(target_current) == 1:
+            target = target_current[0]
+            print("The source is already deleted; finalizing the destination...")
+            self.validate_resize_target(target)
+            if self.password_path.is_file():
+                target["default_password"] = self.password_path.read_text(
+                    encoding="utf-8"
+                ).strip()
+            self.save_instance_state(target, ram_gb=self.resize_target_ram_gb(target))
+            self.remote_command(
+                target,
+                f"touch {shlex.quote(REMOTE_INITIAL_READY)} && "
+                f"chmod 600 {shlex.quote(REMOTE_INITIAL_READY)}",
+                quiet=True,
+                timeout=30,
+            )
+            self.clear_resize_marker(target)
+            print("Resize cleanup complete. Connect with envr go.")
+            return
+        if len(source_current) + len(source_old) != 1:
+            raise EnvrError("source cloud does not contain one unambiguous envr VPS")
+        if len(target_current) > 1 or len(target_pending) > 1:
+            raise EnvrError("destination cloud has an ambiguous resize state")
+        source = (source_current or source_old)[0]
+
+        # Resume only after promotion/validation. An unpromoted target is not
+        # trusted after an interruption, so the source remains authoritative.
+        if source_old and target_current:
+            self.finish_cross_provider_resize(
+                source_api, target_api, target_current[0], source
+            )
+            return
+        if source_old and target_pending:
+            self.validate_resize_target(target_pending[0])
+            self.finish_cross_provider_resize(
+                source_api, target_api, target_pending[0], source
+            )
+            return
+        if target_current:
+            raise EnvrError("destination cloud already contains envr-codex")
+        if target_pending:
+            print("Removing an incomplete destination VPS; the source is unchanged...")
+            self.delete_instance(target_api, target_pending[0])
+            self.clear_resize_marker(source)
+
+        self.ensure_device_access(source_api, source)
+        self.wait_for_cloud_init(source)
+        transfer_bytes = self.ensure_resize_source_ready(source)
+        target_plan_id = target_api.plan_ids[ram_gb]
+        plan = self.plan_catalog(target_api).get(target_plan_id)
+        if not plan:
+            raise EnvrError(
+                f"{self.provider_label(target_api)} plan {target_plan_id} is unavailable"
+            )
+        actual_ram = int(plan.get("ram") or 0) // 1024
+        size_text = f"{ram_gb} GB"
+        if actual_ram != ram_gb:
+            size_text += f" ({actual_ram} GB provider size)"
+        hourly = plan.get("hourly_cost")
+        price_text = (
+            f" at {hourly}/hour" if hourly not in (None, "") else " (live price unavailable)"
+        )
+        print(
+            f"Move envr from {self.provider_label(source_api)} to "
+            f"{self.provider_label(target_api)}, {size_text}{price_text}?\n\n"
+            "Preserved: workspace, Codex state, repository keys, device SSH keys\n"
+            "Rebuilt: operating system and standard envr tools\n"
+            "Not preserved: Git-ignored files, custom packages, VPNs, "
+            "containers, services, or firewall rules"
+        )
+        if not prompt_yes_no("Continue?"):
+            print("Cancelled.")
+            return
+
+        self.sync_from_server(source)
+        self.set_resize_marker(source, ram_gb)
+        target: dict[str, Any] | None = None
+        promoted = False
+        try:
+            target = self.create_instance(
+                target_api,
+                ram_gb,
+                label=RESIZE_TARGET_LABEL,
+                cache_state=False,
+                prepare_workspace=False,
+            )
+            self.set_resize_marker(target, ram_gb, role="target")
+            self.ensure_resize_capacity(target, transfer_bytes)
+            token = secrets.token_hex(8)
+            public_key, host_key = self.migration_key_and_host(source, target, token)
+            try:
+                self.prepare_resize_excludes(source, token)
+                self.authorize_resize_target(source, target, public_key, token)
+                transfer_bytes = self.ensure_resize_source_ready(source)
+                self.ensure_resize_capacity(target, transfer_bytes)
+                self.remote_command(
+                    source, "tmux kill-server 2>/dev/null || true",
+                    quiet=True, timeout=30,
+                )
+                print("Transferring workspace and Codex state...")
+                self.transfer_resize_data(source, target, host_key, token)
+            finally:
+                self.cleanup_resize_access(source, target, token)
+            print("Validating the new VPS...")
+            self.validate_resize_target(target)
+            promoted = True
+            self.set_instance_label(source_api, source, RESIZE_SOURCE_LABEL)
+            self.finish_cross_provider_resize(
+                source_api, target_api, target, source
+            )
+        except (EnvrError, subprocess.TimeoutExpired, KeyboardInterrupt):
+            if not promoted and target is not None:
+                with contextlib.suppress(EnvrError, subprocess.TimeoutExpired):
+                    self.delete_instance(target_api, target)
+                    self.clear_resize_marker(source)
+            if promoted:
+                eprint(
+                    "Warning: destination validation completed, but cleanup is "
+                    f"incomplete. Run envr resize {ram_gb} again; do not delete "
+                    "either VPS manually."
+                )
+            raise
+
     def resize(self, ram_gb: int) -> None:
         if ram_gb not in PLAN_IDS:
             supported = ", ".join(str(size) for size in sorted(PLAN_IDS))
             raise EnvrError(f"RAM must be one of: {supported}")
         ensure_commands(("ssh", "scp", "ssh-keygen"))
-        api = self.api()
+        state = self.state()
+        if state.get("instance_id"):
+            source_provider = str(state.get("provider") or "vultr")
+        elif len(self.configured_providers()) > 1:
+            candidates: list[str] = []
+            for candidate_api, inventory in self.provider_inventories():
+                if self.managed_from(inventory) or any(
+                    item.get("label") == RESIZE_SOURCE_LABEL
+                    for item in self.resize_from(inventory)
+                ):
+                    candidates.append(self.provider_name(candidate_api))
+            if len(candidates) != 1:
+                raise EnvrError(
+                    "cannot identify one resize source across configured clouds; "
+                    "run envr status"
+                )
+            source_provider = candidates[0]
+        else:
+            source_provider = self.selected_provider()
+        target_provider = self.selected_provider()
+        api = self.api(source_provider)
         api.get("account")
+        if target_provider != source_provider:
+            target_api = self.api(target_provider)
+            target_api.get("account")
+            return self.resize_cross_provider(api, target_api, ram_gb)
         current, targets, sources = self.resize_roles(api)
         if any(len(role) > 1 for role in (current, targets, sources)):
             raise EnvrError("ambiguous resize state; run envr status")
@@ -3351,7 +5879,7 @@ done
             self.clear_resize_marker(current[0])
             targets = []
         if not current and sources and targets:
-            target_ram = self.instance_ram_gb(targets[0])
+            target_ram = self.resize_target_ram_gb(targets[0])
             if target_ram != ram_gb:
                 raise EnvrError(
                     f"interrupted resize target is {target_ram} GB; "
@@ -3360,7 +5888,7 @@ done
             self.finish_resize(api, targets[0], sources[0])
             return
         if current and sources:
-            target_ram = self.instance_ram_gb(current[0])
+            target_ram = self.resize_target_ram_gb(current[0])
             if target_ram != ram_gb:
                 raise EnvrError(
                     f"promoted resize target is {target_ram} GB; "
@@ -3377,7 +5905,7 @@ done
             raise EnvrError("envr-codex is not running or resize state is incomplete")
 
         source = current[0]
-        current_ram = self.instance_ram_gb(source)
+        current_ram = self.requested_ram_gb(source)
         self.ensure_device_access(api, source)
         self.wait_for_cloud_init(source)
         if current_ram == ram_gb:
@@ -3474,13 +6002,14 @@ done
                     "Warning: the validated destination was promoted, but final "
                     "cleanup is incomplete. The old source may still be running "
                     "and billable. Do not create or delete a VPS manually; when "
-                    f"the Vultr API recovers, run envr resize {ram_gb} again"
+                    f"the provider API recovers, run envr resize {ram_gb} again"
                 )
             raise
 
     def status_api_unavailable(self, error: ApiError) -> int:
         state = self.state()
-        print("Vultr")
+        provider = str(state.get("provider") or self.selected_provider())
+        print(PROVIDER_LABELS.get(provider, provider))
         print(f"  API:              unavailable ({error})")
         instance_id = str(state.get("instance_id") or "")
         main_ip = str(state.get("main_ip") or "")
@@ -3494,13 +6023,92 @@ done
         print(f"  Region:     {state.get('region') or ''}")
         print(f"  RAM:        {ram_gb} GB")
         print(f"  IP:         {main_ip}")
-        print("  Status:     unknown while Vultr API is unavailable")
+        print("  Status:     unknown while the cloud API is unavailable")
         print("  Warning:    billing and incomplete resize resources are unknown")
         return 1
 
+    def status_multiple(self, providers: Sequence[str]) -> int:
+        all_managed: list[tuple[Any, dict[str, Any]]] = []
+        all_resize: list[tuple[Any, dict[str, Any]]] = []
+        failures = 0
+        for provider in providers:
+            label = PROVIDER_LABELS[provider]
+            print(label)
+            try:
+                api = self.api(provider, prompt=False)
+                account_response = api.get("account")
+                inventory = self.all_instances(api)
+                plans = self.plan_catalog(api)
+                account = account_response.get("account")
+                if not isinstance(account, dict):
+                    raise EnvrError(f"{label} returned invalid account information")
+                balance = float(account.get("balance", 0) or 0)
+                pending = float(account.get("pending_charges", 0) or 0)
+                currency = str(account.get("currency") or "USD")
+                credit = available_prepaid_credit(balance, pending)
+                if account.get("billing_available") is False:
+                    reason = str(
+                        account.get("billing_reason") or "token needs billing:read"
+                    )
+                    print(f"  Billing: unavailable ({reason})")
+                elif account.get("credit_model") == "postpaid":
+                    if balance > 0:
+                        print(f"  Balance: {balance:.2f} {currency} due")
+                    elif balance < 0:
+                        print(f"  Balance: {-balance:.2f} {currency} credit")
+                    else:
+                        print(f"  Balance: 0.00 {currency}")
+                    print(f"  Uninvoiced: {pending:.2f} {currency}")
+                else:
+                    print(f"  Available credit: {credit:.2f} {currency}")
+                managed = self.managed_from(inventory)
+                resizing = self.resize_from(inventory)
+                all_managed.extend((api, item) for item in managed)
+                all_resize.extend((api, item) for item in resizing)
+                if not managed and not resizing:
+                    print("  envr: not running")
+                for instance in managed + resizing:
+                    plan = plans.get(str(instance.get("plan")), {})
+                    hourly = plan.get("hourly_cost")
+                    monthly = plan.get("monthly_cost")
+                    price_currency = str(plan.get("currency") or currency)
+                    role = str(instance.get("label") or LABEL)
+                    price = ""
+                    if hourly not in (None, ""):
+                        price = f" · {price_currency} {float(hourly):.3f}/hour"
+                        if monthly not in (None, ""):
+                            price += f" · {price_currency} {monthly}/month"
+                    print(
+                        f"  {role}: {self.instance_ram_gb(instance)} GB · "
+                        f"{instance.get('region', '')} · {instance.get('main_ip', '')}"
+                        f" · {instance.get('status', '')}{price}"
+                    )
+                    if instance in managed:
+                        try:
+                            password = self.instance_password(api, instance)
+                        except EnvrError:
+                            password = "unavailable on this device"
+                        print(f"    Root password: {password}")
+            except (ApiError, EnvrError) as error:
+                failures += 1
+                print(f"  API: unavailable ({error})")
+            print()
+        if len(all_managed) == 1 and not all_resize:
+            self.save_instance_state(all_managed[0][1])
+        if len(all_managed) > 1:
+            print(f"CONFLICT: {len(all_managed)} envr instances exist across clouds")
+            return 2
+        if all_resize:
+            print("Resize is incomplete. Resume with: envr resize RAM")
+            return 2
+        return 1 if failures else 0
+
     def status(self) -> int:
+        providers = self.configured_providers()
+        if len(providers) > 1:
+            return self.status_multiple(providers)
         try:
-            api = self.api()
+            api = self.api(providers[0] if providers else None)
             account_response = api.get("account")
             inventory = self.all_instances(api)
             plans = self.plan_catalog(api)
@@ -3508,7 +6116,9 @@ done
             return self.status_api_unavailable(error)
         account = account_response.get("account")
         if not isinstance(account, dict):
-            raise EnvrError("Vultr API returned invalid account information")
+            raise EnvrError(
+                f"{self.provider_label(api)} API returned invalid account information"
+            )
         instances = self.managed_from(inventory)
         resizing = self.resize_from(inventory)
         if len(instances) == 1 and not resizing:
@@ -3523,18 +6133,39 @@ done
             balance_text = f"${balance:.2f} due"
         else:
             balance_text = "$0.00"
-        print("Vultr")
-        print(f"  Balance:          {balance_text}")
-        print(f"  Pending charges:  ${pending:.2f}")
-        print(f"  Available credit: ${credit:.2f}")
+        currency = str(account.get("currency") or "USD")
+        credit_model = str(account.get("credit_model") or "prepaid")
+        symbol = "$" if currency == "USD" else f"{currency} "
+        print(self.provider_label(api))
+        if symbol != "$":
+            balance_text = (
+                f"{symbol}{-balance:.2f} credit" if balance < 0
+                else f"{symbol}{balance:.2f} due"
+            )
+        if account.get("billing_available") is False:
+            reason = str(account.get("billing_reason") or "token needs billing:read")
+            print(f"  Billing:          unavailable ({reason})")
+        else:
+            print(f"  Balance:          {balance_text}")
+            if credit_model == "postpaid":
+                print(f"  Uninvoiced:       {symbol}{pending:.2f}")
+            else:
+                print(f"  Pending charges:  {symbol}{pending:.2f}")
+                print(f"  Available credit: {symbol}{credit:.2f}")
 
         if len(instances) == 1:
             plan = plans.get(str(instances[0].get("plan")), {})
             hourly = float(plan.get("hourly_cost", 0) or 0)
-            if hourly > 0 and credit > 0:
+            if (
+                account.get("billing_available") is not False
+                and credit_model != "postpaid"
+                and hourly > 0
+                and credit > 0
+            ):
                 days = credit / (hourly * 24)
                 print(
-                    f"  Credit runway:    about {days:.1f} days at ${hourly:.3f}/hour"
+                    f"  Credit runway:    about {days:.1f} days at "
+                    f"{symbol}{hourly:.3f}/hour"
                 )
             else:
                 print("  Credit runway:    n/a")
@@ -3582,7 +6213,12 @@ done
             hourly = plan.get("hourly_cost")
             monthly = plan.get("monthly_cost")
             if hourly is not None and monthly is not None:
-                print(f"  Price:      ${float(hourly):.3f}/hour · ${monthly}/month")
+                price_currency = str(plan.get("currency") or currency)
+                price_symbol = "$" if price_currency == "USD" else f"{price_currency} "
+                print(
+                    f"  Price:      {price_symbol}{float(hourly):.3f}/hour · "
+                    f"{price_symbol}{monthly}/month"
+                )
             else:
                 print("  Price:      unavailable")
         return 2 if conflict or resizing else 0
@@ -3591,19 +6227,13 @@ done
         if not 1 <= port <= 65535:
             raise EnvrError("port must be an integer from 1 through 65535")
         ensure_commands(("ssh", "ssh-keygen"))
-        api = self.api()
-        inventory = self.all_instances(api)
-        if self.resize_from(inventory):
-            raise EnvrError("resize is incomplete; finish it before opening ports")
-        instances = self.managed_from(inventory)
-        if len(instances) > 1:
-            raise EnvrError("multiple envr VPSs exist; run envr status")
-        instance = instances[0] if instances else None
-        if instance is None:
+        found = self.active_inventory()
+        if found is None:
             raise EnvrError(
                 "envr-codex is not running. Start it with "
                 "envr up RAM."
             )
+        api, instance = found
         self.ensure_device_access(api, instance)
         script = r"""set -euo pipefail
 port=$1
@@ -3613,6 +6243,9 @@ sudo ufw status | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"
 sudo ufw status | grep -Eq "^${port}/udp[[:space:]]+ALLOW"
 """
         self.remote_script(instance, script, (str(port),), timeout=60)
+        open_provider_port = getattr(api, "open_port", None)
+        if callable(open_provider_port):
+            open_provider_port(instance, port)
         print(f"Opened port {port} (TCP and UDP) on envr-codex.")
 
     def git_safety(self, instance: dict[str, Any]) -> list[tuple[str, str]]:
@@ -3691,10 +6324,16 @@ fi
         while time.monotonic() < deadline:
             instances = self.all_instances(api)
             if not any(item.get("id") == instance_id for item in instances):
+                verifier = getattr(api, "verify_instance_deleted", None)
+                if callable(verifier) and not verifier(instance_id):
+                    time.sleep(3)
+                    continue
                 self.remove_known_host(str(instance.get("main_ip", "")))
                 return
             time.sleep(3)
-        raise EnvrError(f"Vultr did not confirm deletion of {instance_id}")
+        raise EnvrError(
+            f"{self.provider_label(api)} did not confirm deletion of {instance_id}"
+        )
 
     def remove_known_host(self, ip: str) -> None:
         if not ip or not self.vps_known_hosts.exists():
@@ -3708,11 +6347,15 @@ fi
 
     def destroy(self) -> None:
         ensure_commands(("ssh", "scp", "ssh-keygen"))
-        api = self.api()
-        inventory = self.all_instances(api)
-        if self.resize_from(inventory):
+        inventories = self.provider_inventories()
+        if any(self.resize_from(inventory) for _, inventory in inventories):
             raise EnvrError("resize is incomplete; finish it before destroy")
-        instances = self.managed_from(inventory)
+        owned = [
+            (api, instance)
+            for api, inventory in inventories
+            for instance in self.managed_from(inventory)
+        ]
+        instances = [instance for _, instance in owned]
         if not instances:
             print("envr-codex: not running")
             self.clear_instance_state()
@@ -3723,6 +6366,7 @@ fi
         auth_ok = True
         summaries: list[tuple[dict[str, Any], list[tuple[str, str]]]] = []
         for instance in instances:
+            api = next(api for api, candidate in owned if candidate is instance)
             try:
                 self.ensure_device_access(api, instance)
                 if not self.sync_from_server(instance):
@@ -3768,6 +6412,7 @@ fi
 
         failures = []
         for instance in instances:
+            api = next(api for api, candidate in owned if candidate is instance)
             try:
                 self.delete_instance(api, instance)
                 print(f"Deleted {instance.get('id')}.")
@@ -3781,28 +6426,56 @@ fi
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="envr", description="Disposable Vultr Codex environment"
+        prog="envr", description="Disposable cloud Codex environment"
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("git", help="configure one Git repository")
-    subparsers.add_parser("relay", help="configure the optional SSH relay")
+    subparsers.add_parser(
+        "git", help="configure one Git repository",
+        description="Configure a repository and its dedicated SSH identity.",
+    )
+    subparsers.add_parser(
+        "relay", help="configure the optional SSH relay",
+        description="Show, configure, edit, or remove the optional SSH relay.",
+    )
+    subparsers.add_parser(
+        "cloud", help="configure and select a cloud provider",
+        description="Choose the provider used by the next up or resize.",
+    )
 
-    up = subparsers.add_parser("up", help="create the initial VPS")
-    up.add_argument("ram", type=int, choices=sorted(PLAN_IDS))
+    up = subparsers.add_parser(
+        "up", help="create the initial VPS",
+        description="Create and prepare the one envr VPS; this command does not connect.",
+    )
+    up.add_argument(
+        "ram", type=int, choices=sorted(PLAN_IDS), metavar="RAM_GB",
+        help="memory size: %(choices)s",
+    )
 
-    go = subparsers.add_parser("go", help="reconnect without specifying RAM")
-    go.add_argument("repository_folder", nargs="?")
+    go = subparsers.add_parser(
+        "go", help="reconnect without specifying RAM",
+        description="Attach to the last workspace, or select one repository.",
+    )
+    go.add_argument(
+        "repository_folder", nargs="?", metavar="REPOSITORY",
+        help="configured repository folder; omit for the last workspace",
+    )
 
     resize = subparsers.add_parser(
-        "resize", help="move the environment to a fresh VPS size"
+        "resize", help="move the environment to a fresh VPS size",
+        description="Safely migrate the preserved environment to a fresh VPS.",
     )
-    resize.add_argument("ram", type=int, choices=sorted(PLAN_IDS))
+    resize.add_argument(
+        "ram", type=int, choices=sorted(PLAN_IDS), metavar="RAM_GB",
+        help="destination memory size: %(choices)s",
+    )
 
     subparsers.add_parser("status", help="show account and VPS status")
 
     port_open = subparsers.add_parser("port-open", help="open one TCP/UDP port")
-    port_open.add_argument("port", type=int)
+    port_open.add_argument(
+        "port", type=int, metavar="PORT", help="TCP and UDP port (1-65535)"
+    )
 
     subparsers.add_parser("destroy", help="check work and destroy the VPS")
     return parser
@@ -3827,6 +6500,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 return 0
             if namespace.command == "relay":
                 app.relay_menu()
+                return 0
+            if namespace.command == "cloud":
+                app.cloud_menu()
                 return 0
             if namespace.command == "up":
                 attachment = app.up(namespace.ram)

@@ -153,6 +153,15 @@ class APITests(unittest.TestCase):
         self.assertEqual(ApiHandler.received_authorization, "Bearer secret-token")
         self.assertEqual(ApiHandler.received_payload, {"plan": "vc2-test"})
 
+    def test_gcore_uses_apikey_authorization_scheme(self) -> None:
+        host, port = self.server.server_address
+        api = envr.JSONAPI(
+            "gcore-secret", f"http://{host}:{port}", "Gcore",
+            auth_scheme="APIKey",
+        )
+        api.request("GET", "iam/clients/me")
+        self.assertEqual(ApiHandler.received_authorization, "APIKey gcore-secret")
+
     def test_http_error_classification(self) -> None:
         ApiHandler.response_status = 503
         ApiHandler.response_payload = {"error": "capacity unavailable"}
@@ -424,7 +433,7 @@ class RelayTests(unittest.TestCase):
             api = app.api()
             self.assertIs(api.opener, opener)
             self.assertEqual(api.token, "secret-token")
-            app.ensure_api_tunnel.assert_called_once_with(relay)
+            app.ensure_api_tunnel.assert_called_once_with(relay, "vultr")
 
     def test_parser_exposes_relay_without_subcommands(self) -> None:
         namespace = envr.build_parser().parse_args(["relay"])
@@ -456,11 +465,15 @@ class LifecycleLogicTests(unittest.TestCase):
                 ]
             )
         self.assertIn("PasswordAuthentication yes", cloud_init)
+        self.assertIn("hostname: envr", cloud_init)
+        self.assertIn("manage_etc_hosts: true", cloud_init)
         self.assertIn("PermitRootLogin yes", cloud_init)
         self.assertIn("ufw default deny incoming", cloud_init)
         self.assertIn("[sshd]", cloud_init)
         self.assertIn("@openai/codex@latest", cloud_init)
         self.assertIn("bubblewrap", cloud_init)
+        self.assertIn("apparmor-profiles", cloud_init)
+        self.assertIn("bwrap-userns-restrict", cloud_init)
         self.assertIn("/usr/local/bin/scodex", cloud_init)
         self.assertIn("AAAAFIRST", cloud_init)
         self.assertIn("AAAASECOND", cloud_init)
@@ -554,7 +567,9 @@ class LifecycleLogicTests(unittest.TestCase):
             script = app.remote_script.call_args.args[1]
             encoded = app.remote_script.call_args.args[2][0]
             self.assertIn("command -v bwrap", script)
-            self.assertIn("apt-get install -y bubblewrap", script)
+            self.assertIn("bubblewrap apparmor-profiles apparmor-utils", script)
+            self.assertIn("VERSION_ID:-", script)
+            self.assertIn("apparmor_parser -r", script)
             self.assertEqual(
                 base64.b64decode(encoded).decode(),
                 envr.SCODEX_SCRIPT,
@@ -1996,6 +2011,7 @@ class ResizeTests(unittest.TestCase):
             api = mock.Mock()
             app.api = mock.Mock(return_value=api)
             app.resize_roles = mock.Mock(return_value=([], [target], [source]))
+            app.resize_marker_state = mock.Mock(return_value=("target", 4))
             app.finish_resize = mock.Mock()
             app.create_instance = mock.Mock()
 
@@ -2020,6 +2036,7 @@ class ResizeTests(unittest.TestCase):
             )
             app.api = mock.Mock(return_value=mock.Mock())
             app.resize_roles = mock.Mock(return_value=([], [target], [source]))
+            app.resize_marker_state = mock.Mock(return_value=("target", 4))
             app.finish_resize = mock.Mock()
 
             with (
@@ -2062,7 +2079,9 @@ class ParserTests(unittest.TestCase):
     def test_up_requires_only_ram(self) -> None:
         parser = envr.build_parser()
         self.assertEqual(envr.PLAN_IDS[16], "vc2-6c-16gb")
+        self.assertEqual(envr.PLAN_IDS[12], "vc2-6c-16gb")
         self.assertEqual(envr.PLAN_IDS[24], "vhp-12c-24gb-amd")
+        self.assertEqual(envr.PLAN_IDS[32], "vc2-8c-32gb")
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["up"])
@@ -2071,6 +2090,8 @@ class ParserTests(unittest.TestCase):
         namespace = parser.parse_args(["up", "4"])
         self.assertEqual(namespace.ram, 4)
         self.assertEqual(parser.parse_args(["up", "24"]).ram, 24)
+        self.assertEqual(parser.parse_args(["up", "12"]).ram, 12)
+        self.assertEqual(parser.parse_args(["up", "32"]).ram, 32)
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["up", "16", "repo"])
@@ -2091,6 +2112,8 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(namespace.command, "resize")
         self.assertEqual(namespace.ram, 16)
         self.assertEqual(envr.build_parser().parse_args(["resize", "24"]).ram, 24)
+        self.assertEqual(envr.build_parser().parse_args(["resize", "12"]).ram, 12)
+        self.assertEqual(envr.build_parser().parse_args(["resize", "32"]).ram, 32)
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 envr.build_parser().parse_args(["resize"])
@@ -2135,6 +2158,778 @@ class MainDispatchTests(unittest.TestCase):
             self.assertEqual(result, 0)
             app.go.assert_called_once_with("envr")
             app.connect_shell.assert_called_once_with(*attachment)
+
+class ProviderTests(unittest.TestCase):
+    def test_legacy_state_and_token_remain_vultr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            envr.atomic_write_json(
+                app.state_path,
+                {"schema": 1, "instance_id": "old", "ram_gb": 4},
+            )
+            envr.atomic_write_text(app.token_path, "legacy-token\n")
+            self.assertEqual(app.state()["provider"], "vultr")
+            self.assertEqual(app.selected_provider(), "vultr")
+            self.assertEqual(app.configured_providers(), ["vultr"])
+
+    def test_parser_exposes_one_cloud_menu(self) -> None:
+        namespace = envr.build_parser().parse_args(["cloud"])
+        self.assertEqual(namespace.command, "cloud")
+        self.assertEqual(
+            envr.PROVIDER_NAMES,
+            ("vultr", "digitalocean", "akamai", "upcloud", "exoscale", "gcore"),
+        )
+
+    def test_exoscale_hmac_matches_official_reference_vectors(self) -> None:
+        key = "EXOxxxxxxxxxxxxxxxxxxxxxxxx"
+        secret = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+        expires = 3376684800
+        plain = envr.ExoscaleAPI.authorization(
+            key, secret, "GET", "/v2/zone", b"", None, expires
+        )
+        queried = envr.ExoscaleAPI.authorization(
+            key,
+            secret,
+            "GET",
+            "/v2/zone",
+            b"",
+            {"k1": "v1", "k2": "v2"},
+            expires,
+        )
+        self.assertEqual(
+            plain,
+            "EXO2-HMAC-SHA256 credential=EXOxxxxxxxxxxxxxxxxxxxxxxxx,"
+            "expires=3376684800,"
+            "signature=Ntbq/p0HVmA3Zg1HHY+Lq1vjFGi7HeMrrgXDS5jRNlY=",
+        )
+        self.assertIn("signed-query-args=k1;k2", queried)
+        self.assertTrue(
+            queried.endswith(
+                "signature=iqOBz13+44L5j0uJclE8hmUhQQcvtCSoPEOXYK6liqY="
+            )
+        )
+
+    def test_exoscale_credentials_are_prompted_privately_and_saved_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            candidate = mock.Mock(display_name="Exoscale")
+            candidate.get.return_value = {"account": {"balance": -10}}
+            with (
+                mock.patch("builtins.input", side_effect=["5"]),
+                mock.patch.object(
+                    envr.getpass,
+                    "getpass",
+                    side_effect=["EXO-key", "secret-value"],
+                ),
+                mock.patch.object(envr, "ExoscaleAPI", return_value=candidate),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                app.cloud_menu()
+
+            path = app.provider_token_path("exoscale")
+            self.assertEqual(path.read_text(), "EXO-key\nsecret-value\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(app.selected_provider(), "exoscale")
+
+    def test_exoscale_catalog_and_24_gb_mapping_use_live_ids(self) -> None:
+        api = envr.ExoscaleAPI("EXO-key\nsecret")
+        instance_types = []
+        definitions = (
+            ("tiny", 1024, 1),
+            ("small", 2048, 2),
+            ("medium", 4096, 2),
+            ("large", 8192, 4),
+            ("extra-large", 16384, 4),
+            ("huge", 32768, 8),
+        )
+        for size, memory, cpus in definitions:
+            instance_types.append(
+                {
+                    "id": "uuid-" + size,
+                    "family": "standard",
+                    "size": size,
+                    "memory": memory,
+                    "cpus": cpus,
+                    "zones": ["de-fra-1"],
+                }
+            )
+        api.raw_request = mock.Mock(
+            return_value={"instance-types": instance_types}
+        )
+
+        plans = api.get("plans")["plans"]
+        catalog = {plan["id"]: plan for plan in plans}
+        self.assertEqual(catalog["standard.huge"]["ram"], 32768)
+        self.assertEqual(
+            catalog[envr.PROVIDER_PLAN_IDS["exoscale"][24]]["provider_plan"],
+            "uuid-huge",
+        )
+        self.assertEqual(
+            envr.PROVIDER_PLAN_IDS["exoscale"][24],
+            envr.PROVIDER_PLAN_IDS["exoscale"][32],
+        )
+
+    def test_exoscale_create_uses_zone_operation_security_group_and_base64_cloud_init(self) -> None:
+        api = envr.ExoscaleAPI("EXO-key\nsecret")
+        api._plans["standard.medium"] = {
+            "provider_plan": "type-uuid",
+            "disk": 50,
+        }
+        api._ensure_security_group = mock.Mock(return_value="sg-uuid")
+        api._operation = mock.Mock(
+            return_value={"state": "success", "reference": {"id": "vm-uuid"}}
+        )
+        raw_calls = []
+
+        def raw(zone, method, resource, **kwargs):
+            raw_calls.append((zone, method, resource, kwargs))
+            if resource == "instance/vm-uuid":
+                return {
+                    "id": "vm-uuid",
+                    "name": envr.LABEL,
+                    "state": "running",
+                    "public-ip": "192.0.2.10",
+                    "labels": {"envr": "managed"},
+                    "instance-type": {
+                        "family": "standard",
+                        "size": "medium",
+                        "memory": 4096,
+                        "cpus": 2,
+                    },
+                }
+            return {"id": "operation-uuid", "state": "pending"}
+
+        api.raw_request = mock.Mock(side_effect=raw)
+        encoded = base64.b64encode(b"#cloud-config\n").decode()
+        result = api.post(
+            "instances",
+            {
+                "region": "de-fra-1",
+                "plan": "standard.medium",
+                "os_id": "template-uuid",
+                "label": envr.LABEL,
+                "sshkey_id": ["envr-device-key"],
+                "user_data": encoded,
+            },
+        )
+
+        create = raw_calls[0][3]["payload"]
+        self.assertEqual(create["instance-type"], {"id": "type-uuid"})
+        self.assertEqual(create["security-groups"], [{"id": "sg-uuid"}])
+        self.assertEqual(create["user-data"], encoded)
+        self.assertEqual(result["instance"]["provider"], "exoscale")
+        self.assertEqual(result["instance"]["main_ip"], "192.0.2.10")
+
+    def test_exoscale_relay_selects_the_api_tunnel_for_each_zone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            relay = envr.RelayConfig("192.0.2.1", 22, "relay")
+            opener = mock.Mock()
+            app.ensure_api_host_tunnel = mock.Mock(return_value=opener)
+            api = app.api_from_credentials("exoscale", "EXO-key\nsecret", relay)
+
+            self.assertIs(api.opener_factory("api-at-vie-1.exoscale.com"), opener)
+            app.ensure_api_host_tunnel.assert_called_once_with(
+                relay, "api-at-vie-1.exoscale.com"
+            )
+
+    def test_exoscale_port_open_updates_both_security_layers(self) -> None:
+        api = envr.ExoscaleAPI("EXO-key\nsecret")
+        api._ensure_security_group = mock.Mock(return_value="sg-uuid")
+        api._ensure_security_rule = mock.Mock()
+        instance = {"region": "de-fra-1"}
+
+        api.open_port(instance, 443)
+
+        self.assertEqual(
+            api._ensure_security_rule.call_args_list,
+            [
+                mock.call("de-fra-1", "sg-uuid", 443, "tcp"),
+                mock.call("de-fra-1", "sg-uuid", 443, "udp"),
+            ],
+        )
+
+    def test_cloud_menu_verifies_then_privately_saves_and_selects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            candidate = mock.Mock(display_name="Akamai Cloud")
+            candidate.get.return_value = {"account": {"balance": 0}}
+            with (
+                mock.patch("builtins.input", side_effect=["3"]),
+                mock.patch.object(envr.getpass, "getpass", return_value="token-value"),
+                mock.patch.object(envr, "AkamaiAPI", return_value=candidate),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                app.cloud_menu()
+
+            token_path = app.provider_token_path("akamai")
+            self.assertEqual(token_path.read_text(encoding="utf-8"), "token-value\n")
+            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+            self.assertEqual(app.selected_provider(), "akamai")
+            candidate.get.assert_called_once_with("account")
+
+    def test_cloud_menu_never_saves_a_token_that_fails_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            candidate = mock.Mock(display_name="Akamai Cloud")
+            candidate.get.side_effect = envr.ApiError(401, "Unauthorized")
+            with (
+                mock.patch("builtins.input", side_effect=["3"]),
+                mock.patch.object(envr.getpass, "getpass", return_value="bad-token"),
+                mock.patch.object(envr, "AkamaiAPI", return_value=candidate),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaises(envr.ApiError),
+            ):
+                app.cloud_menu()
+
+            self.assertFalse(app.provider_token_path("akamai").exists())
+            self.assertEqual(app.selected_provider(), "vultr")
+
+    def test_cloud_menu_refuses_to_forget_the_running_vps_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            envr.atomic_write_text(app.token_path, "token\n")
+            envr.atomic_write_json(
+                app.state_path,
+                {"schema": 1, "instance_id": "live", "provider": "vultr"},
+            )
+            with (
+                mock.patch("builtins.input", side_effect=["d"]),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(envr.EnvrError, "owns the cached running VPS"),
+            ):
+                app.cloud_menu()
+            self.assertTrue(app.token_path.exists())
+
+    def test_akamai_adapter_normalizes_and_creates(self) -> None:
+        api = envr.AkamaiAPI("secret")
+        api.raw = mock.Mock()
+        api.raw.request.return_value = {
+            "id": 42,
+            "label": envr.LABEL,
+            "region": "de-fra-2",
+            "type": "g6-standard-2",
+            "status": "provisioning",
+            "tags": [envr.MANAGEMENT_TAG],
+            "specs": {"memory": 4096, "vcpus": 2, "disk": 81920},
+            "ipv4": ["192.0.2.20"],
+        }
+        response = api.post(
+            "instances",
+            {
+                "region": "de-fra-2",
+                "plan": "g6-standard-2",
+                "os_id": "linode/ubuntu24.04",
+                "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG],
+                "public_keys": ["ssh-ed25519 AAAA"],
+                "user_data": "I2Nsb3VkLWNvbmZpZw==",
+            },
+        )
+        payload = api.raw.request.call_args.kwargs["payload"]
+        self.assertEqual(payload["metadata"]["user_data"], "I2Nsb3VkLWNvbmZpZw==")
+        self.assertEqual(payload["authorized_keys"], ["ssh-ed25519 AAAA"])
+        self.assertEqual(response["instance"]["provider"], "akamai")
+        self.assertTrue(response["instance"]["default_password"])
+
+    def test_digitalocean_adapter_normalizes_and_creates_plain_user_data(self) -> None:
+        api = envr.DigitalOceanAPI("secret")
+        api.raw = mock.Mock()
+        api.raw.request.return_value = {
+            "droplet": {
+                "id": 42,
+                "name": envr.LABEL,
+                "region": {"slug": "fra1"},
+                "size_slug": "s-2vcpu-4gb",
+                "status": "new",
+                "tags": [envr.MANAGEMENT_TAG],
+                "memory": 4096,
+                "vcpus": 2,
+                "disk": 80,
+                "networks": {"v4": []},
+                "created_at": "2026-09-02T00:00:00Z",
+            }
+        }
+        response = api.post(
+            "instances",
+            {
+                "region": "fra1",
+                "plan": "s-2vcpu-4gb",
+                "os_id": "ubuntu-24-04-x64",
+                "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG],
+                "sshkey_id": ["123"],
+                "user_data": base64.b64encode(b"#cloud-config\nhostname: envr\n").decode(),
+            },
+        )
+        payload = api.raw.request.call_args.kwargs["payload"]
+        self.assertEqual(payload["ssh_keys"], [123])
+        self.assertEqual(payload["user_data"], "#cloud-config\nhostname: envr\n")
+        self.assertFalse(payload["backups"])
+        self.assertFalse(payload["ipv6"])
+        self.assertFalse(payload["with_droplet_agent"])
+        self.assertEqual(response["instance"]["provider"], "digitalocean")
+
+    def test_digitalocean_account_billing_scope_is_optional(self) -> None:
+        api = envr.DigitalOceanAPI("secret")
+        api.raw = mock.Mock()
+        api.raw.request.side_effect = [
+            {"account": {"status": "active"}},
+            envr.ApiError(403, "scope missing", provider="DigitalOcean"),
+        ]
+        account = api.get("account")["account"]
+        self.assertFalse(account["billing_available"])
+
+    def test_digitalocean_catalog_pagination_is_followed(self) -> None:
+        api = envr.DigitalOceanAPI("secret")
+        api.raw = mock.Mock()
+        api.raw.request.side_effect = [
+            {
+                "sizes": [{"slug": "s-1vcpu-1gb", "available": True}],
+                "links": {"pages": {"next": "https://api.digitalocean.com/v2/sizes?page=2"}},
+            },
+            {
+                "sizes": [{"slug": "s-2vcpu-4gb", "available": True}],
+                "links": {"pages": {}},
+            },
+        ]
+        sizes = api._all("sizes", "sizes")
+        self.assertEqual(
+            [value["slug"] for value in sizes],
+            ["s-1vcpu-1gb", "s-2vcpu-4gb"],
+        )
+        self.assertEqual(api.raw.request.call_args_list[0].kwargs["query"]["page"], 1)
+        self.assertEqual(api.raw.request.call_args_list[1].kwargs["query"]["page"], 2)
+
+    def test_digitalocean_live_catalog_shapes_normalize_for_shared_lifecycle(self) -> None:
+        api = envr.DigitalOceanAPI("secret")
+        api.raw = mock.Mock()
+
+        def response(method, resource, **kwargs):
+            self.assertEqual(method, "GET")
+            values = {
+                "sizes": {
+                    "sizes": [{
+                        "slug": "s-8vcpu-32gb",
+                        "memory": 32768,
+                        "vcpus": 8,
+                        "disk": 640,
+                        "price_hourly": 0.2381,
+                        "price_monthly": 160,
+                        "regions": ["fra1", "ams3"],
+                        "available": True,
+                    }]
+                },
+                "images": {
+                    "images": [{
+                        "slug": "ubuntu-24-04-x64",
+                        "distribution": "Ubuntu",
+                        "available": True,
+                    }]
+                },
+                "regions": {
+                    "regions": [{"slug": "fra1", "available": True}]
+                },
+                "account/keys": {
+                    "ssh_keys": [{
+                        "id": 123,
+                        "name": "envr-device-test",
+                        "public_key": "ssh-ed25519 AAAA",
+                    }]
+                },
+            }
+            return values[resource]
+
+        api.raw.request.side_effect = response
+        plan = api.get("plans")["plans"][0]
+        self.assertEqual((plan["ram"], plan["vcpu_count"]), (32768, 8))
+        self.assertEqual(api.get("os")["os"][0]["id"], "ubuntu-24-04-x64")
+        self.assertIn(
+            "s-8vcpu-32gb",
+            api.get("regions/fra1/availability")["available_plans"],
+        )
+        self.assertEqual(api.get("ssh-keys")["ssh_keys"][0]["id"], "123")
+
+    def test_every_provider_has_a_32_gb_mapping(self) -> None:
+        self.assertEqual(
+            {provider for provider, plans in envr.PROVIDER_PLAN_IDS.items() if 32 in plans},
+            set(envr.PROVIDER_NAMES),
+        )
+
+    def test_every_provider_has_12_and_24_gb_mappings(self) -> None:
+        for size in (12, 24):
+            self.assertEqual(
+                {provider for provider, plans in envr.PROVIDER_PLAN_IDS.items() if size in plans},
+                set(envr.PROVIDER_NAMES),
+            )
+
+    def test_gcore_default_project_and_account_validation(self) -> None:
+        api = envr.GcoreAPI("secret")
+        api.raw = mock.Mock()
+
+        def response(method, resource, **kwargs):
+            self.assertEqual(method, "GET")
+            if resource == "cloud/v1/projects":
+                return {
+                    "count": 2,
+                    "results": [
+                        {"id": 7, "is_default": True, "state": "ACTIVE"},
+                        {"id": 8, "is_default": False, "state": "ACTIVE"},
+                    ],
+                }
+            if resource == "iam/clients/me":
+                return {"id": 42, "status": "active"}
+            raise AssertionError(resource)
+
+        api.raw.request.side_effect = response
+        account = api.get("account")["account"]
+        self.assertEqual(api._project_id, 7)
+        self.assertFalse(account["billing_available"])
+
+    def test_gcore_live_flavors_expose_exact_12_and_24_gb(self) -> None:
+        api = envr.GcoreAPI("secret")
+        api._project_id = 7
+        api._region_ids = {"frankfurt-2": 1, "amsterdam": 2}
+        flavors = [
+            {
+                "flavor_id": "g1-standard-4-12", "flavor_name": "g1-standard-4-12",
+                "ram": 12288, "vcpus": 4, "architecture": "x86_64",
+                "os_type": "linux", "disabled": False,
+                "price_per_hour": 0.12, "price_per_month": 80,
+            },
+            {
+                "flavor_id": "g1-standard-8-24", "flavor_name": "g1-standard-8-24",
+                "ram": 24576, "vcpus": 8, "architecture": "x86_64",
+                "os_type": "linux", "disabled": False,
+                "price_per_hour": 0.24, "price_per_month": 160,
+            },
+            {
+                "flavor_id": "g1-standard-8-32", "flavor_name": "g1-standard-8-32",
+                "ram": 32768, "vcpus": 8, "architecture": "x86_64",
+                "os_type": "linux", "disabled": False,
+                "price_per_hour": 0.32, "price_per_month": 220,
+            },
+        ]
+        api._flavors = mock.Mock(return_value=flavors)
+        catalog = {item["id"]: item for item in api.get("plans")["plans"]}
+        self.assertEqual(catalog[api.plan_ids[12]]["ram"], 12288)
+        self.assertEqual(catalog[api.plan_ids[24]]["ram"], 24576)
+        self.assertEqual(
+            api._region_plans[(api.plan_ids[24], "frankfurt-2")]["flavor_id"],
+            "g1-standard-8-24",
+        )
+
+    def test_gcore_instance_creation_uses_tasks_managed_network_and_base64_cloud_init(self) -> None:
+        api = envr.GcoreAPI("secret")
+        api._project_id = 7
+        api._region_ids = {"frankfurt-2": 1}
+        api._volume_types = {"frankfurt-2": ["standard"]}
+        api._region_plans[(api.plan_ids[12], "frankfurt-2")] = {
+            "flavor_id": "g1-standard-4-12"
+        }
+        api._region_images["frankfurt-2"] = "ubuntu-image"
+        api._ensure_security_group = mock.Mock(return_value="sg-id")
+        api.get = mock.Mock(side_effect=[
+            {"ssh_keys": [{"id": "key-id", "name": "envr-device-one", "ssh_key": "ssh-ed25519 AAAA"}]},
+            {"instance": {"id": "instance-id", "provider": "gcore"}},
+        ])
+        api.raw = mock.Mock()
+        api.raw.request.side_effect = [
+            {"tasks": ["task-id"]},
+            {"id": "task-id", "state": "FINISHED", "created_resources": {"instances": ["instance-id"]}},
+        ]
+        result = api.post("instances", {
+            "region": "frankfurt-2", "plan": api.plan_ids[12],
+            "os_id": "synthetic", "label": envr.LABEL,
+            "sshkey_id": ["key-id"], "user_data": "I2Nsb3VkLWNvbmZpZw==",
+        })
+        create_call = api.raw.request.call_args_list[0]
+        payload = create_call.kwargs["payload"]
+        self.assertEqual(payload["flavor"], "g1-standard-4-12")
+        self.assertEqual(payload["ssh_key_name"], "envr-device-one")
+        self.assertEqual(payload["interfaces"][0]["security_groups"], [{"id": "sg-id"}])
+        self.assertEqual(payload["volumes"][0]["image_id"], "ubuntu-image")
+        self.assertTrue(payload["volumes"][0]["delete_on_termination"])
+        self.assertEqual(payload["user_data"], "I2Nsb3VkLWNvbmZpZw==")
+        self.assertEqual(result["instance"]["id"], "instance-id")
+
+    def test_gcore_security_group_allows_ssh_and_outbound_traffic(self) -> None:
+        api = envr.GcoreAPI("secret")
+        api._project_id = 7
+        api._region_ids = {"frankfurt-2": 1}
+        api.raw = mock.Mock()
+        complete_group = {
+            "id": "sg-id", "name": api.security_group_name,
+            "security_group_rules": [
+                {"direction": "ingress", "ethertype": "IPv4", "protocol": "tcp", "port_range_min": 22, "port_range_max": 22},
+                {"direction": "egress", "ethertype": "IPv4", "protocol": None, "remote_ip_prefix": "0.0.0.0/0"},
+                {"direction": "egress", "ethertype": "IPv6", "protocol": None, "remote_ip_prefix": "::/0"},
+            ],
+        }
+        list_calls = 0
+
+        def response(method, resource, **kwargs):
+            nonlocal list_calls
+            if method == "GET" and resource.endswith("securitygroups/7/1"):
+                list_calls += 1
+                return {"count": 0 if list_calls == 1 else 1, "results": [] if list_calls == 1 else [complete_group]}
+            if method == "POST" and resource.endswith("security_groups/7/1"):
+                return {"tasks": ["sg-task"]}
+            if method == "GET" and resource == "cloud/v1/tasks/sg-task":
+                return {"id": "sg-task", "state": "FINISHED", "created_resources": {"security_groups": ["sg-id"]}}
+            raise AssertionError((method, resource, kwargs))
+
+        api.raw.request.side_effect = response
+        self.assertEqual(api._ensure_security_group("frankfurt-2"), "sg-id")
+        create = next(
+            call for call in api.raw.request.call_args_list
+            if call.args[:2] == ("POST", "cloud/v2/security_groups/7/1")
+        )
+        rules = create.kwargs["payload"]["rules"]
+        self.assertEqual({item["direction"] for item in rules}, {"ingress", "egress"})
+        self.assertEqual(sum(item["direction"] == "egress" for item in rules), 2)
+
+    def test_gcore_delete_waits_for_provider_task(self) -> None:
+        api = envr.GcoreAPI("secret")
+        api._project_id = 7
+        api._region_ids = {"frankfurt-2": 1}
+        api._instance_regions["instance-id"] = "frankfurt-2"
+        api.raw = mock.Mock()
+        api.raw.request.side_effect = [
+            {"tasks": ["delete-task"]},
+            {"id": "delete-task", "state": "FINISHED", "created_resources": None},
+        ]
+        api.delete("instances/instance-id")
+        self.assertEqual(
+            api.raw.request.call_args_list[0].args,
+            ("DELETE", "cloud/v1/instances/7/1/instance-id"),
+        )
+
+    def test_digitalocean_24_and_32_gb_mapping_is_unambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            instance = {
+                "id": "droplet-id",
+                "provider": "digitalocean",
+                "plan": "s-8vcpu-32gb",
+                "ram": 32768,
+            }
+            self.assertEqual(app.requested_ram_gb(instance), 32)
+            app.save_instance_state(instance, ram_gb=24)
+            self.assertEqual(app.requested_ram_gb(instance), 24)
+
+    def test_resize_marker_preserves_requested_size_for_shared_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            instance = {
+                "id": "new-droplet",
+                "provider": "digitalocean",
+                "plan": "s-8vcpu-32gb",
+                "ram": 32768,
+            }
+            app.resize_marker_state = mock.Mock(return_value=("target", 24))
+            self.assertEqual(app.resize_target_ram_gb(instance), 24)
+
+    def test_upcloud_uses_bearer_shape_custom_plan_and_storage_cleanup(self) -> None:
+        api = envr.UpCloudAPI("secret")
+        api.raw = mock.Mock()
+        api._plans[api.plan_ids[24]] = {
+            "id": api.plan_ids[24],
+            "ram": 24576,
+            "vcpu_count": 8,
+            "disk": 160,
+            "custom": True,
+        }
+        api.raw.request.return_value = {
+            "server": {
+                "uuid": "up-id",
+                "title": envr.LABEL,
+                "zone": "de-fra1",
+                "memory_amount": "24576",
+                "core_number": "8",
+                "state": "started",
+                "plan": "custom",
+                "labels": {"label": [{"key": "envr", "value": "managed"}]},
+                "ip_addresses": {"ip_address": [{
+                    "family": "IPv4", "access": "public", "address": "192.0.2.30"
+                }]},
+            }
+        }
+        response = api.post(
+            "instances",
+            {
+                "region": "de-fra1",
+                "plan": api.plan_ids[24],
+                "os_id": "template-id",
+                "label": envr.LABEL,
+                "hostname": "envr",
+                "public_keys": ["ssh-ed25519 AAAA"],
+                "user_data": "I2Nsb3VkLWNvbmZpZw==",
+            },
+        )
+        payload = api.raw.request.call_args.kwargs["payload"]["server"]
+        self.assertEqual(payload["metadata"], "yes")
+        self.assertEqual(payload["plan"], "custom")
+        self.assertEqual(payload["core_number"], 8)
+        self.assertEqual(payload["memory_amount"], 24576)
+        self.assertIsInstance(payload["core_number"], int)
+        self.assertIsInstance(payload["memory_amount"], int)
+        self.assertEqual(payload["storage_devices"]["storage_device"][0]["size"], "160")
+        self.assertEqual(response["instance"]["provider"], "upcloud")
+        api.delete("instances/up-id")
+        self.assertEqual(api.raw.request.call_args.kwargs["query"], {"storages": 1})
+
+    def test_akamai_24_gb_request_is_explicitly_32_gb(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            instance = {
+                "id": "linode-id",
+                "provider": "akamai",
+                "plan": "g6-standard-8",
+                "ram": 32768,
+            }
+            self.assertEqual(app.instance_ram_gb(instance), 32)
+            self.assertEqual(app.requested_ram_gb(instance), 32)
+            app.save_instance_state(instance, ram_gb=24)
+            self.assertEqual(app.requested_ram_gb(instance), 24)
+
+    def test_status_uses_the_provider_currency_for_price_and_runway(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = SimpleNamespace(provider_name="upcloud", display_name="UpCloud")
+            instance = {
+                "id": "up-id",
+                "provider": "upcloud",
+                "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG],
+                "region": "de-fra1",
+                "ram": 4096,
+                "vcpu_count": 2,
+                "main_ip": "192.0.2.30",
+                "status": "active",
+                "power_status": "running",
+                "plan": "2xCPU-4GB",
+            }
+            responses = {
+                "account": {"account": {
+                    "balance": -20,
+                    "pending_charges": 0,
+                    "currency": "EUR",
+                    "credit_model": "prepaid",
+                }},
+                "instances": {"instances": [instance]},
+                "plans": {"plans": [{
+                    "id": "2xCPU-4GB",
+                    "hourly_cost": 0.05,
+                    "monthly_cost": 33.6,
+                }]},
+                "instances/up-id": {"instance": instance},
+            }
+            api.get = mock.Mock(side_effect=lambda resource, **kwargs: responses[resource])
+            app.api = mock.Mock(return_value=api)
+            app.instance_password = mock.Mock(side_effect=envr.EnvrError("not cached"))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = app.status()
+
+            self.assertEqual(result, 0)
+            self.assertIn("EUR 0.050/hour", output.getvalue())
+            self.assertIn("EUR 33.6/month", output.getvalue())
+            self.assertIn("at EUR 0.050/hour", output.getvalue())
+
+    def test_resize_transfer_preserves_enrolled_device_keys(self) -> None:
+        source = Path(envr.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            "sync_file /home/remote/.ssh/authorized_keys /home/remote/.ssh/authorized_keys",
+            source,
+        )
+        self.assertIn(
+            "verify_file /home/remote/.ssh/authorized_keys /home/remote/.ssh/authorized_keys",
+            source,
+        )
+
+    def test_cross_provider_resize_keeps_source_until_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source_api = SimpleNamespace(provider_name="vultr", display_name="Vultr")
+            target_api = SimpleNamespace(
+                provider_name="akamai",
+                display_name="Akamai Cloud",
+                plan_ids={24: "g6-standard-8"},
+            )
+            source = {
+                "id": "source", "provider": "vultr", "label": envr.LABEL,
+                "ram": 8192, "main_ip": "192.0.2.10",
+            }
+            target = {
+                "id": "target", "provider": "akamai",
+                "label": envr.RESIZE_TARGET_LABEL, "ram": 32768,
+                "main_ip": "192.0.2.20",
+            }
+            app.resize_roles = mock.Mock(side_effect=[([source], [], []), ([], [], [])])
+            app.ensure_device_access = mock.Mock()
+            app.wait_for_cloud_init = mock.Mock()
+            app.ensure_resize_source_ready = mock.Mock(return_value=1024)
+            app.plan_catalog = mock.Mock(return_value={
+                "g6-standard-8": {"ram": 32768, "hourly_cost": 0.288}
+            })
+            app.sync_from_server = mock.Mock(return_value=True)
+            app.set_resize_marker = mock.Mock()
+            app.create_instance = mock.Mock(return_value=target)
+            app.ensure_resize_capacity = mock.Mock()
+            app.migration_key_and_host = mock.Mock(return_value=("public", "host"))
+            app.prepare_resize_excludes = mock.Mock()
+            app.authorize_resize_target = mock.Mock()
+            app.remote_command = mock.Mock()
+            app.transfer_resize_data = mock.Mock()
+            app.cleanup_resize_access = mock.Mock()
+            app.validate_resize_target = mock.Mock()
+            app.set_instance_label = mock.Mock()
+            app.finish_cross_provider_resize = mock.Mock()
+
+            with (
+                mock.patch.object(envr, "prompt_yes_no", return_value=True),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                app.resize_cross_provider(source_api, target_api, 24)
+
+            app.validate_resize_target.assert_called_once_with(target)
+            app.set_instance_label.assert_called_once_with(
+                source_api, source, envr.RESIZE_SOURCE_LABEL
+            )
+            app.finish_cross_provider_resize.assert_called_once_with(
+                source_api, target_api, target, source
+            )
+            app.create_instance.assert_called_once_with(
+                target_api, 24, label=envr.RESIZE_TARGET_LABEL,
+                cache_state=False, prepare_workspace=False,
+            )
+
+    def test_cross_provider_finish_deletes_source_before_switching_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            source_api = SimpleNamespace(display_name="Vultr")
+            target_api = SimpleNamespace(display_name="Akamai Cloud")
+            source = {"id": "source", "ram": 8192, "provider": "vultr"}
+            target = {
+                "id": "target", "ram": 16384, "provider": "akamai",
+                "label": envr.LABEL,
+            }
+            events = []
+            app.ensure_device_access = mock.Mock()
+            app.ensure_recovery_password = mock.Mock()
+            app.repair_remote_repository_bindings = mock.Mock()
+            app.sync_from_server = mock.Mock(return_value=True)
+            app.delete_instance = mock.Mock(side_effect=lambda *_: events.append("delete"))
+            app.save_instance_state = mock.Mock(side_effect=lambda *_a, **_k: events.append("save"))
+            app.remote_command = mock.Mock()
+            app.clear_resize_marker = mock.Mock()
+            with contextlib.redirect_stdout(io.StringIO()):
+                app.finish_cross_provider_resize(
+                    source_api, target_api, target, source
+                )
+            self.assertEqual(events, ["delete", "save"])
+
 
 if __name__ == "__main__":
     unittest.main()

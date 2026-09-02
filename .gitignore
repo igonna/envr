@@ -1,5 +1,7 @@
 # Legacy envr runtime state if an old checkout also lives at ~/envr
 /api
+/cloud.json
+/providers/
 /client-id
 /instance-password
 /repos.json

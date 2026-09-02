@@ -1,16 +1,22 @@
 # envr
 
-`envr` is a small command-line tool for using one disposable Vultr development
-VPS from Android Termux. It prepares Git repositories, remote shells, Codex
+`envr` is a small command-line tool for using one disposable cloud development
+VPS from Android Termux. It supports Vultr, DigitalOcean, Akamai Cloud,
+UpCloud, Exoscale, and Gcore and
+prepares Git repositories, remote shells, Codex
 authentication, development tools, and safe instance cleanup.
 
-Status: implemented, locally tested, and validated with a funded Vultr resize.
+Status: Vultr is account-backed deployment validated. Exoscale and Gcore have
+funded accounts; their adapters, along with DigitalOcean, Akamai Cloud, and
+UpCloud, are contract-tested against current official APIs and await their
+first account-backed envr deployment.
 
 ## Interface
 
 ```bash
 envr git
 envr relay
+envr cloud
 envr up 4
 envr go
 envr go repository-folder
@@ -20,7 +26,7 @@ envr port-open 443
 envr destroy
 ```
 
-One Vultr account manages at most one `envr` VPS. Multiple repositories and
+All configured cloud accounts together manage at most one `envr` VPS. Multiple repositories and
 trusted client devices share it. Each client has its own SSH key; the running
 VPS is authoritative for repository configuration and Codex authentication.
 
@@ -53,7 +59,7 @@ envr go                    # last selected workspace
 envr go repository-folder  # clone if absent, otherwise attach immediately
 ```
 
-`go` tries the cached IP and trusted SSH host key before contacting Vultr. If
+`go` tries the cached IP and trusted SSH host key before contacting a cloud API. If
 the VPS is reachable, an API outage does not prevent reconnection. Stale or
 untrusted cached connections fail closed and fall back to live discovery.
 
@@ -77,7 +83,7 @@ envr-repo-REPOSITORY_FOLDER
 
 `go` never creates or resizes a VPS. It tries the trusted local SSH cache first,
 does not repeat bootstrap or Git-host verification for an existing repository,
-and uses the Vultr API only as a fallback. If the selected repository is absent,
+and uses cloud APIs only as a fallback. If the selected repository is absent,
 that one call uploads its configured key, clones, verifies, and attaches. If no
 VPS exists, it tells you to run `envr up RAM`.
 
@@ -93,8 +99,8 @@ approvals and sandboxing explicitly bypassed; use it only because this VPS is
 disposable and isolated for that purpose.
 
 To join from another Mac, Linux machine, or Android phone, install `envr`, enter
-the same Vultr API token, and run the same command. `envr` discovers the
-running VPS and registers that device's public key. If Vultr does not expose
+the API token for the cloud containing the VPS, and run the same command. `envr` discovers the
+running VPS and registers that device's public key. If the provider does not expose
 the running VPS password, `envr` asks once for its root SSH password. It
 installs the new device's public key and immediately reconnects key-only.
 On disconnection, the new device receives the current repository configuration,
@@ -104,7 +110,7 @@ Initial `up` establishes one strong recovery password for that
 VPS, synchronizes it to the connected device with mode `600`, and durably
 records the IP, device key, and trusted SSH host key. An authorized device can
 show the recovery password with `envr status`; a new device enters it once,
-then all later connections are key-only and can proceed without the Vultr API.
+then all later connections are key-only and can proceed without a cloud API.
 Only an explicit SSH authentication rejection can request that password.
 Timeouts, filtered routes, and other network failures instead report that the
 VPS is unreachable; changing VPN or mobile networks never removes a device
@@ -125,9 +131,74 @@ Keys under `~/.ssh/envr` are never loaded globally or placed in an agent; each
 repository remains bound only to its own dedicated key. Initial setup and
 resize validation repair these repository-local bindings when necessary.
 
+## Cloud selection
+
+Configure or select a provider with one interactive command:
+
+```bash
+envr cloud
+```
+
+The selected provider is where `envr up RAM` creates a new VPS and where
+`envr resize RAM` places its destination. Selecting an unconfigured provider
+asks once for its API credentials, verifies them, and stores them privately. Existing
+installations remain selected as Vultr without a migration step. The same menu
+can rotate credentials or forget an unused provider locally; it refuses to forget
+the provider recorded as owning the running VPS.
+
+To move between providers without another migration command:
+
+```bash
+envr cloud       # select any configured destination cloud
+envr resize 32   # encrypted VPS-to-VPS migration
+```
+
+Frankfurt is preferred, with nearby European regions as fallbacks. Requested
+sizes are 1, 2, 4, 8, 12, 16, 24, and 32 GB. UpCloud supplies exact custom
+12 and 24 GB configurations. Gcore selects an exact live flavor where present,
+or the smallest safe larger flavor. Providers without 12 or 24 GB plans round
+up to 16 or 32 GB and show the actual size before creation or migration. The
+old VPS remains authoritative until the destination validates and source
+deletion is confirmed.
+
+For the simplest DigitalOcean setup, create a personal access token with full
+access; envr stores it mode `600`. A restricted token needs account, Droplet,
+image, size, region, SSH-key, tag, and billing read/write scopes needed by the
+lifecycle. If billing read is omitted, envr still works but `status` reports
+that billing is unavailable.
+
+Provider signup constraints are separate from API support. Akamai currently
+requires SMS phone verification during onboarding. UpCloud's published account
+requirements exclude customers located in Russia, so it is not a suitable
+choice when that restriction applies. DigitalOcean is the more practical next
+provider to test, but payment acceptance, account review, capacity, and access
+from a particular Russian network still cannot be guaranteed. Always use
+truthful identity and billing information.
+
+For Exoscale, open the portal's IAM section, create an API key (an unrestricted
+key is simplest for this disposable environment), and copy both values shown:
+the API key and the API secret. The secret is shown only once. Select Exoscale
+in `envr cloud`; it asks for both values without echoing them, validates them,
+and saves them together in `~/.config/envr/providers/exoscale/api` with mode
+`600`. Never paste either credential into chat. Exoscale uses Frankfurt first,
+then Munich, Vienna, and Zurich. Its reusable `envr-managed` security group is
+free and admits SSH plus ports explicitly opened with `envr port-open`.
+Exoscale's compute catalog does not expose prices through this API, so `status`
+shows its balance but marks per-instance price and runway unavailable.
+
+For Gcore, create one permanent API key in the portal and select Gcore in
+`envr cloud`; envr asks for the key without echoing it, validates it, and saves
+it in `~/.config/envr/providers/gcore/api` with mode `600`. The account's one
+default project is selected automatically. Gcore uses Frankfurt, Amsterdam,
+then Warsaw, live flavor prices, a managed security group, and a 50 GB boot
+volume deleted with the instance. Gcore's Cloud API does not expose account
+balance through this adapter, so `status` marks balance/runway unavailable;
+the displayed instance price is compute-only and storage or public-IP charges
+may be additional.
+
 ## Optional SSH relay
 
-When the direct path to Vultr is filtered or unreliable, configure one stable
+When the direct path to a provider is filtered or unreliable, configure one stable
 SSH server:
 
 ```bash
@@ -152,13 +223,14 @@ Relay
 ```
 
 There are no separate relay-edit or relay-delete commands. With a relay
-configured, all `envr` traffic to Vultr uses it: the Vultr HTTPS API travels
+configured, all `envr` traffic uses it: each cloud HTTPS API travels
 through an IPv4 SSH forward with end-to-end hostname-validated TLS, and VPS
 SSH/SCP uses an end-to-end SSH connection through the relay. There is no
 silent direct fallback. Git clones and package downloads initiated by the VPS
 remain direct from the VPS.
 
-Inspect the Vultr account, instance, live price, IP, and envr-managed recovery
+Inspect configured accounts, instances, live price when the provider exposes
+it through its API, IP, and envr-managed recovery
 root password:
 
 ```bash
@@ -171,11 +243,15 @@ Move the complete working environment to a fresh supported VPS size:
 envr resize 24
 ```
 
-Supported sizes are 1, 2, 4, 8, 16, and 24 GB. The 24 GB option uses Vultr's
-12-vCPU High Performance AMD shared-CPU plan.
+Supported requested sizes are 1, 2, 4, 8, 12, 16, 24, and 32 GB. Vultr's
+24 GB option uses its 12-vCPU High Performance AMD shared-CPU plan. UpCloud
+uses exact custom 12 and 24 GB configurations, while Gcore chooses from its
+live regional flavor catalog. A provider lacking an exact 12 or 24 GB option
+uses the smallest configured safe larger size; the actual size is shown before
+creation or migration.
 
 Resize preserves `/home/remote/envr`, the complete `~/.codex` directory,
-repository keys, repository metadata, and the last selected workspace. Inside
+repository keys, enrolled device SSH keys, repository metadata, and the last selected workspace. Inside
 Git repositories, untracked paths ignored by Git are deliberately omitted;
 tracked files and untracked non-ignored work are preserved. The
 operating system and standard envr tools are rebuilt fresh. Custom packages,
@@ -235,15 +311,15 @@ filesystem permissions. They must never be committed or placed in Android
 shared storage. Existing state from the prototype’s `~/envr` layout is
 automatically migrated on first use.
 
-Each device stores only its API token, device SSH key, and a synchronized cache
+Each device stores only its provider API credentials, device SSH key, and a synchronized cache
 of repository credentials and Codex authentication. Repository working trees,
 shell tools, builds, and containers remain on the VPS.
 
-An optional relay receives no Vultr token, VPS private key, recovery password,
+An optional relay receives no cloud API token, VPS private key, recovery password,
 Codex authentication, Git key, or repository data. It can observe connection
-destinations, timing, and traffic volume, but the Vultr API remains protected
-by TLS and VPS sessions remain protected by their inner SSH connection. SSH
-agent forwarding is disabled.
+destinations, timing, and traffic volume, but cloud APIs remain protected by
+TLS and VPS sessions remain protected by their inner SSH connection. SSH agent
+forwarding is disabled.
 
 The VPS is hardened during its initial cloud-init run. Later `envr` commands do
 not reset its firewall. Automatic backups, snapshots, and additional storage
