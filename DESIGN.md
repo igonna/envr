@@ -474,18 +474,17 @@ Additional disks: none
 IPv6:              disabled initially
 ```
 
-Plan IDs or stable aliases are mapped for the eight supported requested sizes.
-Vultr 12 GB uses its 16 GB plan and Vultr 24 GB uses
-`vhp-12c-24gb-amd` (12 vCPU). DigitalOcean and Akamai map 24 GB to their 32 GB
-shared plans; an explicit 32 GB request uses those same plans without an alias.
-Their 12 GB requests use 16 GB plans. UpCloud selects its live, least-expensive
+Plan IDs or stable aliases are mapped only to exact allocated sizes. Vultr uses
+`vhp-4c-12gb-amd` for 12 GB and `vhp-12c-24gb-amd` for 24 GB. DigitalOcean and
+Akamai have no exact 12 or 24 GB shared tier, so those choices are unavailable
+instead of silently allocating and charging for 16 or 32 GB. UpCloud selects its live, least-expensive
 balanced Starter plans for 1–8 GB. For 16, 24, and 32 GB it uses exact balanced
 Cloud Native plans with an explicit 50 GB MaxIOPS boot disk and IPv4, including
 both unbundled resources in the displayed price. UpCloud has no current exact
 12 GB plan, so it does not expose one. Deletion first stops the server as
 required by the provider, then deletes attached storage and backups; normal
-server addresses are released with the server. Exoscale maps 12 GB to 16 GB and
-24/32 GB to `standard.huge` (32 GB, 8 vCPU), discovers
+server addresses are released with the server. Exoscale's standard sizes jump
+from 8 to 16 to 32 GB, so it also omits 12 and 24 GB. It discovers
 the current type and Ubuntu template UUIDs live, and uses a 50 GB local root
 disk. Its zones are Frankfurt, Munich, Vienna, then Zurich. Exoscale's HMAC
 authentication is signed locally with the API key and secret; relay mode opens
@@ -493,8 +492,8 @@ a separate hostname-validated TLS tunnel for each zone API host. A reusable,
 unbilled `envr-managed` security group permits SSH and only ports explicitly
 added with `port-open`.
 Gcore uses the account's single default project, discovers region IDs, flavors,
-prices, and Ubuntu image IDs live, and selects exact 12/24 GB flavors when
-available or the smallest safe larger flavor otherwise. Its order is
+prices, and Ubuntu image IDs live, and exposes 12/24 GB only when exact flavors
+exist. Its order is
 Frankfurt, Amsterdam, then Warsaw. Creation uses one project SSH key, a
 reusable `envr-managed` security group with unrestricted egress and explicit
 ingress, and a 50 GB boot volume marked `delete_on_termination`. Its task IDs

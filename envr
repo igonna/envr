@@ -61,7 +61,7 @@ PLAN_IDS = {
     2: "vc2-1c-2gb",
     4: "vc2-2c-4gb",
     8: "vc2-4c-8gb",
-    12: "vc2-6c-16gb",
+    12: "vhp-4c-12gb-amd",
     16: "vc2-6c-16gb",
     24: "vhp-12c-24gb-amd",
     32: "vc2-8c-32gb",
@@ -116,9 +116,7 @@ PROVIDER_PLAN_IDS = {
         2: "g6-standard-1",
         4: "g6-standard-2",
         8: "g6-standard-4",
-        12: "g6-standard-6",
         16: "g6-standard-6",
-        24: "g6-standard-8",
         32: "g6-standard-8",
     },
     "upcloud": {
@@ -136,9 +134,7 @@ PROVIDER_PLAN_IDS = {
         2: "s-1vcpu-2gb",
         4: "s-2vcpu-4gb",
         8: "s-4vcpu-8gb",
-        12: "s-6vcpu-16gb",
         16: "s-6vcpu-16gb",
-        24: "s-8vcpu-32gb",
         32: "s-8vcpu-32gb",
     },
     "exoscale": {
@@ -146,9 +142,7 @@ PROVIDER_PLAN_IDS = {
         2: "standard.small",
         4: "standard.medium",
         8: "standard.large",
-        12: "standard.extra-large",
         16: "standard.extra-large",
-        24: "standard.huge",
         32: "standard.huge",
     },
     "gcore": {
@@ -2049,11 +2043,7 @@ class GcoreAPI:
                 available_sizes = sorted({
                     int(item.get("ram") or 0)
                     for values in by_region.values() for item in values
-                    if (
-                        int(item.get("ram") or 0) >= requested * 1024
-                        if requested in {12, 24}
-                        else int(item.get("ram") or 0) == requested * 1024
-                    )
+                    if int(item.get("ram") or 0) == requested * 1024
                 })
                 if not available_sizes:
                     continue
@@ -4006,6 +3996,10 @@ runcmd:
         plan_ids = getattr(api, "plan_ids", None)
         if not isinstance(plan_ids, dict):
             plan_ids = PLAN_IDS
+        if ram_gb not in plan_ids:
+            raise EnvrError(
+                f"{self.provider_label(api)} has no exact {ram_gb} GB configuration"
+            )
         plan_id = plan_ids[ram_gb]
         catalog = self.plan_catalog(api)
         plan = catalog.get(plan_id)
@@ -4014,9 +4008,7 @@ runcmd:
                 f"{self.provider_label(api)} plan {plan_id} is not present in the live catalog"
             )
         actual_ram = int(plan.get("ram", 0)) // 1024
-        if actual_ram < ram_gb or (
-            actual_ram != ram_gb and ram_gb not in {12, 24}
-        ):
+        if actual_ram != ram_gb:
             raise EnvrError(
                 f"{self.provider_label(api)} plan {plan_id} no longer matches {ram_gb} GB"
             )
@@ -4039,10 +4031,10 @@ runcmd:
 
         last_error: Exception | None = None
         for region in regions:
-            size = f"{ram_gb} GB"
-            if actual_ram != ram_gb:
-                size += f" request ({actual_ram} GB provider size)"
-            print(f"Creating {size} envr VPS on {self.provider_label(api)} in {region}...")
+            print(
+                f"Creating {ram_gb} GB envr VPS on "
+                f"{self.provider_label(api)} in {region}..."
+            )
             payload = {
                 "region": region,
                 "plan": plan_id,
@@ -6197,6 +6189,7 @@ done
         target_api = self.api(target_provider, prompt=False)
         self.account_response(target_api)
         options = self.resize_options(target_api)
+        provider_available_sizes = {int(option["ram_gb"]) for option in options}
         if target_provider == source_provider:
             current_actual_ram = self.instance_ram_gb(source)
             options = [
@@ -6216,6 +6209,13 @@ done
                 f"{region_label(str(option['region']))} · "
                 f"{compact_price(option['plan'])}"
             )
+        unavailable_sizes = [
+            size for size in sorted(PLAN_IDS)
+            if size not in provider_available_sizes
+        ]
+        if unavailable_sizes:
+            sizes = ", ".join(f"{size} GB" for size in unavailable_sizes)
+            print(f"  Exact sizes unavailable: {sizes}")
         while True:
             choice = input(f"Choose 1-{len(options)}, or Q to cancel: ").strip().lower()
             if choice in {"", "q"}:
@@ -6466,20 +6466,36 @@ done
             print("  Price:      unavailable")
 
     def status_multiple(self, providers: Sequence[str]) -> int:
+        cached_state = self.state()
         current_provider = str(
-            self.state().get("provider") or self.selected_provider()
+            cached_state.get("provider") or self.selected_provider()
         )
         ordered_providers = (
             [current_provider] if current_provider in providers else []
         ) + [provider for provider in providers if provider != current_provider]
-        cached_active = bool(self.state().get("instance_id"))
+        cached_active = bool(cached_state.get("instance_id"))
 
         def query_provider(provider: str) -> dict[str, Any]:
             label = PROVIDER_LABELS[provider]
             lines = [label]
             try:
                 api = self.api(provider, prompt=False)
-                prefetch_plans = provider == current_provider and cached_active
+            except (ApiError, EnvrError) as error:
+                lines.append(f"  API: unavailable ({error})")
+                return {
+                    "provider": provider,
+                    "api": None,
+                    "lines": lines,
+                    "managed": [],
+                    "resizing": [],
+                    "plans": {},
+                    "currency": "USD",
+                    "failed": True,
+                    "inventory_failed": True,
+                }
+
+            prefetch_plans = provider == current_provider and cached_active
+            try:
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=3 if prefetch_plans else 2
                 ) as provider_executor:
@@ -6494,8 +6510,26 @@ done
                         plans_future = provider_executor.submit(
                             self.plan_catalog, plans_api
                         )
-                    account_response = account_future.result()
-                    inventory = inventory_future.result()
+            except (ApiError, EnvrError) as error:
+                lines.append(f"  API: unavailable ({error})")
+                return {
+                    "provider": provider,
+                    "api": api,
+                    "lines": lines,
+                    "managed": [],
+                    "resizing": [],
+                    "plans": {},
+                    "currency": "USD",
+                    "failed": True,
+                    "inventory_failed": True,
+                }
+
+            failed = False
+            account: dict[str, Any] | None = None
+            currency = "USD"
+            credit = 0.0
+            try:
+                account_response = account_future.result()
                 account = account_response.get("account")
                 if not isinstance(account, dict):
                     raise EnvrError(f"{label} returned invalid account information")
@@ -6518,50 +6552,57 @@ done
                     lines.append(f"  Uninvoiced: {pending:.2f} {currency}")
                 else:
                     lines.append(f"  Available credit: {credit:.2f} {currency}")
+            except (ApiError, EnvrError) as error:
+                failed = True
+                lines.append(f"  Billing: unavailable ({error})")
+
+            inventory_failed = False
+            try:
+                inventory = inventory_future.result()
                 managed = self.managed_from(inventory)
                 resizing = self.resize_from(inventory)
-                if managed or resizing:
+            except (ApiError, EnvrError) as error:
+                failed = True
+                inventory_failed = True
+                managed = []
+                resizing = []
+                lines.append(f"  Inventory: unavailable ({error})")
+
+            plans: dict[str, dict[str, Any]] = {}
+            if managed or resizing:
+                try:
                     plans = (
                         plans_future.result()
                         if plans_future is not None
                         else self.plan_catalog(api)
                     )
-                else:
-                    plans = {}
-                if len(managed) == 1 and not resizing:
-                    active_plan = plans.get(str(managed[0].get("plan")), {})
-                    active_hourly = float(active_plan.get("hourly_cost", 0) or 0)
-                    if (
-                        account.get("billing_available") is not False
-                        and account.get("credit_model") != "postpaid"
-                        and active_hourly > 0
-                        and credit > 0
-                    ):
-                        lines.append(
-                            f"  Credit runway: {format_runway(credit / active_hourly)}"
-                        )
-                return {
-                    "provider": provider,
-                    "api": api,
-                    "lines": lines,
-                    "managed": managed,
-                    "resizing": resizing,
-                    "plans": plans,
-                    "currency": currency,
-                    "failed": False,
-                }
-            except (ApiError, EnvrError) as error:
-                lines.append(f"  API: unavailable ({error})")
-                return {
-                    "provider": provider,
-                    "api": None,
-                    "lines": lines,
-                    "managed": [],
-                    "resizing": [],
-                    "plans": {},
-                    "currency": "USD",
-                    "failed": True,
-                }
+                except (ApiError, EnvrError) as error:
+                    failed = True
+                    lines.append(f"  Pricing: unavailable ({error})")
+
+            if len(managed) == 1 and not resizing and account is not None:
+                active_plan = plans.get(str(managed[0].get("plan")), {})
+                active_hourly = float(active_plan.get("hourly_cost", 0) or 0)
+                if (
+                    account.get("billing_available") is not False
+                    and account.get("credit_model") != "postpaid"
+                    and active_hourly > 0
+                    and credit > 0
+                ):
+                    lines.append(
+                        f"  Credit runway: {format_runway(credit / active_hourly)}"
+                    )
+            return {
+                "provider": provider,
+                "api": api,
+                "lines": lines,
+                "managed": managed,
+                "resizing": resizing,
+                "plans": plans,
+                "currency": currency,
+                "failed": failed,
+                "inventory_failed": inventory_failed,
+            }
 
         all_managed: list[tuple[Any, dict[str, Any]]] = []
         all_resize: list[tuple[Any, dict[str, Any]]] = []
@@ -6598,7 +6639,37 @@ done
                 machine_printed = True
             elif primary:
                 label = PROVIDER_LABELS[result["provider"]]
-                print(f"envr-codex: not running on {label}")
+                cached_matches = (
+                    result["inventory_failed"]
+                    and cached_active
+                    and str(cached_state.get("provider") or "vultr")
+                    == result["provider"]
+                    and cached_state.get("main_ip")
+                    and cached_state.get("ram_gb")
+                )
+                if cached_matches:
+                    password = "unavailable locally"
+                    if self.password_path.is_file():
+                        password = self.password_path.read_text(
+                            encoding="utf-8"
+                        ).strip() or password
+                    print("envr-codex")
+                    print(f"  Cloud:      {label}")
+                    print(f"  ID:         {cached_state.get('instance_id')}")
+                    print(f"  Region:     {cached_state.get('region') or ''}")
+                    print(f"  RAM:        {cached_state.get('ram_gb')} GB")
+                    print(f"  IP:         {cached_state.get('main_ip')}")
+                    print(f"  SSH user:   {REMOTE_USER} (key)")
+                    print("  Root user:  root")
+                    print(f"  Password:   {password}")
+                    print("  Status:     cached; live inventory unavailable")
+                    print("  Power:      unknown")
+                    print("  Price:      unavailable")
+                    machine_printed = True
+                elif result["inventory_failed"]:
+                    print(f"envr-codex: unknown; {label} inventory unavailable")
+                else:
+                    print(f"envr-codex: not running on {label}")
 
             if not clouds_printed:
                 print("\nClouds")
@@ -6637,7 +6708,7 @@ done
 
     def status(self) -> int:
         providers = self.configured_providers()
-        if len(providers) > 1:
+        if providers:
             return self.status_multiple(providers)
         try:
             api = self.api(providers[0] if providers else None)

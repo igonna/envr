@@ -254,7 +254,9 @@ envr resize
 
 The numbered menu shows only actual sizes available from the selected provider
 in the preferred regions. It never presents a 12 GB request that secretly
-allocates 16 GB, or a 24 GB request that allocates 32 GB.
+allocates 16 GB, or a 24 GB request that allocates 32 GB. Missing exact sizes
+are named below the menu. Vultr currently provides exact 12 and 24 GB plans;
+other providers expose those sizes only when their live catalogs genuinely do.
 
 Resize preserves `/home/remote/envr`, the complete `~/.codex` directory,
 repository keys, enrolled device SSH keys, repository metadata, and the last selected workspace. Inside

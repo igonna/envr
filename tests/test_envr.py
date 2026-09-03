@@ -865,6 +865,37 @@ class LifecycleLogicTests(unittest.TestCase):
 
             api.post.assert_called_once()
 
+    def test_create_rejects_size_missing_from_provider_without_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = SimpleNamespace(
+                provider_name="exoscale",
+                display_name="Exoscale",
+                plan_ids={16: "standard.extra-large"},
+            )
+
+            with self.assertRaisesRegex(
+                envr.EnvrError, "Exoscale has no exact 12 GB configuration"
+            ):
+                app.create_instance(api, 12)
+
+    def test_create_rejects_provider_plan_with_nonexact_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = SimpleNamespace(
+                provider_name="example",
+                display_name="Example",
+                plan_ids={12: "wrong-plan"},
+            )
+            app.plan_catalog = mock.Mock(return_value={
+                "wrong-plan": {"id": "wrong-plan", "ram": 16384}
+            })
+
+            with self.assertRaisesRegex(
+                envr.EnvrError, "wrong-plan no longer matches 12 GB"
+            ):
+                app.create_instance(api, 12)
+
     def test_vps_host_key_is_accepted_only_when_new(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -2015,6 +2046,7 @@ class ResizeTests(unittest.TestCase):
             app.resize.assert_called_once_with(8)
             self.assertIn("Current: Vultr · Frankfurt · 4 GB", output.getvalue())
             self.assertIn("8 GB · 4 CPU · Frankfurt", output.getvalue())
+            self.assertIn("Exact sizes unavailable: 1 GB, 2 GB, 4 GB", output.getvalue())
 
     def test_resize_menu_resumes_marker_without_prompting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2326,7 +2358,7 @@ class ParserTests(unittest.TestCase):
     def test_up_requires_only_ram(self) -> None:
         parser = envr.build_parser()
         self.assertEqual(envr.PLAN_IDS[16], "vc2-6c-16gb")
-        self.assertEqual(envr.PLAN_IDS[12], "vc2-6c-16gb")
+        self.assertEqual(envr.PLAN_IDS[12], "vhp-4c-12gb-amd")
         self.assertEqual(envr.PLAN_IDS[24], "vhp-12c-24gb-amd")
         self.assertEqual(envr.PLAN_IDS[32], "vc2-8c-32gb")
         with contextlib.redirect_stderr(io.StringIO()):
@@ -2474,7 +2506,7 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(app.selected_provider(), "exoscale")
 
-    def test_exoscale_catalog_and_24_gb_mapping_use_live_ids(self) -> None:
+    def test_exoscale_catalog_uses_live_ids_without_fake_24_gb_alias(self) -> None:
         api = envr.ExoscaleAPI("EXO-key\nsecret")
         instance_types = []
         definitions = (
@@ -2504,13 +2536,10 @@ class ProviderTests(unittest.TestCase):
         catalog = {plan["id"]: plan for plan in plans}
         self.assertEqual(catalog["standard.huge"]["ram"], 32768)
         self.assertEqual(
-            catalog[envr.PROVIDER_PLAN_IDS["exoscale"][24]]["provider_plan"],
+            catalog[envr.PROVIDER_PLAN_IDS["exoscale"][32]]["provider_plan"],
             "uuid-huge",
         )
-        self.assertEqual(
-            envr.PROVIDER_PLAN_IDS["exoscale"][24],
-            envr.PROVIDER_PLAN_IDS["exoscale"][32],
-        )
+        self.assertNotIn(24, envr.PROVIDER_PLAN_IDS["exoscale"])
 
     def test_exoscale_create_uses_zone_operation_security_group_and_base64_cloud_init(self) -> None:
         api = envr.ExoscaleAPI("EXO-key\nsecret")
@@ -2825,12 +2854,16 @@ class ProviderTests(unittest.TestCase):
             set(envr.PROVIDER_NAMES),
         )
 
-    def test_every_provider_has_12_and_24_gb_mappings(self) -> None:
-        for size in (12, 24):
-            self.assertEqual(
-                {provider for provider, plans in envr.PROVIDER_PLAN_IDS.items() if size in plans},
-                set(envr.PROVIDER_NAMES),
-            )
+    def test_static_provider_mappings_do_not_fake_12_or_24_gb(self) -> None:
+        for provider in ("akamai", "digitalocean", "exoscale"):
+            self.assertNotIn(12, envr.PROVIDER_PLAN_IDS[provider])
+            self.assertNotIn(24, envr.PROVIDER_PLAN_IDS[provider])
+        self.assertEqual(
+            envr.PROVIDER_PLAN_IDS["vultr"][12], "vhp-4c-12gb-amd"
+        )
+        self.assertEqual(
+            envr.PROVIDER_PLAN_IDS["vultr"][24], "vhp-12c-24gb-amd"
+        )
 
     def test_gcore_default_project_and_account_validation(self) -> None:
         api = envr.GcoreAPI("secret")
@@ -3005,7 +3038,7 @@ class ProviderTests(unittest.TestCase):
             ("DELETE", "cloud/v1/instances/7/1/instance-id"),
         )
 
-    def test_digitalocean_24_and_32_gb_mapping_is_unambiguous(self) -> None:
+    def test_legacy_oversized_digitalocean_state_remains_readable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             instance = {
@@ -3018,7 +3051,7 @@ class ProviderTests(unittest.TestCase):
             app.save_instance_state(instance, ram_gb=24)
             self.assertEqual(app.requested_ram_gb(instance), 24)
 
-    def test_resize_marker_preserves_requested_size_for_shared_plan(self) -> None:
+    def test_legacy_resize_marker_preserves_requested_size(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             instance = {
@@ -3182,7 +3215,7 @@ class ProviderTests(unittest.TestCase):
 
         self.assertEqual([system["id"] for system in systems], ["plain"])
 
-    def test_akamai_24_gb_request_is_explicitly_32_gb(self) -> None:
+    def test_legacy_oversized_akamai_state_remains_readable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
             instance = {
@@ -3361,6 +3394,90 @@ class ProviderTests(unittest.TestCase):
                 release_slow.set()
                 worker.join(2)
             self.assertFalse(worker.is_alive())
+
+    def test_pricing_timeout_does_not_hide_live_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.save_state({
+                "instance_id": "vultr-id",
+                "provider": "vultr",
+                "main_ip": "192.0.2.10",
+                "ram_gb": 4,
+                "region": "fra",
+            })
+            instance = {
+                "id": "vultr-id", "provider": "vultr", "label": envr.LABEL,
+                "tags": [envr.MANAGEMENT_TAG], "region": "fra", "ram": 4096,
+                "vcpu_count": 2, "main_ip": "192.0.2.10", "status": "active",
+                "power_status": "running", "plan": "vultr-plan",
+            }
+
+            def vultr_get(resource: str, **kwargs: object) -> dict[str, object]:
+                if resource == "account":
+                    return {"account": {"balance": -10, "pending_charges": 0,
+                                        "currency": "USD", "credit_model": "prepaid"}}
+                if resource == "instances":
+                    return {"instances": [instance]}
+                if resource == "plans":
+                    raise envr.ApiError(0, "The read operation timed out")
+                raise AssertionError(resource)
+
+            vultr = SimpleNamespace(
+                provider_name="vultr", display_name="Vultr",
+                get=mock.Mock(side_effect=vultr_get),
+            )
+            app.api = mock.Mock(return_value=vultr)
+            app.instance_password = mock.Mock(return_value="recovery-password")
+
+            with contextlib.redirect_stdout(output := io.StringIO()):
+                result = app.status_multiple(["vultr"])
+
+            text = output.getvalue()
+            self.assertEqual(result, 1)
+            self.assertTrue(text.startswith("envr-codex\n"))
+            self.assertIn("  ID:         vultr-id", text)
+            self.assertIn("  Status:     active", text)
+            self.assertIn("  Price:      unavailable", text)
+            self.assertIn("  Pricing: unavailable", text)
+            self.assertNotIn("not running", text)
+
+    def test_inventory_timeout_shows_cached_instance_as_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.save_state({
+                "instance_id": "vultr-id",
+                "provider": "vultr",
+                "main_ip": "192.0.2.10",
+                "ram_gb": 4,
+                "region": "fra",
+            })
+
+            def vultr_get(resource: str, **kwargs: object) -> dict[str, object]:
+                if resource == "account":
+                    return {"account": {"balance": -10, "pending_charges": 0,
+                                        "currency": "USD", "credit_model": "prepaid"}}
+                if resource == "instances":
+                    raise envr.ApiError(0, "The read operation timed out")
+                if resource == "plans":
+                    return {"plans": []}
+                raise AssertionError(resource)
+
+            vultr = SimpleNamespace(
+                provider_name="vultr", display_name="Vultr",
+                get=mock.Mock(side_effect=vultr_get),
+            )
+            app.api = mock.Mock(return_value=vultr)
+
+            with contextlib.redirect_stdout(output := io.StringIO()):
+                result = app.status_multiple(["vultr"])
+
+            text = output.getvalue()
+            self.assertEqual(result, 1)
+            self.assertTrue(text.startswith("envr-codex\n"))
+            self.assertIn("  ID:         vultr-id", text)
+            self.assertIn("cached; live inventory unavailable", text)
+            self.assertIn("Inventory: unavailable", text)
+            self.assertNotIn("not running", text)
 
     def test_runway_is_compact_and_does_not_round_up(self) -> None:
         self.assertEqual(envr.format_runway(0.001), "<1m")
