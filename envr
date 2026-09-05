@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 AKAMAI_API_BASE = "https://api.linode.com/v4"
@@ -153,6 +153,8 @@ PROVIDER_PLAN_IDS = {
 
 SCODEX_SCRIPT = """#!/bin/sh
 set -eu
+export NPM_CONFIG_PREFIX=/home/remote/.local
+export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
 
 case "${1:-}" in
     auth)
@@ -161,13 +163,686 @@ case "${1:-}" in
         ;;
     resume)
         shift
-        exec codex resume --dangerously-bypass-approvals-and-sandbox "$@"
+        exec envr-codex-supervisor resume "$@"
         ;;
     *)
-        echo "usage: scodex {auth|resume}" >&2
+        echo "usage: scodex auth | scodex resume [--choose|SESSION_UUID]" >&2
         exit 2
         ;;
 esac
+"""
+
+CODEX_SUPERVISOR_SCRIPT = r'''#!/usr/bin/env python3
+"""Exact-session Codex supervision for envr hosts."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+REMOTE_HOME = Path(os.environ.get("ENVR_REMOTE_HOME", "/home/remote")).resolve()
+WORKSPACE_ROOT = (REMOTE_HOME / "envr").resolve()
+CODEX_HOME = Path(
+    os.environ.get("ENVR_CODEX_HOME", str(REMOTE_HOME / ".codex"))
+).resolve()
+STATE_ROOT = Path(
+    os.environ.get(
+        "ENVR_SUPERVISION_ROOT",
+        str(REMOTE_HOME / ".config" / "envr" / "supervision"),
+    )
+).resolve()
+TMUX = os.environ.get("ENVR_TMUX", "tmux")
+CODEX = os.environ.get("ENVR_CODEX", "codex")
+os.environ["NPM_CONFIG_PREFIX"] = str(REMOTE_HOME / ".local")
+os.environ["PATH"] = str(REMOTE_HOME / ".local/bin") + os.pathsep + os.environ.get("PATH", "")
+PROTOCOL_VERSION = "4"
+UUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+SESSION = re.compile(r"^envr-(?:workspace|repo-[A-Za-z0-9._-]+)$")
+MAX_FAILURES = 3
+FAILURE_WINDOW = 600
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=".state-", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
+def load_state(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) and value.get("schema") == 1 else None
+
+
+def boot_id() -> str:
+    override = os.environ.get("ENVR_TEST_BOOT_ID")
+    if override:
+        return override
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return "unknown"
+
+
+def memory_events_path() -> Path | None:
+    override = os.environ.get("ENVR_MEMORY_EVENTS")
+    if override:
+        return Path(override)
+    try:
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            fields = line.split(":", 2)
+            if len(fields) == 3 and fields[0] == "0":
+                return Path("/sys/fs/cgroup") / fields[2].lstrip("/") / "memory.events"
+    except OSError:
+        pass
+    return None
+
+
+def oom_kills() -> int:
+    path = memory_events_path()
+    if path is None:
+        return 0
+    try:
+        for line in path.read_text().splitlines():
+            name, value = line.split(None, 1)
+            if name == "oom_kill":
+                return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def memory_ready() -> bool:
+    try:
+        values = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            name, value = line.split(":", 1)
+            values[name] = int(value.strip().split()[0]) * 1024
+        total = values.get("MemTotal", 0)
+        available = values.get("MemAvailable", 0)
+        required = max(512 * 1024**2, min(2 * 1024**3, total // 8))
+        return available >= required
+    except (OSError, ValueError, IndexError):
+        return True
+
+
+def run_tmux(*arguments: str, capture: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [TMUX, *arguments],
+        text=True,
+        capture_output=capture,
+        check=False,
+    )
+
+
+def tmux_value(format_string: str, target: str | None = None) -> str:
+    arguments = ["display-message", "-p"]
+    if target:
+        arguments.extend(["-t", target])
+    arguments.append(format_string)
+    result = run_tmux(*arguments, capture=True)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def pane_identity() -> tuple[str, str, str, str]:
+    pane = os.environ.get("TMUX_PANE", "")
+    if not pane:
+        raise RuntimeError("scodex must run inside the tmux opened by envr go")
+    session = tmux_value("#{session_name}", pane)
+    window = tmux_value("#{window_index}", pane)
+    if not SESSION.fullmatch(session):
+        raise RuntimeError("scodex is not running in an envr workspace session")
+    result = run_tmux("show-options", "-p", "-t", pane, "-v", "@envr-codex-slot", capture=True)
+    slot = result.stdout.strip() if result.returncode == 0 else ""
+    if not UUID.fullmatch(slot):
+        slot = str(uuid.uuid4())
+        result = run_tmux("set-option", "-p", "-t", pane, "@envr-codex-slot", slot)
+        if result.returncode != 0:
+            raise RuntimeError("could not bind the Codex supervisor to this tmux pane")
+    return slot, session, window, pane
+
+
+def state_path(slot: str) -> Path:
+    if not UUID.fullmatch(slot):
+        raise RuntimeError("invalid Codex supervision slot")
+    return STATE_ROOT / f"{slot}.json"
+
+
+def lock_path(slot: str) -> Path:
+    return STATE_ROOT / f"{slot}.lock"
+
+
+def lock_slot(slot: str, *, blocking: bool) -> object | None:
+    STATE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = lock_path(slot).open("a+")
+    flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    try:
+        fcntl.flock(handle.fileno(), flags)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def sqlite_candidates(cwd: str) -> list[dict]:
+    databases = []
+    for path in CODEX_HOME.glob("state_*.sqlite"):
+        try:
+            databases.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    databases = [path for _, path in sorted(databases, reverse=True)]
+    for database in databases:
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(threads)")
+            }
+            if not {"id", "cwd"}.issubset(columns):
+                connection.close()
+                continue
+            title = "title" if "title" in columns else "''"
+            archived = "archived = 0 AND" if "archived" in columns else ""
+            interactive = "source IN ('cli', 'vscode') AND" if "source" in columns else ""
+            updated = (
+                "updated_at_ms" if "updated_at_ms" in columns
+                else "updated_at" if "updated_at" in columns else "0"
+            )
+            rows = connection.execute(
+                f"SELECT id, {title}, {updated} FROM threads "
+                f"WHERE {archived} {interactive} cwd = ? ORDER BY {updated} DESC, id DESC",
+                (cwd,),
+            ).fetchall()
+            connection.close()
+            return [
+                {"id": str(row[0]), "title": str(row[1] or "Untitled"), "updated": int(row[2] or 0)}
+                for row in rows if UUID.fullmatch(str(row[0]))
+            ]
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+    return []
+
+
+def rollout_candidates(cwd: str) -> list[dict]:
+    result = []
+    for path in CODEX_HOME.glob("sessions/**/*.jsonl"):
+        try:
+            with path.open(encoding="utf-8") as handle:
+                value = json.loads(handle.readline())
+            payload = value.get("payload", {})
+            source = payload.get("source", "cli")
+            if not isinstance(source, str) or source not in {"cli", "vscode"}:
+                continue
+            identifier = str(payload.get("id") or payload.get("session_id") or "")
+            if UUID.fullmatch(identifier) and os.path.realpath(str(payload.get("cwd") or "")) == cwd:
+                result.append({"id": identifier, "title": "Codex session", "updated": path.stat().st_mtime_ns})
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            continue
+    return sorted(result, key=lambda item: (item["updated"], item["id"]), reverse=True)
+
+
+def active_thread_ids(except_slot: str) -> set[str]:
+    identifiers = set()
+    for path in STATE_ROOT.glob("*.json"):
+        value = load_state(path)
+        if not value or value.get("slot") == except_slot:
+            continue
+        if value.get("desired") == "running" and UUID.fullmatch(str(value.get("thread_id") or "")):
+            identifiers.add(str(value["thread_id"]))
+    return identifiers
+
+
+def choose_thread(slot: str, cwd: str, previous: dict | None, arguments: list[str]) -> str:
+    choose = arguments == ["--choose"]
+    explicit = arguments[0] if len(arguments) == 1 and UUID.fullmatch(arguments[0]) else None
+    if arguments and not choose and explicit is None:
+        raise RuntimeError("usage: scodex resume [--choose|SESSION_UUID]")
+    if explicit:
+        if explicit in active_thread_ids(slot):
+            raise RuntimeError("that Codex session is already supervised in another pane")
+        candidates = sqlite_candidates(cwd) or rollout_candidates(cwd)
+        if explicit not in {str(item["id"]) for item in candidates}:
+            raise RuntimeError("that Codex session does not belong to this repository")
+        return explicit
+    bound = str((previous or {}).get("thread_id") or "")
+    if not choose and UUID.fullmatch(bound) and (previous or {}).get("cwd") == cwd:
+        if bound in active_thread_ids(slot):
+            raise RuntimeError("that Codex session is already supervised in another pane")
+        return bound
+    candidates = sqlite_candidates(cwd) or rollout_candidates(cwd)
+    used = active_thread_ids(slot)
+    candidates = [item for item in candidates if item["id"] not in used]
+    if not candidates:
+        raise RuntimeError("no unbound Codex session exists for this repository")
+    if not choose or len(candidates) == 1:
+        selected = candidates[0]
+        print(f"Resuming {selected['id']}")
+        return str(selected["id"])
+    candidates = candidates[:10]
+    print("Codex sessions in this repository:")
+    for index, item in enumerate(candidates, 1):
+        title = "".join(
+            character if character.isprintable() else " "
+            for character in str(item["title"])
+        ).strip()[:80]
+        print(f"  {index}. {title or 'Untitled'} · {item['id']}")
+    while True:
+        answer = input(f"Choose 1-{len(candidates)}, or Q to cancel: ").strip().lower()
+        if answer == "q" or answer == "":
+            raise RuntimeError("cancelled")
+        if answer.isdigit() and 1 <= int(answer) <= len(candidates):
+            return str(candidates[int(answer) - 1]["id"])
+        print(f"Choose 1-{len(candidates)}, or Q.")
+
+
+def save(state: dict) -> None:
+    state["schema"] = 1
+    state["updated_at"] = int(time.time())
+    atomic_json(state_path(str(state["slot"])), state)
+
+
+def run_bound(state: dict) -> int:
+    # Lock the conversation too: two different panes can select it concurrently.
+    thread_lock = (STATE_ROOT / f"thread-{state['thread_id']}.lock").open("a+")
+    try:
+        fcntl.flock(thread_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        thread_lock.close()
+        state.update({"desired": "stopped", "status": "failed",
+                      "reason": "conversation already running"})
+        save(state)
+        raise RuntimeError("that Codex conversation is already running")
+    try:
+        return run_child(state)
+    except KeyboardInterrupt:
+        state.update({"desired": "stopped", "status": "stopped", "last_exit": 130})
+        save(state)
+        return 130
+    finally:
+        thread_lock.close()
+
+
+def run_child(state: dict) -> int:
+    while True:
+        baseline = oom_kills()
+        state.update({
+            "desired": "running",
+            "status": "running",
+            "boot_id": boot_id(),
+            "oom_baseline": baseline,
+            "pane": os.environ.get("TMUX_PANE", state.get("pane", "")),
+        })
+        save(state)
+        command = [
+            CODEX,
+            "resume",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C",
+            str(state["cwd"]),
+            str(state["thread_id"]),
+        ]
+        try:
+            child = subprocess.Popen(command)
+            while True:
+                try:
+                    returncode = child.wait()
+                    break
+                except KeyboardInterrupt:
+                    # The foreground child receives Ctrl-C as well. Let Codex
+                    # handle it; never abandon a still-running child process.
+                    continue
+        except OSError as error:
+            state.update({
+                "desired": "stopped",
+                "status": "failed",
+                "reason": f"could not start Codex: {error}",
+            })
+            save(state)
+            print(f"scodex: could not start Codex: {error}", file=sys.stderr)
+            return 1
+        current_oom = oom_kills()
+        oom_exit = returncode in {-9, 137} and current_oom > baseline
+        if not oom_exit:
+            state.update({"desired": "stopped", "status": "stopped", "last_exit": returncode})
+            save(state)
+            return returncode if 0 <= returncode <= 255 else 1
+        now = int(time.time())
+        failures = [
+            int(value) for value in state.get("failures", [])
+            if now - int(value) <= FAILURE_WINDOW
+        ]
+        failures.append(now)
+        state["failures"] = failures
+        state["oom_baseline"] = current_oom
+        if len(failures) > MAX_FAILURES:
+            state.update({"desired": "stopped", "status": "failed", "reason": "repeated OOM"})
+            save(state)
+            print("scodex: recovery stopped after repeated OOM failures", file=sys.stderr)
+            return 137
+        state["status"] = "waiting-memory"
+        save(state)
+        print("scodex: Codex was killed by OOM; waiting to resume the exact session", file=sys.stderr)
+        deadline = time.monotonic() + 120
+        while not memory_ready() and time.monotonic() < deadline:
+            time.sleep(5)
+        if not memory_ready():
+            state.update({"desired": "stopped", "status": "failed", "reason": "memory did not recover"})
+            save(state)
+            return 137
+
+
+def resume(arguments: list[str]) -> int:
+    slot, session, window, pane = pane_identity()
+    handle = lock_slot(slot, blocking=False)
+    if handle is None:
+        raise RuntimeError("this tmux pane already has a supervised Codex process")
+    try:
+        path = state_path(slot)
+        previous = load_state(path)
+        cwd = os.path.realpath(os.getcwd())
+        if not (cwd == str(WORKSPACE_ROOT) or cwd.startswith(str(WORKSPACE_ROOT) + os.sep)):
+            raise RuntimeError("scodex must run inside /home/remote/envr")
+        thread_id = choose_thread(slot, cwd, previous, arguments)
+        state = {
+            "schema": 1,
+            "slot": slot,
+            "thread_id": thread_id,
+            "cwd": cwd,
+            "tmux_session": session,
+            "tmux_window": window,
+            "pane": pane,
+            "failures": [],
+        }
+        # Publish intent under the cutover lock, so resize cannot pass its
+        # last check while a supervised conversation is being started.
+        with (STATE_ROOT.parent / "tmux.lock").open("a+") as gate:
+            fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
+            if (STATE_ROOT.parent / "resize-in-progress").exists():
+                raise RuntimeError("resize is in progress; reconnect after it finishes")
+            state.update({"desired": "running", "status": "starting",
+                          "boot_id": boot_id(), "oom_baseline": oom_kills()})
+            save(state)
+        return run_bound(state)
+    finally:
+        handle.close()
+
+
+def recover(slot: str) -> int:
+    handle = lock_slot(slot, blocking=False)
+    if handle is None:
+        return 0
+    try:
+        state = load_state(state_path(slot))
+        if not state or state.get("desired") != "running":
+            return 0
+        state["pane"] = os.environ.get("TMUX_PANE", state.get("pane", ""))
+        run_tmux("set-option", "-p", "-t", state["pane"], "@envr-codex-slot", slot)
+        state["boot_id"] = boot_id()
+        return run_bound(state)
+    finally:
+        handle.close()
+
+
+def recovery_command(slot: str) -> str:
+    command = shlex.join([sys.argv[0], "recover", slot])
+    return f"{command}; exec /bin/bash -l"
+
+
+def launch_recovery(state: dict) -> bool:
+    STATE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (STATE_ROOT.parent / "tmux.lock").open("a+") as gate:
+        fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
+        if (STATE_ROOT.parent / "resize-in-progress").exists():
+            return False
+        return restore_pane(state)
+
+
+def restore_pane(state: dict) -> bool:
+    session = str(state.get("tmux_session") or "")
+    cwd = os.path.realpath(str(state.get("cwd") or ""))
+    pane = str(state.get("pane") or "")
+    if not SESSION.fullmatch(session):
+        return False
+    if not (cwd == str(WORKSPACE_ROOT) or cwd.startswith(str(WORKSPACE_ROOT) + os.sep)):
+        return False
+    command = recovery_command(str(state["slot"]))
+    panes = run_tmux("list-panes", "-a", "-F", "#{pane_id}", capture=True)
+    existing_panes = set(panes.stdout.split()) if panes.returncode == 0 else set()
+    # Pane IDs are recycled when tmux restarts. Never replace a live shell or
+    # another conversation merely because its numeric ID matches old state.
+    binding = run_tmux(
+        "show-options", "-p", "-t", pane, "-v", "@envr-codex-slot", capture=True
+    ) if pane in existing_panes else None
+    if (binding is not None and binding.stdout.strip() == str(state["slot"])
+            and tmux_value("#{pane_dead}", pane) == "1"
+            and tmux_value("#{session_name}", pane) == session):
+        result = run_tmux("respawn-pane", "-k", "-t", pane, "-c", cwd, command)
+        if result.returncode == 0:
+            run_tmux("select-pane", "-t", pane)
+            return True
+    if run_tmux("has-session", "-t", f"={session}").returncode == 0:
+        result = run_tmux(
+            "new-window", "-d", "-P", "-F", "#{pane_id}",
+            "-t", session, "-n", "codex-recovery", "-c", cwd, command,
+            capture=True,
+        )
+        if result.returncode == 0:
+            pane = result.stdout.strip()
+            run_tmux("select-window", "-t", pane)
+            return True
+        return False
+    result = run_tmux(
+        "new-session", "-d", "-P", "-F", "#{pane_id}",
+        "-s", session, "-n", "codex", "-c", cwd, command,
+        capture=True,
+    )
+    if result.returncode == 0:
+        return True
+    return False
+
+
+def inspect_orphans() -> None:
+    current_boot = boot_id()
+    current_oom = oom_kills()
+    for path in STATE_ROOT.glob("*.json"):
+        state = load_state(path)
+        if not state or state.get("desired") != "running":
+            continue
+        slot = str(state.get("slot") or "")
+        if not UUID.fullmatch(slot):
+            continue
+        handle = lock_slot(slot, blocking=False)
+        if handle is None:
+            continue
+        try:
+            state = load_state(path)
+            if not state or state.get("desired") != "running":
+                continue
+            launching = int(state.get("launching_at") or 0)
+            if state.get("status") == "recovering" and time.time() - launching < 30:
+                continue
+            recoverable = (
+                str(state.get("boot_id") or "") != current_boot
+                or current_oom > int(state.get("oom_baseline") or 0)
+            )
+            if not recoverable:
+                state.update({
+                    "desired": "stopped",
+                    "status": "stopped",
+                    "reason": "process ended without OOM",
+                })
+                save(state)
+                continue
+            now = int(time.time())
+            failures = [int(value) for value in state.get("failures", [])
+                        if now - int(value) <= FAILURE_WINDOW]
+            failures.append(now)
+            state["failures"] = failures
+            if len(failures) > MAX_FAILURES:
+                state.update({"desired": "stopped", "status": "failed",
+                              "reason": "repeated recovery failures"})
+                save(state)
+                continue
+            state.update({
+                "status": "recovering",
+                "launching_at": int(time.time()),
+                "boot_id": current_boot,
+                "oom_baseline": current_oom,
+            })
+            save(state)
+        finally:
+            handle.close()
+        launched = launch_recovery(state)
+        if not launched:
+            handle = lock_slot(slot, blocking=False)
+            if handle is not None:
+                try:
+                    latest = load_state(path) or state
+                    latest.update({
+                        "desired": "stopped",
+                        "status": "failed",
+                        "reason": "tmux recovery failed",
+                    })
+                    save(latest)
+                finally:
+                    handle.close()
+
+
+def ensure_keeper_session() -> None:
+    if run_tmux("has-session", "-t", "=envr-keeper").returncode == 0:
+        return
+    run_tmux(
+        "new-session", "-d", "-s", "envr-keeper", "-n", "keeper",
+        "-c", str(WORKSPACE_ROOT), "exec sleep infinity",
+    )
+
+
+def keeper() -> int:
+    STATE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    while True:
+        ensure_keeper_session()
+        marker = STATE_ROOT / "recover-after-oom"
+        if marker.exists():
+            current = oom_kills()
+            for path in STATE_ROOT.glob("*.json"):
+                state = load_state(path)
+                if not state or state.get("desired") != "running":
+                    continue
+                slot = str(state.get("slot") or "")
+                if not UUID.fullmatch(slot):
+                    continue
+                handle = lock_slot(slot, blocking=False)
+                if handle is None:
+                    continue
+                try:
+                    latest = load_state(path) or state
+                    latest["oom_baseline"] = min(
+                        int(latest.get("oom_baseline") or 0), current - 1
+                    )
+                    save(latest)
+                finally:
+                    handle.close()
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+        inspect_orphans()
+        time.sleep(5)
+
+
+def armed() -> int:
+    for path in STATE_ROOT.glob("*.json"):
+        state = load_state(path)
+        if state and state.get("desired") == "running":
+            return 0
+    return 1
+
+
+def disarm_all() -> int:
+    for path in STATE_ROOT.glob("*.json"):
+        state = load_state(path)
+        if state:
+            state.update({"desired": "stopped", "status": "stopped", "reason": "envr shutdown"})
+            save(state)
+    return 0
+
+
+def main(arguments: list[str]) -> int:
+    try:
+        if arguments and arguments[0] == "resume":
+            return resume(arguments[1:])
+        if len(arguments) == 2 and arguments[0] == "recover":
+            return recover(arguments[1])
+        if arguments == ["keeper"]:
+            return keeper()
+        if arguments == ["armed"]:
+            return armed()
+        if arguments == ["disarm-all"]:
+            return disarm_all()
+        if arguments == ["inspect-once"]:
+            inspect_orphans()
+            return 0
+        if arguments == ["version"]:
+            print(PROTOCOL_VERSION)
+            return 0
+        raise RuntimeError("invalid envr Codex supervisor operation")
+    except RuntimeError as error:
+        print(f"scodex: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+'''
+
+TMUX_KEEPER_SERVICE = """[Unit]
+Description=envr persistent tmux and Codex recovery keeper
+After=network.target
+
+[Service]
+Type=simple
+User=remote
+Group=remote
+Environment=HOME=/home/remote
+WorkingDirectory=/home/remote/envr
+ExecStart=/usr/local/bin/envr-codex-supervisor keeper
+ExecStopPost=/bin/sh -c 'if [ "$SERVICE_RESULT" = oom-kill ]; then mkdir -p /home/remote/.config/envr/supervision; chmod 700 /home/remote/.config/envr/supervision; : > /home/remote/.config/envr/supervision/recover-after-oom; fi'
+Restart=always
+RestartSec=2
+MemoryAccounting=yes
+OOMPolicy=continue
+ManagedOOMPreference=avoid
+
+[Install]
+WantedBy=multi-user.target
 """
 
 
@@ -3899,6 +4574,12 @@ class Envr:
             f"chmod 600 {REMOTE_HOME}/.codex/config.toml"
         )
         scodex_encoded = base64.b64encode(SCODEX_SCRIPT.encode()).decode()
+        supervisor_encoded = base64.b64encode(
+            CODEX_SUPERVISOR_SCRIPT.encode()
+        ).decode()
+        keeper_service_encoded = base64.b64encode(
+            TMUX_KEEPER_SERVICE.encode()
+        ).decode()
         return f"""#cloud-config
 hostname: envr
 manage_etc_hosts: true
@@ -3927,6 +4608,8 @@ packages:
   - unzip
   - nodejs
   - npm
+  - python3
+  - util-linux
   - bubblewrap
   - apparmor-profiles
   - apparmor-utils
@@ -3953,18 +4636,28 @@ write_files:
     permissions: '0755'
     encoding: b64
     content: {scodex_encoded}
+  - path: /usr/local/bin/envr-codex-supervisor
+    permissions: '0755'
+    encoding: b64
+    content: {supervisor_encoded}
+  - path: /etc/systemd/system/envr-tmux.service
+    permissions: '0644'
+    encoding: b64
+    content: {keeper_service_encoded}
 runcmd:
   - [bash, -lc, "usermod -aG docker {REMOTE_USER}"]
   - [bash, -lc, "install -d -m 700 -o {REMOTE_USER} -g {REMOTE_USER} {REMOTE_HOME}/.ssh {REMOTE_HOME}/.ssh/envr {REMOTE_HOME}/.codex {REMOTE_CONFIG_ROOT}"]
   - [bash, -lc, {codex_config_command}]
   - [bash, -lc, "install -d -m 755 -o {REMOTE_USER} -g {REMOTE_USER} {REMOTE_ROOT}"]
-  - [bash, -lc, "for i in 1 2 3; do npm install -g @openai/codex@latest && break; sleep 10; done; command -v codex"]
+  - [bash, -lc, "for i in 1 2 3; do sudo -u {REMOTE_USER} -H env NPM_CONFIG_PREFIX={REMOTE_HOME}/.local npm install -g @openai/codex@latest && break; sleep 10; done; test -x {REMOTE_HOME}/.local/bin/codex"]
+  - [bash, -lc, "sudo -u {REMOTE_USER} -H npm config set prefix {REMOTE_HOME}/.local --location=user && ln -sfn {REMOTE_HOME}/.local/bin/codex /usr/local/bin/codex"]
+  - [bash, -lc, "if ! swapon --noheadings --show=NAME | grep -q . && test $(df -PB1 / | awk 'NR == 2 {{print $4}}') -ge 6442450944; then if fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile; then grep -qF '/swapfile none swap sw 0 0' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab; printf 'vm.swappiness=10\\n' > /etc/sysctl.d/90-envr-swap.conf; sysctl -p /etc/sysctl.d/90-envr-swap.conf; else swapoff /swapfile 2>/dev/null || true; rm -f /swapfile; fi; fi"]
   - [bash, -lc, "if test -r /sys/module/apparmor/parameters/enabled && grep -q '^Y' /sys/module/apparmor/parameters/enabled && test -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict; then install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict; apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict; fi"]
   - [bash, -lc, "ufw default deny incoming"]
   - [bash, -lc, "ufw default allow outgoing"]
   - [bash, -lc, "ufw allow 22/tcp"]
   - [bash, -lc, "ufw --force enable"]
-  - [bash, -lc, "systemctl enable --now fail2ban docker"]
+  - [bash, -lc, "systemctl daemon-reload && systemctl enable --now fail2ban docker envr-tmux.service"]
   - [bash, -lc, "systemctl restart ssh"]
   - [bash, -lc, "touch /var/lib/envr-ready"]
 """
@@ -4744,10 +5437,16 @@ done
         )
 
     def ensure_remote_runtime(self, instance: dict[str, Any]) -> None:
-        encoded = base64.b64encode(SCODEX_SCRIPT.encode()).decode()
+        scodex_encoded = base64.b64encode(SCODEX_SCRIPT.encode()).decode()
+        supervisor_encoded = base64.b64encode(
+            CODEX_SUPERVISOR_SCRIPT.encode()
+        ).decode()
+        keeper_service_encoded = base64.b64encode(
+            TMUX_KEEPER_SERVICE.encode()
+        ).decode()
         script = f"""set -euo pipefail
 needs_sandbox_packages=false
-if ! command -v bwrap >/dev/null 2>&1; then
+if ! command -v bwrap >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
     needs_sandbox_packages=true
 fi
 if test -r /etc/os-release; then
@@ -4760,7 +5459,7 @@ fi
 if test "$needs_sandbox_packages" = true; then
     sudo apt-get update
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        bubblewrap apparmor-profiles apparmor-utils
+        bubblewrap apparmor-profiles apparmor-utils python3
 fi
 if test -r /sys/module/apparmor/parameters/enabled \
         && grep -q '^Y' /sys/module/apparmor/parameters/enabled \
@@ -4771,15 +5470,71 @@ if test -r /sys/module/apparmor/parameters/enabled \
     sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
 fi
 temporary=$(mktemp)
-trap 'rm -f "$temporary"' EXIT
+supervisor_temporary=$(mktemp)
+service_temporary=$(mktemp)
+trap 'rm -f "$temporary" "$supervisor_temporary" "$service_temporary"' EXIT
 printf '%s' "$1" | base64 -d > "$temporary"
+printf '%s' "$2" | base64 -d > "$supervisor_temporary"
+printf '%s' "$3" | base64 -d > "$service_temporary"
 sudo install -m 755 "$temporary" /usr/local/bin/scodex
+sudo install -m 755 "$supervisor_temporary" /usr/local/bin/envr-codex-supervisor
+sudo install -m 644 "$service_temporary" /etc/systemd/system/envr-tmux.service
+if test ! -x {REMOTE_HOME}/.local/bin/codex; then
+    env NPM_CONFIG_PREFIX={REMOTE_HOME}/.local npm install -g @openai/codex@latest
+fi
+npm config set prefix {REMOTE_HOME}/.local --location=user
+sudo ln -sfn {REMOTE_HOME}/.local/bin/codex /usr/local/bin/codex
 install -d -m 700 {REMOTE_HOME}/.codex
-printf '%s\n' 'cli_auth_credentials_store = "file"' \
-    > {REMOTE_HOME}/.codex/config.toml
+install -d -m 700 {REMOTE_HOME}/.config/envr/supervision
+if test ! -e {REMOTE_HOME}/.codex/config.toml \
+        && test ! -L {REMOTE_HOME}/.codex/config.toml; then
+    (umask 077; set -C; printf '%s\n' 'cli_auth_credentials_store = "file"' \
+        > {REMOTE_HOME}/.codex/config.toml)
+fi
 chmod 600 {REMOTE_HOME}/.codex/config.toml
+if ! sudo swapon --noheadings --show=NAME | grep -q . \
+        && test ! -e /swapfile && test ! -L /swapfile \
+        && test "$(df -PB1 / | awk 'NR == 2 {{print $4}}')" -ge 6442450944; then
+    if sudo fallocate -l 4G /swapfile \
+            && sudo chmod 600 /swapfile \
+            && sudo mkswap /swapfile >/dev/null \
+            && sudo swapon /swapfile; then
+        grep -qF '/swapfile none swap sw 0 0' /etc/fstab \
+            || printf '%s\n' '/swapfile none swap sw 0 0' \
+            | sudo tee -a /etc/fstab >/dev/null
+        printf '%s\n' 'vm.swappiness=10' \
+            | sudo tee /etc/sysctl.d/90-envr-swap.conf >/dev/null
+        sudo sysctl -p /etc/sysctl.d/90-envr-swap.conf >/dev/null
+    else
+        sudo swapoff /swapfile 2>/dev/null || true
+        sudo rm -f /swapfile
+    fi
+fi
+sudo systemctl daemon-reload
+sudo systemctl enable envr-tmux.service >/dev/null
+if ! tmux list-sessions >/dev/null 2>&1; then
+    sudo systemctl start envr-tmux.service
+fi
 """
-        self.remote_script(instance, script, (encoded,), timeout=300)
+        self.remote_script(
+            instance,
+            script,
+            (scodex_encoded, supervisor_encoded, keeper_service_encoded),
+            timeout=300,
+        )
+
+    def ensure_remote_runtime_current(self, instance: dict[str, Any]) -> None:
+        result = self.remote_command(
+            instance,
+            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 4 "
+            "&& test -x /home/remote/.local/bin/codex "
+            "&& systemctl is-enabled --quiet envr-tmux.service",
+            check=False,
+            quiet=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            self.ensure_remote_runtime(instance)
 
     @staticmethod
     def validate_auth_file(path: Path) -> None:
@@ -5213,13 +5968,20 @@ trap - EXIT
             display_name = str(repository["folder"])
             target = f"{REMOTE_ROOT}/{display_name}"
             session = f"envr-repo-{display_name}"
-        command = (
-            f"tmux has-session -t {shlex.quote(session)} 2>/dev/null || "
+        exact_session = f"={session}"
+        create_session = (
+            f"tmux has-session -t {shlex.quote(exact_session)} 2>/dev/null || "
             f"tmux new-session -d -s {shlex.quote(session)} "
-            f"-c {shlex.quote(target)}; "
-            f"tmux set-option -t {shlex.quote(session)} mouse on; "
+            f"-c {shlex.quote(target)}"
+        )
+        command = (
+            f"flock -x {shlex.quote(f'{REMOTE_CONFIG_ROOT}/tmux.lock')} "
+            f"bash -lc {shlex.quote(create_session)}; "
+            f"session_id=$(tmux display-message -p -t {shlex.quote(exact_session)} "
+            "'#{session_id}') || exit; "
+            'tmux set-option -t "$session_id" mouse on; '
             "tmux set-option -g history-limit 50000; "
-            f"exec tmux attach-session -t {shlex.quote(session)}"
+            f"exec tmux attach-session -t {shlex.quote(exact_session)}"
         )
         print(f"Connecting to {display_name}. Detach safely with Ctrl-b d.")
         try:
@@ -5304,6 +6066,7 @@ trap - EXIT
         self, instance: dict[str, Any], folder: str | None
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         self.refuse_incomplete_resize(instance)
+        self.ensure_remote_runtime_current(instance)
         explicitly_selected = folder is not None
         if folder is None:
             folder = self.last_workspace(instance)
@@ -5525,7 +6288,10 @@ trap - EXIT
     ) -> int:
         script = r"""set -euo pipefail
 measure=$1
-if pgrep -u remote -af '[c]odex' >/dev/null; then
+if (pgrep -u remote -af '[c]odex' \
+        | grep -v '[e]nvr-codex-supervisor' | grep -q .) \
+        || (command -v envr-codex-supervisor >/dev/null 2>&1 \
+            && envr-codex-supervisor armed); then
     echo CODEX_RUNNING
     exit 20
 fi
@@ -5573,6 +6339,38 @@ printf '%s\n' "$total"
         if result.returncode != 0 or not detail.isdigit():
             raise EnvrError("could not measure the resize data")
         return int(detail)
+
+    def quiesce_resize_source(self, instance: dict[str, Any]) -> None:
+        """Stop persistent tmux only while no Codex session is armed."""
+        script = rf"""set -euo pipefail
+lock={shlex.quote(f'{REMOTE_CONFIG_ROOT}/tmux.lock')}
+exec 9>"$lock"
+flock -x 9
+if (pgrep -u remote -af '[c]odex' \
+        | grep -v '[e]nvr-codex-supervisor' | grep -q .) \
+        || (command -v envr-codex-supervisor >/dev/null 2>&1 \
+            && envr-codex-supervisor armed); then
+    echo CODEX_RUNNING
+    exit 20
+fi
+sudo systemctl stop envr-tmux.service 2>/dev/null || true
+tmux kill-server 2>/dev/null || true
+"""
+        result = self.remote_script(
+            instance,
+            script,
+            (),
+            capture=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode == 20 or result.stdout.strip() == "CODEX_RUNNING":
+            raise EnvrError(
+                "Codex started while resize was preparing. Exit Codex and "
+                "detach from tmux, then run resize again"
+            )
+        if result.returncode != 0:
+            raise EnvrError("could not safely pause tmux for resize")
 
     def ensure_resize_capacity(
         self, target: dict[str, Any], transfer_bytes: int
@@ -6052,10 +6850,7 @@ done
                 self.authorize_resize_target(source, target, public_key, token)
                 transfer_bytes = self.ensure_resize_source_ready(source)
                 self.ensure_resize_capacity(target, transfer_bytes)
-                self.remote_command(
-                    source, "tmux kill-server 2>/dev/null || true",
-                    quiet=True, timeout=30,
-                )
+                self.quiesce_resize_source(source)
                 print("Transferring workspace and Codex state...")
                 self.transfer_resize_data(source, target, host_key, token)
             finally:
@@ -6073,6 +6868,13 @@ done
             )
         except (EnvrError, subprocess.TimeoutExpired, KeyboardInterrupt):
             if not promoted and target is not None:
+                with contextlib.suppress(EnvrError, subprocess.TimeoutExpired):
+                    self.remote_command(
+                        source,
+                        "sudo systemctl start envr-tmux.service 2>/dev/null || true",
+                        quiet=True,
+                        timeout=30,
+                    )
                 with contextlib.suppress(EnvrError, subprocess.TimeoutExpired):
                     self.delete_instance(target_api, target)
                     self.clear_resize_marker(source)
@@ -6361,12 +7163,7 @@ done
                 self.authorize_resize_target(source, target, public_key, token)
                 transfer_bytes = self.ensure_resize_source_ready(source)
                 self.ensure_resize_capacity(target, transfer_bytes)
-                self.remote_command(
-                    source,
-                    "tmux kill-server 2>/dev/null || true",
-                    quiet=True,
-                    timeout=30,
-                )
+                self.quiesce_resize_source(source)
                 print("Transferring workspace and Codex state...")
                 self.transfer_resize_data(source, target, host_key, token)
             finally:
@@ -6379,6 +7176,13 @@ done
             return
         except (EnvrError, subprocess.TimeoutExpired, KeyboardInterrupt):
             if not promoted:
+                with contextlib.suppress(EnvrError, subprocess.TimeoutExpired):
+                    self.remote_command(
+                        source,
+                        "sudo systemctl start envr-tmux.service 2>/dev/null || true",
+                        quiet=True,
+                        timeout=30,
+                    )
                 try:
                     rollback_current, rollback_targets, rollback_sources = (
                         self.resize_roles(api)
@@ -7007,6 +7811,15 @@ fi
         for instance in instances:
             api = next(api for api, candidate in owned if candidate is instance)
             try:
+                with contextlib.suppress(EnvrError, subprocess.TimeoutExpired):
+                    self.remote_command(
+                        instance,
+                        "envr-codex-supervisor disarm-all 2>/dev/null || true; "
+                        "sudo systemctl stop envr-tmux.service 2>/dev/null || true",
+                        check=False,
+                        quiet=True,
+                        timeout=30,
+                    )
                 self.delete_instance(api, instance)
                 print(f"Deleted {instance.get('id')}.")
             except EnvrError as error:

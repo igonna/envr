@@ -412,10 +412,12 @@ rules, and open ports are not copied. The destination receives the normal
 fresh envr bootstrap and current Codex CLI.
 
 Codex must not be running. `resize` refuses before creating a target when a
-Codex process is found, then checks again immediately before cutover. The old
-tmux server is stopped before the final copy. Process memory and tmux sessions
-cannot move between VPSs; after `envr go` creates a fresh destination tmux,
-`scodex resume` uses the copied Codex session history.
+Codex process or armed supervisor record is found. Immediately before cutover,
+resize takes the same lock used to create tmux sessions, checks both conditions
+again, and only then stops the old tmux server. This closes the concurrent
+`envr go`/`scodex resume` race. Process memory and tmux sessions cannot move
+between VPSs; after `envr go` creates a fresh destination tmux, `scodex resume`
+uses the copied Codex session history.
 
 The transaction is:
 
@@ -544,8 +546,9 @@ envr creates the selected session only when absent, then uses
 `tmux attach-session` without detaching another client. SSH loss, relay loss,
 Android suspension, and network changes detach the client while the remote
 session and its processes continue. The user can detach deliberately with
-`Ctrl-b d`. Sessions do not survive VPS reboot, process termination,
-out-of-memory failure, or instance destruction.
+`Ctrl-b d`. Ordinary shells do not survive VPS reboot, process termination, or
+instance destruction. A Codex session started through `scodex resume` is the
+deliberate exception described below.
 
 Before every attachment, envr enables `mouse` on the selected session and sets
 the global history limit to 50,000 lines. This applies to existing sessions
@@ -560,15 +563,57 @@ scodex resume
 ```
 
 `scodex auth` executes `codex login --device-auth`; the user approves the
-URL/code in a browser. `scodex resume` executes:
+URL/code in a browser. `scodex resume` selects and persistently binds the
+current tmux pane to an exact session UUID, then executes:
 
 ```bash
-codex resume --dangerously-bypass-approvals-and-sandbox
+codex resume --dangerously-bypass-approvals-and-sandbox -C DIRECTORY SESSION_UUID
 ```
 
 This intentionally disables Codex approvals and sandboxing and is restricted
 to the explicit wrapper command. Users can run plain `codex`, `tmux`, or any
-other terminal command themselves.
+other terminal command themselves. Plain `codex` is not supervised.
+
+Candidate sessions are filtered by the exact repository directory using the
+local Codex state database, with rollout metadata as a compatibility fallback.
+Subagent and non-interactive threads are excluded. The latest eligible main
+conversation binds automatically. A stored UUID is reused thereafter;
+`scodex resume --choose` offers up to ten recent eligible conversations and explicitly
+rebinds the pane, and one UUID cannot be armed in two panes. Recovery therefore
+never relies on recency or `--last`.
+
+The tmux daemon and a small keeper run in `envr-tmux.service` with
+`OOMPolicy=continue`. Every supervised pane has an atomic state record and an
+exclusive lock. Conversation locks also prevent concurrent starts of one UUID
+in different panes. If the child exits normally (including an exit through
+`Ctrl-C`), or is killed
+without an increased cgroup `oom_kill` counter, its record is disarmed and it
+stays stopped. With positive OOM evidence, the wrapper waits for usable memory
+and resumes the exact UUID in place. If the whole tmux scope is killed, the
+keeper recreates the same named repository session and launches that exact
+binding. A changed boot ID similarly restores sessions that were armed across a
+VPS reboot. No prompt and no `/goal resume` command are injected: persisted goal
+state belongs to the exact Codex thread itself. Automatic recovery is capped at
+three retries in ten minutes.
+
+Recovery checks pane ownership and never replaces a live pane using a stale
+numeric pane ID. When necessary it creates a recovery window in the original
+named session. Ctrl-C is handled by the foreground Codex process; supervision
+waits for that process to exit before disarming. Cgroup OOM counters establish
+group-level evidence, not attribution to an exact PID, so simultaneous manual
+kills and OOM events in that group remain ambiguous. Real Linux OOM and reboot
+validation remains an explicit production gate.
+
+Cloud-init adds a 4 GB swap file when the root disk has at least 6 GiB free and
+no swap already exists. This is emergency headroom, not a substitute for sizing
+build concurrency. Resize refuses while any supervision record is armed;
+destroy disarms records and intentionally stops the keeper before deletion.
+`go` probes the remote supervisor protocol version and repairs an old runtime
+only when needed. Runtime upgrades preserve existing Codex configuration and
+existing swap files; the default configuration is created only when absent.
+On an already-running legacy VPS it does not kill or replace
+the existing tmux daemon; child-level supervision becomes available immediately,
+and the dedicated service owns tmux after the next reboot or fresh resize.
 
 The resulting remote
 `/home/remote/.codex/auth.json` is pulled atomically after disconnection and
@@ -675,6 +720,9 @@ configure repo on macOS
 → configure relay and verify status plus VPS SSH use it without direct fallback
 → interrupt SSH and verify both devices reattach to the persistent tmux session
 → verify scodex auth and scodex resume
+→ OOM-kill a disposable supervised Codex child and verify the exact UUID returns
+→ verify a normal exit and a manual kill remain stopped
+→ reboot a disposable VPS and verify the armed UUID returns in the same tmux name
 → resize upward and downward, including one interrupted pre-promotion run
 → open a port
 → destroy from Android

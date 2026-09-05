@@ -95,7 +95,28 @@ scodex resume
 
 `scodex auth` starts device authentication. `scodex resume` resumes Codex with
 approvals and sandboxing explicitly bypassed; use it only because this VPS is
-disposable and isolated for that purpose.
+disposable and isolated for that purpose. On first use in a repository it binds
+the tmux pane to the latest main interactive conversation in that repository,
+excluding subagents, and remembers its exact UUID. `scodex resume --choose`
+offers the ten most recent eligible conversations to change the binding later.
+
+That binding is supervised. A normal Codex exit, including exiting with
+`Ctrl-C`, leaves it stopped. Ctrl-C handled internally by Codex does not abandon
+the running process. If Linux records an out-of-memory kill and Codex is killed, envr waits
+for memory to recover and resumes only that UUID in the same named tmux session.
+It also restores an armed session after a VPS reboot. Recovery never uses
+`--last`, never injects a prompt, and never runs `/goal resume`; an active goal
+remains part of the resumed Codex thread. Recovery stops after three repeated
+OOM restarts in ten minutes. Plain `codex` remains completely unsupervised.
+
+Codex is installed as `remote` under `~/.local`, with npm's user prefix set
+there, so its built-in update action works without sudo. `scodex` uses that
+same installation even inside an older tmux shell.
+
+Recovery has automated process simulations, but a real Linux OOM/reboot test
+remains required before treating it as production-verified. OOM counters cover
+the service group: a simultaneous manual kill and unrelated OOM in that same
+group cannot be distinguished reliably by this mechanism.
 
 To join from another Mac, Linux machine, or Android phone, install `envr`, enter
 the API token for the cloud containing the VPS, and run the same command. `envr` discovers the
@@ -264,8 +285,10 @@ Git repositories, untracked paths ignored by Git are deliberately omitted;
 tracked files and untracked non-ignored work are preserved. The
 operating system and standard envr tools are rebuilt fresh. Custom packages,
 VPNs, containers, services, firewall rules, and open ports are not migrated.
-Codex must be exited first; process memory and the old tmux process cannot be
-moved, but `scodex resume` sees the copied Codex sessions afterward.
+Codex must be exited first; an armed supervised session also makes resize
+refuse. Process memory and the old tmux process cannot be moved, but `scodex
+resume` sees the copied Codex sessions afterward. Resize locks tmux creation,
+rechecks that Codex is stopped, and only then pauses tmux for the final copy.
 
 The old VPS remains authoritative until a direct encrypted VPS-to-VPS copy
 passes checksum, repository-key, metadata, and destination-SSH validation.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import base64
 import http.server
 import importlib.machinery
@@ -9,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -475,6 +477,12 @@ class LifecycleLogicTests(unittest.TestCase):
         self.assertIn("apparmor-profiles", cloud_init)
         self.assertIn("bwrap-userns-restrict", cloud_init)
         self.assertIn("/usr/local/bin/scodex", cloud_init)
+        self.assertIn("/usr/local/bin/envr-codex-supervisor", cloud_init)
+        self.assertIn("envr-tmux.service", cloud_init)
+        self.assertIn("MemoryAccounting=yes", envr.TMUX_KEEPER_SERVICE)
+        self.assertIn("OOMPolicy=continue", envr.TMUX_KEEPER_SERVICE)
+        self.assertIn("ManagedOOMPreference=avoid", envr.TMUX_KEEPER_SERVICE)
+        self.assertIn("fallocate -l 4G /swapfile", cloud_init)
         self.assertIn("AAAAFIRST", cloud_init)
         self.assertIn("AAAASECOND", cloud_init)
         self.assertGreater(
@@ -510,16 +518,16 @@ class LifecycleLogicTests(unittest.TestCase):
                 {"folder": "envr", "identity": "igonna-envr"},
             )
             command = app.remote_command.call_args_list[0].args[1]
-            self.assertIn("tmux has-session -t envr-repo-envr", command)
+            self.assertIn("tmux has-session -t =envr-repo-envr", command)
             self.assertIn("tmux new-session -d -s envr-repo-envr", command)
             self.assertIn(f"-c {envr.REMOTE_ROOT}/envr", command)
             self.assertIn(
-                "tmux set-option -t envr-repo-envr mouse on",
+                'tmux set-option -t "$session_id" mouse on',
                 command,
             )
             self.assertIn("tmux set-option -g history-limit 50000", command)
             self.assertIn(
-                "exec tmux attach-session -t envr-repo-envr",
+                "exec tmux attach-session -t =envr-repo-envr",
                 command,
             )
             self.assertNotIn("codex login", command)
@@ -535,15 +543,15 @@ class LifecycleLogicTests(unittest.TestCase):
             app.sync_from_server = mock.Mock(return_value=False)
             app.connect_shell({"main_ip": "192.0.2.1"}, None)
             command = app.remote_command.call_args_list[0].args[1]
-            self.assertIn("tmux has-session -t envr-workspace", command)
+            self.assertIn("tmux has-session -t =envr-workspace", command)
             self.assertIn("tmux new-session -d -s envr-workspace", command)
             self.assertIn(f"-c {envr.REMOTE_ROOT}", command)
             self.assertIn(
-                "tmux set-option -t envr-workspace mouse on",
+                'tmux set-option -t "$session_id" mouse on',
                 command,
             )
             self.assertIn(
-                "exec tmux attach-session -t envr-workspace",
+                "exec tmux attach-session -t =envr-workspace",
                 command,
             )
             self.assertNotIn("codex login", command)
@@ -551,11 +559,15 @@ class LifecycleLogicTests(unittest.TestCase):
 
     def test_scodex_wrapper_has_only_auth_and_unsafe_resume(self) -> None:
         self.assertIn("codex login --device-auth", envr.SCODEX_SCRIPT)
+        self.assertIn("envr-codex-supervisor resume", envr.SCODEX_SCRIPT)
         self.assertIn(
-            "codex resume --dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-approvals-and-sandbox",
+            envr.CODEX_SUPERVISOR_SCRIPT,
+        )
+        self.assertIn(
+            "usage: scodex auth | scodex resume [--choose|SESSION_UUID]",
             envr.SCODEX_SCRIPT,
         )
-        self.assertIn("usage: scodex {auth|resume}", envr.SCODEX_SCRIPT)
 
     def test_remote_runtime_repairs_bubblewrap_and_scodex(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -566,6 +578,8 @@ class LifecycleLogicTests(unittest.TestCase):
             app.ensure_remote_runtime({"main_ip": "192.0.2.1"})
             script = app.remote_script.call_args.args[1]
             encoded = app.remote_script.call_args.args[2][0]
+            supervisor_encoded = app.remote_script.call_args.args[2][1]
+            service_encoded = app.remote_script.call_args.args[2][2]
             self.assertIn("command -v bwrap", script)
             self.assertIn("bubblewrap apparmor-profiles apparmor-utils", script)
             self.assertIn("VERSION_ID:-", script)
@@ -574,6 +588,68 @@ class LifecycleLogicTests(unittest.TestCase):
                 base64.b64decode(encoded).decode(),
                 envr.SCODEX_SCRIPT,
             )
+            self.assertEqual(
+                base64.b64decode(supervisor_encoded).decode(),
+                envr.CODEX_SUPERVISOR_SCRIPT,
+            )
+            self.assertEqual(
+                base64.b64decode(service_encoded).decode(),
+                envr.TMUX_KEEPER_SERVICE,
+            )
+            self.assertIn("systemctl enable envr-tmux.service", script)
+            self.assertIn("swapon --noheadings", script)
+            self.assertIn("NPM_CONFIG_PREFIX=/home/remote/.local npm install", script)
+            self.assertIn("npm config set prefix /home/remote/.local --location=user", script)
+            self.assertIn("ln -sfn /home/remote/.local/bin/codex /usr/local/bin/codex", script)
+
+    def test_current_remote_runtime_is_not_reinstalled_on_every_go(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            app.ensure_remote_runtime = mock.Mock()
+
+            app.ensure_remote_runtime_current({"id": "active"})
+
+            probe = app.remote_command.call_args.args[1]
+            self.assertIn("envr-codex-supervisor version", probe)
+            self.assertIn("systemctl is-enabled", probe)
+            app.ensure_remote_runtime.assert_not_called()
+
+    def test_runtime_upgrade_preserves_existing_codex_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = envr.Envr(root / "local")
+            app.remote_script = mock.Mock()
+            app.ensure_remote_runtime({"id": "fixture"})
+            script = app.remote_script.call_args.args[1]
+            start = script.index("if test ! -e /home/remote/.codex/config.toml")
+            end = script.index("if ! sudo swapon", start)
+            config = root / ".codex" / "config.toml"
+            config.parent.mkdir()
+            block = script[start:end].replace("/home/remote", str(root))
+            original = 'model = "custom-model"\n[projects."/some/repo"]\ntrust_level = "trusted"\n'
+            config.write_text(original)
+            subprocess.run(["bash", "-eu", "-c", block], check=True)
+            self.assertEqual(config.read_text(), original)
+            config.unlink()
+            subprocess.run(["bash", "-eu", "-c", block], check=True)
+            self.assertEqual(config.read_text(), 'cli_auth_credentials_store = "file"\n')
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+
+    def test_old_remote_runtime_is_repaired_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            instance = {"id": "active"}
+            app.remote_command = mock.Mock(
+                return_value=SimpleNamespace(returncode=1, stdout="", stderr="")
+            )
+            app.ensure_remote_runtime = mock.Mock()
+
+            app.ensure_remote_runtime_current(instance)
+
+            app.ensure_remote_runtime.assert_called_once_with(instance)
 
     def test_repository_access_is_verified_only_on_remote_vps(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1942,6 +2018,41 @@ class ResizeTests(unittest.TestCase):
                 app.ensure_resize_source_ready({"id": "old"})
             script = app.remote_script.call_args.args[1]
             self.assertIn("pgrep -u remote -af '[c]odex'", script)
+            self.assertIn("grep -v '[e]nvr-codex-supervisor'", script)
+            self.assertIn("envr-codex-supervisor armed", script)
+
+    def test_resize_quiesce_holds_tmux_lock_and_rechecks_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+
+            app.quiesce_resize_source({"id": "old"})
+
+            script = app.remote_script.call_args.args[1]
+            self.assertIn("flock -x 9", script)
+            self.assertIn("grep -v '[e]nvr-codex-supervisor'", script)
+            self.assertLess(
+                script.index("envr-codex-supervisor armed"),
+                script.index("systemctl stop envr-tmux.service"),
+            )
+            self.assertLess(
+                script.index("systemctl stop envr-tmux.service"),
+                script.index("tmux kill-server"),
+            )
+
+    def test_resize_quiesce_does_not_stop_tmux_if_codex_started(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock(
+                return_value=SimpleNamespace(
+                    returncode=20, stdout="CODEX_RUNNING\n", stderr=""
+                )
+            )
+
+            with self.assertRaisesRegex(envr.EnvrError, "Codex started"):
+                app.quiesce_resize_source({"id": "old"})
 
     def test_resize_marker_records_role_and_target_size(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2168,6 +2279,7 @@ class ResizeTests(unittest.TestCase):
             app.set_resize_marker = mock.Mock()
             app.create_instance = mock.Mock(return_value=target)
             app.ensure_resize_capacity = mock.Mock()
+            app.quiesce_resize_source = mock.Mock()
             app.migration_key_and_host = mock.Mock(
                 return_value=(
                     "ssh-ed25519 AAAATARGET target",
@@ -2246,6 +2358,7 @@ class ResizeTests(unittest.TestCase):
             app.set_resize_marker = mock.Mock()
             app.create_instance = mock.Mock(return_value=target)
             app.ensure_resize_capacity = mock.Mock()
+            app.quiesce_resize_source = mock.Mock()
             app.migration_key_and_host = mock.Mock(
                 return_value=(
                     "ssh-ed25519 AAAATARGET target",
@@ -2344,6 +2457,381 @@ class ResizeTests(unittest.TestCase):
                 app.destroy()
 
             app.delete_instance.assert_not_called()
+
+
+class RemoteSupervisorTests(unittest.TestCase):
+    SLOT = "11111111-1111-4111-8111-111111111111"
+    THREAD_ONE = "22222222-2222-4222-8222-222222222222"
+    THREAD_TWO = "33333333-3333-4333-8333-333333333333"
+
+    def test_recovery_never_overwrites_a_reused_live_pane(self) -> None:
+        namespace = {"__name__": "supervisor_test", "__file__": "supervisor"}
+        exec(compile(envr.CODEX_SUPERVISOR_SCRIPT, "supervisor", "exec"), namespace)
+        tmux = mock.Mock(side_effect=[
+            SimpleNamespace(returncode=0, stdout="%1\n"),
+            SimpleNamespace(returncode=0, stdout="different-slot\n"),
+            SimpleNamespace(returncode=0, stdout=""),
+            SimpleNamespace(returncode=0, stdout="%2\n"),
+            SimpleNamespace(returncode=0, stdout=""),
+        ])
+        namespace["run_tmux"] = tmux
+        self.assertTrue(namespace["restore_pane"]({
+            "slot": self.SLOT, "pane": "%1", "cwd": "/home/remote/envr/bet1",
+            "tmux_session": "envr-repo-bet1",
+        }))
+        self.assertFalse(any(call.args[0] == "respawn-pane" for call in tmux.call_args_list))
+
+    def test_resize_marker_prevents_starting_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(temporary, "#!/bin/sh\nexit 0\n")
+            marker = Path(environment["ENVR_SUPERVISION_ROOT"]).parent / "resize-in-progress"
+            marker.touch()
+            completed = subprocess.run(
+                [str(supervisor), "resume", self.THREAD_ONE], cwd=repository,
+                env=environment, capture_output=True, text=True, timeout=10,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("resize is in progress", completed.stderr)
+            self.assertFalse(Path(environment["ENVR_CODEX_LOG"]).exists())
+
+    def test_conversation_lock_prevents_duplicate_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(temporary, "#!/bin/sh\nexit 0\n")
+            lock_path = Path(environment["ENVR_SUPERVISION_ROOT"]) / f"thread-{self.THREAD_ONE}.lock"
+            with lock_path.open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                completed = subprocess.run(
+                    [str(supervisor), "resume", self.THREAD_ONE], cwd=repository,
+                    env=environment, capture_output=True, text=True, timeout=10,
+                )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("already running", completed.stderr)
+            self.assertFalse(Path(environment["ENVR_CODEX_LOG"]).exists())
+
+    def fixture(self, temporary: str, codex_script: str) -> tuple[Path, Path, dict[str, str]]:
+        root = Path(temporary).resolve()
+        remote_home = root / "home" / "remote"
+        repository = remote_home / "envr" / "bet1"
+        codex_home = remote_home / ".codex"
+        supervision = remote_home / ".config" / "envr" / "supervision"
+        repository.mkdir(parents=True)
+        codex_home.mkdir()
+        supervision.mkdir(parents=True)
+
+        database = sqlite3.connect(codex_home / "state_5.sqlite")
+        database.execute(
+            "CREATE TABLE threads (id TEXT, cwd TEXT, title TEXT, "
+            "updated_at_ms INTEGER, archived INTEGER)"
+        )
+        database.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, 0)",
+            (self.THREAD_ONE, str(repository), "Primary work", 200),
+        )
+        database.commit()
+        database.close()
+
+        supervisor = root / "envr-codex-supervisor"
+        supervisor.write_text(envr.CODEX_SUPERVISOR_SCRIPT, encoding="utf-8")
+        supervisor.chmod(0o755)
+        tmux_log = root / "tmux.log"
+        fake_tmux = root / "tmux"
+        fake_tmux.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$ENVR_TMUX_LOG\"\n"
+            "case \"$*\" in\n"
+            "  *session_name*) echo envr-repo-bet1; exit 0;;\n"
+            "  *window_index*) echo 0; exit 0;;\n"
+            "esac\n"
+            "case \"$1\" in\n"
+            f"  show-options) echo {self.SLOT}; exit 0;;\n"
+            "  set-option) exit 0;;\n"
+            "  list-panes) exit 1;;\n"
+            "  has-session) exit 1;;\n"
+            "  new-session|new-window) echo %9; exit 0;;\n"
+            "  *) exit 0;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_tmux.chmod(0o755)
+        codex_log = root / "codex.log"
+        fake_codex = root / "codex"
+        fake_codex.write_text(codex_script, encoding="utf-8")
+        fake_codex.chmod(0o755)
+        memory_events = root / "memory.events"
+        memory_events.write_text("oom_kill 0\n", encoding="utf-8")
+        environment = {
+            **os.environ,
+            "ENVR_REMOTE_HOME": str(remote_home),
+            "ENVR_CODEX_HOME": str(codex_home),
+            "ENVR_SUPERVISION_ROOT": str(supervision),
+            "ENVR_TMUX": str(fake_tmux),
+            "ENVR_TMUX_LOG": str(tmux_log),
+            "ENVR_CODEX": str(fake_codex),
+            "ENVR_CODEX_LOG": str(codex_log),
+            "ENVR_MEMORY_EVENTS": str(memory_events),
+            "ENVR_TEST_BOOT_ID": "boot-one",
+            "TMUX_PANE": "%1",
+        }
+        return supervisor, repository, environment
+
+    def state(self, environment: dict[str, str]) -> dict[str, object]:
+        path = Path(environment["ENVR_SUPERVISION_ROOT"]) / f"{self.SLOT}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_normal_exit_disarms_and_uses_exact_uuid_without_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ENVR_CODEX_LOG\"\nexit 0\n",
+            )
+            completed = subprocess.run(
+                [str(supervisor), "resume", self.THREAD_ONE],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            state = self.state(environment)
+            self.assertEqual(state["desired"], "stopped")
+            invocation = Path(environment["ENVR_CODEX_LOG"]).read_text()
+            self.assertIn(f"-C {repository} {self.THREAD_ONE}", invocation)
+            self.assertIn("--dangerously-bypass-approvals-and-sandbox", invocation)
+            self.assertNotIn("--last", invocation)
+            self.assertNotIn("/goal", invocation)
+
+    def test_positive_oom_evidence_restarts_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$ENVR_CODEX_LOG\"\n"
+                "count=$(wc -l < \"$ENVR_CODEX_LOG\")\n"
+                "if [ \"$count\" -eq 1 ]; then\n"
+                "  printf 'oom_kill 1\\n' > \"$ENVR_MEMORY_EVENTS\"\n"
+                "  kill -9 $$\n"
+                "fi\n"
+                "exit 0\n",
+            )
+            completed = subprocess.run(
+                [str(supervisor), "resume", self.THREAD_ONE],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            invocations = Path(environment["ENVR_CODEX_LOG"]).read_text().splitlines()
+            self.assertEqual(len(invocations), 2)
+            self.assertTrue(all(self.THREAD_ONE in line for line in invocations))
+            self.assertEqual(self.state(environment)["desired"], "stopped")
+
+    def test_sigkill_without_oom_does_not_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ENVR_CODEX_LOG\"\nkill -9 $$\n",
+            )
+            completed = subprocess.run(
+                [str(supervisor), "resume", self.THREAD_ONE],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(
+                len(Path(environment["ENVR_CODEX_LOG"]).read_text().splitlines()),
+                1,
+            )
+            self.assertEqual(self.state(environment)["desired"], "stopped")
+
+    def test_repeated_oom_recovery_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$ENVR_CODEX_LOG\"\n"
+                "count=$(wc -l < \"$ENVR_CODEX_LOG\")\n"
+                "printf 'oom_kill %s\\n' \"$count\" > \"$ENVR_MEMORY_EVENTS\"\n"
+                "kill -9 $$\n",
+            )
+            completed = subprocess.run(
+                [str(supervisor), "resume", self.THREAD_ONE],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 137)
+            self.assertEqual(
+                len(Path(environment["ENVR_CODEX_LOG"]).read_text().splitlines()),
+                4,
+            )
+            state = self.state(environment)
+            self.assertEqual(state["desired"], "stopped")
+            self.assertEqual(state["reason"], "repeated OOM")
+
+    def test_explicit_choose_lists_repository_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ENVR_CODEX_LOG\"\nexit 0\n",
+            )
+            database = sqlite3.connect(Path(environment["ENVR_CODEX_HOME"]) / "state_5.sqlite")
+            database.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, 0)",
+                (self.THREAD_TWO, str(repository), "Second work", 100),
+            )
+            database.commit()
+            database.close()
+            completed = subprocess.run(
+                [str(supervisor), "resume", "--choose"],
+                cwd=repository,
+                env=environment,
+                input="2\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("Codex sessions in this repository", completed.stdout)
+            invocation = Path(environment["ENVR_CODEX_LOG"]).read_text()
+            self.assertIn(self.THREAD_TWO, invocation)
+            self.assertEqual(self.state(environment)["thread_id"], self.THREAD_TWO)
+
+    def test_existing_pane_binding_is_reused_without_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ENVR_CODEX_LOG\"\nexit 0\n",
+            )
+            first = subprocess.run(
+                [str(supervisor), "resume", self.THREAD_ONE],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            second = subprocess.run(
+                [str(supervisor), "resume"],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertNotIn("Choose", second.stdout)
+            invocations = Path(environment["ENVR_CODEX_LOG"]).read_text().splitlines()
+            self.assertEqual(len(invocations), 2)
+            self.assertTrue(all(self.THREAD_ONE in line for line in invocations))
+
+    def test_default_resume_excludes_newer_subagents_and_needs_no_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ENVR_CODEX_LOG\"\nexit 0\n",
+            )
+            database = sqlite3.connect(Path(environment["ENVR_CODEX_HOME"]) / "state_5.sqlite")
+            database.execute("ALTER TABLE threads ADD COLUMN source TEXT DEFAULT 'cli'")
+            database.execute("INSERT INTO threads VALUES (?, ?, ?, ?, 0, ?)", (
+                self.THREAD_TWO, str(repository), "Worker thread", 9999,
+                json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": self.THREAD_ONE}}}),
+            ))
+            database.commit()
+            database.close()
+            result = subprocess.run(
+                [str(supervisor), "resume"], cwd=repository, env=environment,
+                input="", text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Choose", result.stdout)
+            self.assertEqual(self.state(environment)["thread_id"], self.THREAD_ONE)
+
+    def test_orphan_from_previous_boot_recreates_named_tmux_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\nexit 0\n",
+            )
+            state_path = Path(environment["ENVR_SUPERVISION_ROOT"]) / f"{self.SLOT}.json"
+            state_path.write_text(json.dumps({
+                "schema": 1,
+                "slot": self.SLOT,
+                "thread_id": self.THREAD_ONE,
+                "cwd": str(repository),
+                "tmux_session": "envr-repo-bet1",
+                "tmux_window": "0",
+                "pane": "%1",
+                "desired": "running",
+                "status": "running",
+                "boot_id": "old-boot",
+                "oom_baseline": 0,
+            }), encoding="utf-8")
+            completed = subprocess.run(
+                [str(supervisor), "inspect-once"],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            tmux_calls = Path(environment["ENVR_TMUX_LOG"]).read_text()
+            self.assertIn("new-session", tmux_calls)
+            self.assertIn("envr-repo-bet1", tmux_calls)
+            self.assertIn(f"recover {self.SLOT}", tmux_calls)
+            self.assertEqual(self.state(environment)["status"], "recovering")
+
+    def test_orphan_without_oom_is_disarmed_instead_of_restarted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\nexit 0\n",
+            )
+            state_path = Path(environment["ENVR_SUPERVISION_ROOT"]) / f"{self.SLOT}.json"
+            state_path.write_text(json.dumps({
+                "schema": 1,
+                "slot": self.SLOT,
+                "thread_id": self.THREAD_ONE,
+                "cwd": str(repository),
+                "tmux_session": "envr-repo-bet1",
+                "tmux_window": "0",
+                "pane": "%1",
+                "desired": "running",
+                "status": "running",
+                "boot_id": "boot-one",
+                "oom_baseline": 0,
+            }), encoding="utf-8")
+            completed = subprocess.run(
+                [str(supervisor), "inspect-once"],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            state = self.state(environment)
+            self.assertEqual(state["desired"], "stopped")
+            self.assertEqual(state["reason"], "process ended without OOM")
+            tmux_log = Path(environment["ENVR_TMUX_LOG"])
+            tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
+            self.assertNotIn("new-session", tmux_calls)
 
 
 class ParserTests(unittest.TestCase):
@@ -3525,6 +4013,7 @@ class ProviderTests(unittest.TestCase):
             app.set_resize_marker = mock.Mock()
             app.create_instance = mock.Mock(return_value=target)
             app.ensure_resize_capacity = mock.Mock()
+            app.quiesce_resize_source = mock.Mock()
             app.migration_key_and_host = mock.Mock(return_value=("public", "host"))
             app.prepare_resize_excludes = mock.Mock()
             app.authorize_resize_target = mock.Mock()
