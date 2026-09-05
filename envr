@@ -33,8 +33,31 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.15.2"
+VERSION = "0.15.5"
 SCHEMA_VERSION = 1
+
+# Run by cloud-init and by narrow recovery of an interrupted package install.
+# Never delete APT lock files or kill the process that owns them.
+PACKAGE_INSTALL_SCRIPT = r'''#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+exec 9>/var/lock/envr-packages.lock
+flock -w 900 9
+packages=(git curl ca-certificates build-essential tmux jq rsync unzip nodejs npm
+          python3 util-linux bubblewrap apparmor-profiles apparmor-utils docker.io
+          ufw fail2ban unattended-upgrades)
+for attempt in 1 2 3; do
+    if apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 update &&
+       apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 \
+           -o Dpkg::Options::=--force-confold install -y "${packages[@]}"; then
+        touch /var/lib/envr-packages-ready
+        exit 0
+    fi
+    echo "envr: package installation attempt $attempt failed" >&2
+    if [ "$attempt" -lt 3 ]; then sleep 10; fi
+done
+exit 1
+'''
 API_BASE = "https://api.vultr.com/v2"
 AKAMAI_API_BASE = "https://api.linode.com/v4"
 UPCLOUD_API_BASE = "https://api.upcloud.com/1.3"
@@ -206,7 +229,7 @@ TMUX = os.environ.get("ENVR_TMUX", "tmux")
 CODEX = os.environ.get("ENVR_CODEX", "codex")
 os.environ["NPM_CONFIG_PREFIX"] = str(REMOTE_HOME / ".local")
 os.environ["PATH"] = str(REMOTE_HOME / ".local/bin") + os.pathsep + os.environ.get("PATH", "")
-PROTOCOL_VERSION = "4"
+PROTOCOL_VERSION = "5"
 UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -420,7 +443,7 @@ def active_thread_ids(except_slot: str) -> set[str]:
     return identifiers
 
 
-def choose_thread(slot: str, cwd: str, previous: dict | None, arguments: list[str]) -> str:
+def choose_thread(slot: str, cwd: str, previous: dict | None, arguments: list[str]) -> str | None:
     choose = arguments == ["--choose"]
     explicit = arguments[0] if len(arguments) == 1 and UUID.fullmatch(arguments[0]) else None
     if arguments and not choose and explicit is None:
@@ -438,6 +461,8 @@ def choose_thread(slot: str, cwd: str, previous: dict | None, arguments: list[st
             raise RuntimeError("that Codex session is already supervised in another pane")
         return bound
     candidates = sqlite_candidates(cwd) or rollout_candidates(cwd)
+    if not candidates:
+        return None
     used = active_thread_ids(slot)
     candidates = [item for item in candidates if item["id"] not in used]
     if not candidates:
@@ -587,6 +612,14 @@ def resume(arguments: list[str]) -> int:
             fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
             if (STATE_ROOT.parent / "resize-in-progress").exists():
                 raise RuntimeError("resize is in progress; reconnect after it finishes")
+            if thread_id is None:
+                # A new CLI conversation has no known UUID yet. Never guess a
+                # different conversation for recovery or claim it is supervised.
+                print("Starting a new conversation. Automatic recovery applies on a later resume.", flush=True)
+                try:
+                    os.execvp(CODEX, [CODEX, "--dangerously-bypass-approvals-and-sandbox", "-C", cwd])
+                except OSError as error:
+                    raise RuntimeError(f"could not start Codex: {error}") from error
             state.update({"desired": "running", "status": "starting",
                           "boot_id": boot_id(), "oom_baseline": oom_kills()})
             save(state)
@@ -4585,10 +4618,11 @@ class Envr:
         keeper_service_encoded = base64.b64encode(
             TMUX_KEEPER_SERVICE.encode()
         ).decode()
+        packages_content = "\n".join("      " + line for line in PACKAGE_INSTALL_SCRIPT.splitlines())
         return f"""#cloud-config
 hostname: envr
 manage_etc_hosts: true
-package_update: true
+package_update: false
 package_upgrade: false
 ssh_pwauth: true
 disable_root: false
@@ -4602,27 +4636,11 @@ users:
     lock_passwd: true
     ssh_authorized_keys:
 {authorized_keys}
-packages:
-  - git
-  - curl
-  - ca-certificates
-  - build-essential
-  - tmux
-  - jq
-  - rsync
-  - unzip
-  - nodejs
-  - npm
-  - python3
-  - util-linux
-  - bubblewrap
-  - apparmor-profiles
-  - apparmor-utils
-  - docker.io
-  - ufw
-  - fail2ban
-  - unattended-upgrades
 write_files:
+  - path: /usr/local/lib/envr/install-packages
+    permissions: '0700'
+    content: |
+{packages_content}
   - path: /etc/ssh/sshd_config.d/00-envr.conf
     permissions: '0644'
     content: |
@@ -4650,6 +4668,8 @@ write_files:
     encoding: b64
     content: {keeper_service_encoded}
 runcmd:
+  - set -e
+  - [bash, /usr/local/lib/envr/install-packages]
   - [bash, -lc, "usermod -aG docker {REMOTE_USER}"]
   - [bash, -lc, "install -d -m 700 -o {REMOTE_USER} -g {REMOTE_USER} {REMOTE_HOME}/.ssh {REMOTE_HOME}/.ssh/envr {REMOTE_HOME}/.codex {REMOTE_CONFIG_ROOT}"]
   - [bash, -lc, {codex_config_command}]
@@ -5395,6 +5415,9 @@ done
             "sudo cloud-init status --wait >/dev/null 2>&1 || true; "
             "if test -f /var/lib/envr-ready && command -v codex >/dev/null; "
             "then exit 0; fi; "
+            "if test -f /usr/local/lib/envr/install-packages && "
+            "! test -f /var/lib/envr-packages-ready; then "
+            "echo 'envr: package setup incomplete' >&2; fi; "
             "sudo cloud-init status --long >&2; exit 1",
             check=False,
             capture=True,
@@ -5402,7 +5425,33 @@ done
         )
         if result.returncode != 0:
             detail = result.stderr.strip() if result.stderr else "cloud-init failed"
+            if "Could not get APT lock" in detail or "envr: package setup incomplete" in detail:
+                self.recover_initial_packages(instance)
+                return
             raise EnvrError(detail)
+
+    def recover_initial_packages(self, instance: dict[str, Any]) -> None:
+        """Repair failed initial provisioning, never an established workspace."""
+        print("Recovering initial package setup on the same VPS...")
+        encoded = base64.b64encode(PACKAGE_INSTALL_SCRIPT.encode()).decode()
+        script = f'''set -euo pipefail
+sudo -n bash -s -- "$1" <<'ROOT'
+set -euo pipefail
+test ! -e {shlex.quote(REMOTE_INITIAL_READY)} || {{ echo 'Refusing to replay setup on an initialized VPS' >&2; exit 1; }}
+if pgrep -u remote -x codex >/dev/null; then echo 'Codex is running; refusing setup replay' >&2; exit 1; fi
+test -s /var/lib/cloud/instance/scripts/runcmd
+temporary=$(mktemp /tmp/envr-packages.XXXXXX)
+trap 'rm -f -- "$temporary"' EXIT
+printf '%s' "$1" | base64 -d > "$temporary"
+bash "$temporary"
+# Replay only envr's initial setup, not provider/vendor scripts or cloud-init clean.
+bash -e /var/lib/cloud/instance/scripts/runcmd
+for tool in git tmux npm codex docker; do command -v "$tool" >/dev/null; done
+systemctl is-active --quiet docker.service fail2ban.service envr-tmux.service
+test -e /var/lib/envr-ready
+ROOT
+'''
+        self.remote_script(instance, script, (encoded,), timeout=1800)
 
     def scp_options(
         self, instance: dict[str, Any] | None = None
@@ -5531,7 +5580,7 @@ fi
     def ensure_remote_runtime_current(self, instance: dict[str, Any]) -> None:
         result = self.remote_command(
             instance,
-            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 4 "
+            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 5 "
             "&& test -x /home/remote/.local/bin/codex "
             "&& systemctl is-enabled --quiet envr-tmux.service",
             check=False,
@@ -6077,6 +6126,8 @@ trap - EXIT
             quiet=True,
             timeout=15,
         )
+        if result.returncode not in {0, 1}:
+            raise EnvrError("Could not verify VPS setup over SSH; retry the connection. This does not mean setup is incomplete.")
         return result.returncode == 0
 
     def require_initial_setup_complete(self, instance: dict[str, Any]) -> None:
@@ -6217,7 +6268,10 @@ trap - EXIT
             print("\nWorkspaces")
             for index, name in enumerate(names, 1):
                 print(f"  {index}. {name}")
-            choice = input("Number to connect, [A] add, [E] edit, [R] remove, [Q] quit: ").strip().lower()
+            print("  A. Add workspace\n  Q. Quit")
+            if instance is not None:
+                print("  W. Workspace root")
+            choice = input("Choose: ").strip().lower()
             if choice == "w" and instance is not None:
                 return None
             if choice in {"", "q"}:
@@ -6227,40 +6281,47 @@ trap - EXIT
             if choice == "a":
                 name = input("Workspace name: ").strip()
                 if name in records:
-                    print("Already configured; choose Edit to change it.")
-                    continue
-                record = self.add_workspace(instance, name)
-                if record and instance is not None:
-                    return record["folder"]
-            elif choice == "e":
-                name = input("Workspace to edit: ").strip()
-                record = records.get(name)
-                if not record:
-                    print("Workspace not found.")
-                    continue
-                if record.get("kind") == "folder":
-                    self.add_workspace(None, name)
+                    print("Already configured; select it to edit.")
                 else:
-                    url = input(f"Repository SSH URL [{record['url']}]: ").strip() or record["url"]
-                    if parse_repository_url(url)["folder"] != name:
-                        print("That URL has a different folder name; use Add for a different repository.")
+                    self.add_workspace(None, name)
+                continue
+            if not choice.isdigit() or not 1 <= int(choice) <= len(names):
+                print("Choose a listed number, A, or Q.")
+                continue
+            name = names[int(choice) - 1]
+            while True:
+                record = self.repositories()["repositories"].get(name)
+                if record is None:
+                    break
+                print(f"\n{name}\n  C. Connect\n  E. Edit\n  R. Remove configuration\n  B. Back")
+                action = input("Choose: ").strip().lower()
+                if action in {"", "b"}:
+                    break
+                if action == "c":
+                    return name
+                if action == "e":
+                    if record.get("kind") == "folder":
+                        self.add_workspace(None, name)
+                    else:
+                        url = input(f"Repository SSH URL [{record['url']}]: ").strip() or record["url"]
+                        if parse_repository_url(url)["folder"] != name:
+                            print("That URL has a different folder name; use Add for a different repository.")
+                            continue
+                        self.configure_git(url=url, pending=True)
+                elif action == "r":
+                    if not prompt_yes_no(f"Remove configuration for {name}? Files and sessions stay."):
                         continue
-                    self.configure_git(url=url, pending=True)
-            elif choice == "r":
-                name = input("Entry to remove (files and tmux remain): ").strip()
-                if name not in records or not prompt_yes_no(f"Forget {name}?"):
-                    continue
-                manifest = self.repositories()
-                manifest["repositories"].pop(name, None)
-                removed = {"kind": "removed", "folder": name}
-                manifest.setdefault("pending", {})[name] = removed
-                self.save_repositories(manifest)
-                if instance is not None:
-                    self.flush_workspace_changes(instance, None)
-                    self.set_last_workspace(instance, None)
-                print("Entry removed; remote files and sessions untouched.")
-            elif choice.isdigit() and 1 <= int(choice) <= len(names):
-                return names[int(choice) - 1]
+                    manifest = self.repositories()
+                    manifest["repositories"].pop(name, None)
+                    manifest.setdefault("pending", {})[name] = {"kind": "removed", "folder": name}
+                    self.save_repositories(manifest)
+                    if instance is not None:
+                        self.flush_workspace_changes(instance, None)
+                        self.set_last_workspace(instance, None)
+                    print("Configuration removed; files and sessions untouched.")
+                    break
+                else:
+                    print("Choose C, E, R, or B.")
 
     def machine_menu(self) -> None:
         while True:
@@ -6433,7 +6494,7 @@ try:
     enabled = subprocess.run(['systemctl', 'is-enabled', '--quiet', 'envr-tmux.service']).returncode == 0
 except (OSError, subprocess.CalledProcessError):
     sys.exit(10)
-if version != '4' or not enabled:
+if version != '5' or not enabled:
     sys.exit(10)
 folder = request['folder']
 if folder is None:

@@ -2513,6 +2513,26 @@ class RemoteSupervisorTests(unittest.TestCase):
             self.assertIn("resize is in progress", completed.stderr)
             self.assertFalse(Path(environment["ENVR_CODEX_LOG"]).exists())
 
+    def test_empty_history_starts_new_with_bypass_in_current_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(temporary, '#!/bin/sh\nprintf "%s\\n" "$@" > "$ENVR_CODEX_LOG"\n')
+            with sqlite3.connect(Path(environment["ENVR_CODEX_HOME"]) / "state_5.sqlite") as database:
+                database.execute("DELETE FROM threads")
+            result = subprocess.run([str(supervisor), "resume"], cwd=repository, env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(Path(environment["ENVR_CODEX_LOG"]).read_text().splitlines(), ["--dangerously-bypass-approvals-and-sandbox", "-C", str(repository)])
+            self.assertIn("Starting a new conversation", result.stdout)
+            self.assertFalse(list(Path(environment["ENVR_SUPERVISION_ROOT"]).glob("*.json")))
+
+    def test_explicit_missing_thread_does_not_start_new(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(temporary, '#!/bin/sh\ntouch "$ENVR_CODEX_LOG"\n')
+            with sqlite3.connect(Path(environment["ENVR_CODEX_HOME"]) / "state_5.sqlite") as database:
+                database.execute("DELETE FROM threads")
+            result = subprocess.run([str(supervisor), "resume", self.THREAD_ONE], cwd=repository, env=environment, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(Path(environment["ENVR_CODEX_LOG"]).exists())
+
     def test_conversation_lock_prevents_duplicate_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             supervisor, repository, environment = self.fixture(temporary, "#!/bin/sh\nexit 0\n")

@@ -134,7 +134,7 @@ class InterfaceTests(unittest.TestCase):
         self.app.sync_from_server = mock.Mock()
         self.app.update_remote_manifest = mock.Mock()
         self.app.set_last_workspace = mock.Mock()
-        with mock.patch("builtins.input", side_effect=["r", "scratch", "w"]), mock.patch.object(envr, "prompt_yes_no", return_value=True):
+        with mock.patch("builtins.input", side_effect=["1", "r", "w"]), mock.patch.object(envr, "prompt_yes_no", return_value=True):
             self.assertIsNone(self.app.workspace_picker(self.host))
         self.app.update_remote_manifest.assert_called_once_with(self.host, {"kind": "removed", "folder": "scratch"})
         self.app.remote_command.assert_not_called()
@@ -165,7 +165,7 @@ class InterfaceTests(unittest.TestCase):
             argv = [value.replace("/home/remote", str(root)) for value in shlex.split(command)[1:]]
             output = io.StringIO()
             status = 0
-            with mock.patch("sys.argv", argv), contextlib.redirect_stdout(output), mock.patch("subprocess.check_output", return_value="4"), mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)):
+            with mock.patch("sys.argv", argv), contextlib.redirect_stdout(output), mock.patch("subprocess.check_output", return_value="5"), mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)):
                 try:
                     exec(compile(script, "remote-go-check", "exec"), {})
                 except SystemExit as error:
@@ -237,18 +237,63 @@ class InterfaceTests(unittest.TestCase):
 
     def test_offline_menu_removes_without_server(self):
         self.app.save_repositories({"repositories": {"notes": {"kind": "folder", "folder": "notes", "path": "/srv/notes"}}})
-        with mock.patch("builtins.input", side_effect=["r", "notes", "q"]), mock.patch.object(envr, "prompt_yes_no", return_value=True):
+        with mock.patch("builtins.input", side_effect=["1", "r", "q"]), mock.patch.object(envr, "prompt_yes_no", return_value=True):
             self.assertIsNone(self.app.workspace_picker())
         manifest = self.app.repositories()
         self.assertNotIn("notes", manifest["repositories"])
         self.assertEqual(manifest["pending"]["notes"]["kind"], "removed")
         self.app.remote_command.assert_not_called()
 
+    def test_remove_accepts_displayed_number(self):
+        self.app.save_repositories({"repositories": {"notes": {"folder": "notes"}}})
+        with mock.patch("builtins.input", side_effect=["1", "r", "q"]), mock.patch.object(envr, "prompt_yes_no", return_value=True) as confirm:
+            self.app.workspace_picker()
+        confirm.assert_called_once_with("Remove configuration for notes? Files and sessions stay.")
+        self.assertEqual(self.app.repositories()["repositories"], {})
+        self.app.remote_command.assert_not_called()
+
+    def test_select_then_back_does_not_connect(self):
+        self.app.save_repositories({"repositories": {"notes": {"folder": "notes"}}})
+        with mock.patch("builtins.input", side_effect=["1", "b", "q"]):
+            self.assertIsNone(self.app.workspace_picker())
+        self.app.remote_command.assert_not_called()
+        self.assertIn("notes", self.app.repositories()["repositories"])
+
+    def test_select_then_connect_returns_workspace(self):
+        self.app.save_repositories({"repositories": {"notes": {"folder": "notes"}}})
+        with mock.patch("builtins.input", side_effect=["1", "c"]):
+            self.assertEqual(self.app.workspace_picker(), "notes")
+        self.app.remote_command.assert_not_called()
+
+    def test_cancel_removal_stays_in_workspace_actions(self):
+        self.app.save_repositories({"repositories": {"notes": {"folder": "notes"}}})
+        with mock.patch("builtins.input", side_effect=["1", "r", "b", "q"]), mock.patch.object(envr, "prompt_yes_no", return_value=False):
+            self.assertIsNone(self.app.workspace_picker())
+        self.assertIn("notes", self.app.repositories()["repositories"])
+
+    def test_edit_accepts_displayed_number(self):
+        url = "git@github.com:owner/notes.git"
+        self.app.save_repositories({"repositories": {"notes": {"url": url}}})
+        self.app.configure_git = mock.Mock()
+        with mock.patch("builtins.input", side_effect=["1", "e", "", "b", "q"]):
+            self.app.workspace_picker()
+        self.app.configure_git.assert_called_once_with(url=url, pending=True)
+
+    def test_invalid_removal_is_not_silently_ignored(self):
+        with mock.patch("builtins.input", side_effect=["99", "q"]), contextlib.redirect_stdout(output := io.StringIO()):
+            self.app.workspace_picker()
+        self.assertIn("Choose a listed number", output.getvalue())
+
+    def test_network_failure_is_not_misreported_as_incomplete_setup(self):
+        self.app.remote_command.return_value = SimpleNamespace(returncode=255)
+        with self.assertRaisesRegex(envr.EnvrError, "Could not verify VPS setup over SSH"):
+            self.app.initial_setup_complete(self.host)
+
     def test_offline_edit_git_does_not_connect(self):
         url = "git@github.com:owner/project.git"
         self.app.save_repositories({"repositories": {"project": {"url": url}}})
         self.app.configure_git = mock.Mock(return_value="project")
-        with mock.patch("builtins.input", side_effect=["e", "project", "", "q"]):
+        with mock.patch("builtins.input", side_effect=["1", "e", "", "b", "q"]):
             self.app.workspace_picker()
         self.app.configure_git.assert_called_once_with(url=url, pending=True)
         self.app.remote_command.assert_not_called()

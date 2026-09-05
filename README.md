@@ -86,7 +86,11 @@ scodex resume
 
 `scodex auth` starts device authentication. `scodex resume` resumes Codex with
 approvals and sandboxing explicitly bypassed; use it only because this VPS is
-disposable and isolated for that purpose. On first use in a repository it binds
+disposable and isolated for that purpose. With no saved conversation in the
+repository, it starts a new conversation using the same bypass flag. That first
+run is not automatically recovered: exact-thread supervision begins on a later
+resume, once the conversation has a saved UUID. Explicit missing UUIDs still fail
+rather than silently starting a different conversation. On first resume it binds
 the tmux pane to the latest main interactive conversation in that repository,
 excluding subagents, and remembers its exact UUID. `scodex resume --choose`
 offers the ten most recent eligible conversations to change the binding later.
@@ -352,6 +356,12 @@ sh -n install.sh
 
 ## Slow-network behavior
 
+Initial package installation waits for APT locks and retries up to three times.
+Bootstrap stops on failure instead of continuing with missing tools. A known
+initial APT-lock failure can be recovered on the same VPS; initialized machines
+and running Codex sessions are protected from setup replay. Recovery does not
+rerun provider vendor scripts or erase cloud-init's historical failure logs.
+
 For an existing, ready workspace, `go` checks readiness, migration state,
 runtime, and the workspace in one read-only SSH request. Saving the selected
 workspace happens in the tmux attachment request. Missing setup or workspaces
@@ -363,7 +373,8 @@ First-time Git setup also batches key permissions and known-host-file preparatio
 ## Workspace entries
 
 `envr go --choose` opens local workspace configuration, even without a VPS:
-add, edit, remove, or select an entry to connect. Configuration does not access
+select a workspace number, then Connect, Edit, Remove configuration, or Back.
+Add and Quit are on the workspace list. Configuration does not access
 Git hosts or a cloud API. Pending local edits survive synchronization; Git edits
 are applied when that repository is opened, without pulling or pushing project code.
 Removals and folder mappings are sent on the next successful connection.
