@@ -75,4 +75,4 @@ case ":${PATH}:" in
 esac
 
 echo "Installed envr to $target_dir/envr"
-echo "Run: envr up 4"
+echo "Run: envr machine"

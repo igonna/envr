@@ -13,16 +13,11 @@ DigitalOcean and Akamai Cloud are contract-tested against current official APIs.
 ## Interface
 
 ```bash
-envr git
-envr relay
-envr cloud
-envr up 4
-envr go
-envr go repository-folder
-envr resize
+envr machine              # create, migrate, destroy, provider credentials
+envr go [workspace]       # connect; add unknown workspaces interactively
+envr go --choose          # pick, add, or remove entries
 envr status
-envr port-open 443
-envr destroy
+envr relay
 ```
 
 All configured cloud accounts together manage at most one `envr` VPS. Multiple repositories and
@@ -31,25 +26,21 @@ VPS is authoritative for repository configuration and Codex authentication.
 
 ## Intended workflow
 
-Configure a repository once, on any device:
-
-```bash
-envr git
-```
-
-This stores the repository configuration and dedicated key locally but does
-not contact the Git host. Clone and access verification happen only from the
-disposable VPS during the first `envr go repository-folder`.
+Create a machine first, then run `envr go project`. For an unknown name,
+choose Git repository or remote folder. Git configuration asks for its SSH URL,
+key, and author identity; the saved name is deduced from the URL. Access is
+verified only from the VPS when cloning, never from your client device.
 
 Create the VPS once:
 
 ```bash
-envr up 4
+envr machine
 ```
 
-`up` performs initial bootstrap and exits. If setup was interrupted, repeating
-the same command resumes that VPS. Once it is healthy, `up` refuses and points
-to `go` or `resize`; it never becomes a second connection or resizing path.
+`envr machine` offers creation or migration, destruction, and provider credentials.
+Creation asks for a provider and a live configuration, then bootstraps and exits.
+An interrupted setup is resumed on the same VPS. Migration retains the existing
+transactional transfer and validation checks; destruction still asks for confirmation.
 
 Connect afterward:
 
@@ -84,7 +75,7 @@ envr-repo-REPOSITORY_FOLDER
 does not repeat bootstrap or Git-host verification for an existing repository,
 and uses cloud APIs only as a fallback. If the selected repository is absent,
 that one call uploads its configured key, clones, verifies, and attaches. If no
-VPS exists, it tells you to run `envr up RAM`.
+VPS exists, it tells you to run `envr machine`.
 
 `envr` never starts Codex automatically. Inside the remote shell:
 
@@ -126,7 +117,7 @@ installs the new device's public key and immediately reconnects key-only.
 On disconnection, the new device receives the current repository configuration,
 dedicated Git keys, and Codex auth cache from the VPS.
 
-Initial `up` establishes one strong recovery password for that
+Initial machine creation establishes one strong recovery password for that
 VPS, synchronizes it to the connected device with mode `600`, and durably
 records the IP, device key, and trusted SSH host key. An authorized device can
 show the recovery password with `envr status`; a new device enters it once,
@@ -156,10 +147,10 @@ resize validation repair these repository-local bindings when necessary.
 Configure or select a provider with one interactive command:
 
 ```bash
-envr cloud
+envr machine
 ```
 
-The selected provider is where `envr up RAM` creates a new VPS. Selecting an unconfigured provider
+The selected provider is where `envr machine` creates a new VPS. Selecting an unconfigured provider
 asks once for its API credentials, verifies them, and stores them privately. Existing
 installations remain selected as Vultr without a migration step. The same menu
 can rotate credentials or forget an unused provider locally; it refuses to forget
@@ -171,7 +162,7 @@ claim that one cloud is universally superior.
 Resize chooses its destination directly, without changing the default first:
 
 ```bash
-envr resize
+envr machine
 ```
 
 The command lists configured clouds, queries the chosen provider's live plan,
@@ -194,7 +185,7 @@ from a particular Russian network still cannot be guaranteed. Always use
 truthful identity and billing information.
 
 For UpCloud, create a Bearer API token under **Account → API Tokens** and select
-UpCloud in `envr cloud`; token values begin with `ucat_`. UpCloud uses Frankfurt,
+UpCloud in `envr machine`; token values begin with `ucat_`. UpCloud uses Frankfurt,
 Amsterdam, Warsaw, then Helsinki, reads prepaid balance and USD plan prices live,
 and deletes the boot storage and backups with the server. Current Starter plans
 are selected for 1–8 GB because they are the least expensive balanced bundled
@@ -207,16 +198,16 @@ require a quota increase.
 For Exoscale, open the portal's IAM section, create an API key (an unrestricted
 key is simplest for this disposable environment), and copy both values shown:
 the API key and the API secret. The secret is shown only once. Select Exoscale
-in `envr cloud`; it asks for both values without echoing them, validates them,
+in `envr machine`; it asks for both values without echoing them, validates them,
 and saves them together in `~/.config/envr/providers/exoscale/api` with mode
 `600`. Never paste either credential into chat. Exoscale uses Frankfurt first,
 then Munich, Vienna, and Zurich. Its reusable `envr-managed` security group is
-free and admits SSH plus ports explicitly opened with `envr port-open`.
+free and admits SSH. Additional service ports are managed manually.
 Exoscale's compute catalog does not expose prices through this API, so `status`
 shows its balance but marks per-instance price and runway unavailable.
 
 For Gcore, create one permanent API key in the portal and select Gcore in
-`envr cloud`; envr asks for the key without echoing it, validates it, and saves
+`envr machine`; envr asks for the key without echoing it, validates it, and saves
 it in `~/.config/envr/providers/gcore/api` with mode `600`. The account's one
 default project is selected automatically. Gcore uses Frankfurt, Amsterdam,
 then Warsaw, live flavor prices, a managed security group, and a 50 GB boot
@@ -270,7 +261,7 @@ Choose a cloud and move the complete working environment to one of its live
 configurations:
 
 ```bash
-envr resize
+envr machine
 ```
 
 The numbered menu shows only actual sizes available from the selected provider
@@ -293,21 +284,15 @@ rechecks that Codex is stopped, and only then pauses tmux for the final copy.
 The old VPS remains authoritative until a direct encrypted VPS-to-VPS copy
 passes checksum, repository-key, metadata, and destination-SSH validation.
 Only then is the new VPS promoted and the old one deleted. If the command is
-interrupted, rerunning `envr resize` detects the saved target size and safely
+interrupted, rerunning `envr machine` detects the saved target size and safely
 restarts an uncommitted copy or finishes an already validated promotion. `status` exposes
-an incomplete resize and `destroy` refuses to run until it is resolved. Resize
+an incomplete resize and machine destruction refuses to run until it is resolved. Resize
 then exits; `envr go` reconnects to the preserved last workspace.
-
-Open a service port when needed:
-
-```bash
-envr port-open 443
-```
 
 After committing and pushing work:
 
 ```bash
-envr destroy
+envr machine
 ```
 
 Before deletion, `envr` preserves refreshed Codex credentials and reports
@@ -364,3 +349,29 @@ python3 -m unittest discover -s tests -v
 python3 -Wall -m py_compile envr tests/test_envr.py
 sh -n install.sh
 ```
+
+## Slow-network behavior
+
+For an existing, ready workspace, `go` checks readiness, migration state,
+runtime, and the workspace in one read-only SSH request. Saving the selected
+workspace happens in the tmux attachment request. Missing setup or workspaces
+use the normal setup flow; authentication and host-key checks are not skipped.
+SSH connections remain independent between invocations/tabs. Machine availability
+checks fetch independent regions concurrently and retain the configured priority.
+First-time Git setup also batches key permissions and known-host-file preparation.
+
+## Workspace entries
+
+`envr go --choose` opens local workspace configuration, even without a VPS:
+add, edit, remove, or select an entry to connect. Configuration does not access
+Git hosts or a cloud API. Pending local edits survive synchronization; Git edits
+are applied when that repository is opened, without pulling or pushing project code.
+Removals and folder mappings are sent on the next successful connection.
+`envr go` reconnects to the last workspace, or offers a picker if none is selected.
+Removing an entry does not delete files, keys, or tmux sessions. A remote manifest
+tombstone propagates removal to other devices on synchronization.
+Plain folders default to `~/envr/NAME`; creation requires confirmation if absent.
+Paths outside `~/envr` require an explicit warning acknowledgment because they
+are not included in migration. Existing tmux sessions are attached unchanged.
+The old up, resize, git, cloud, destroy, and port-open command entry points are
+removed, with no aliases. Provider tokens remain local to each device.

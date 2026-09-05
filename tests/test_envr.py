@@ -1150,7 +1150,7 @@ class LifecycleLogicTests(unittest.TestCase):
 
             with (
                 mock.patch.object(envr, "ensure_commands"),
-                self.assertRaisesRegex(envr.EnvrError, "envr up RAM"),
+                self.assertRaisesRegex(envr.EnvrError, "envr machine"),
             ):
                 app.go("bet1")
 
@@ -1171,7 +1171,7 @@ class LifecycleLogicTests(unittest.TestCase):
             with (
                 mock.patch.object(envr, "ensure_commands"),
                 contextlib.redirect_stdout(io.StringIO()),
-                self.assertRaisesRegex(envr.EnvrError, "envr up 4"),
+                self.assertRaisesRegex(envr.EnvrError, "envr machine"),
             ):
                 app.go(None)
 
@@ -2017,8 +2017,8 @@ class ResizeTests(unittest.TestCase):
             with self.assertRaisesRegex(envr.EnvrError, "Codex is still running"):
                 app.ensure_resize_source_ready({"id": "old"})
             script = app.remote_script.call_args.args[1]
-            self.assertIn("pgrep -u remote -af '[c]odex'", script)
-            self.assertIn("grep -v '[e]nvr-codex-supervisor'", script)
+            self.assertIn("pgrep -u remote -x codex", script)
+            self.assertNotIn("grep -v", script)
             self.assertIn("envr-codex-supervisor armed", script)
 
     def test_resize_quiesce_holds_tmux_lock_and_rechecks_codex(self) -> None:
@@ -2032,7 +2032,7 @@ class ResizeTests(unittest.TestCase):
 
             script = app.remote_script.call_args.args[1]
             self.assertIn("flock -x 9", script)
-            self.assertIn("grep -v '[e]nvr-codex-supervisor'", script)
+            self.assertIn("pgrep -u remote -x codex", script)
             self.assertLess(
                 script.index("envr-codex-supervisor armed"),
                 script.index("systemctl stop envr-tmux.service"),
@@ -2041,6 +2041,25 @@ class ResizeTests(unittest.TestCase):
                 script.index("systemctl stop envr-tmux.service"),
                 script.index("tmux kill-server"),
             )
+
+    def test_resize_process_filter_excludes_its_own_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_script = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout="0"))
+            app.ensure_resize_source_ready({"id": "fixture"}, measure=False)
+            script = app.remote_script.call_args.args[1]
+            pattern = script.split("pgrep -u remote -f '", 1)[1].split("'", 1)[0]
+            lines = [
+                "grep -v [e]nvr-codex-supervisor",
+                "python3 /usr/local/bin/envr-codex-supervisor keeper",
+                "bash -c " + script.replace("\n", " "),
+                "node /usr/local/bin/codex resume",
+                "/usr/local/bin/node /home/remote/.local/lib/node_modules/@openai/codex/bin/codex.js resume",
+                "node /workspace/other.js",
+            ]
+            result = subprocess.run(["grep", "-E", pattern], input="\n".join(lines)+"\n",
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.splitlines(), lines[3:5])
 
     def test_resize_quiesce_does_not_stop_tmux_if_codex_started(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2148,7 +2167,7 @@ class ResizeTests(unittest.TestCase):
 
             with (
                 mock.patch.object(envr, "ensure_commands"),
-                mock.patch("builtins.input", side_effect=["2", "1"]),
+                mock.patch("builtins.input", side_effect=[str(envr.PROVIDER_NAMES.index("gcore") + 1), "1"]),
                 contextlib.redirect_stdout(output := io.StringIO()),
             ):
                 app.resize_menu()
@@ -2254,7 +2273,7 @@ class ResizeTests(unittest.TestCase):
             with (
                 mock.patch.object(envr, "ensure_commands"),
                 contextlib.redirect_stdout(io.StringIO()),
-                self.assertRaisesRegex(envr.EnvrError, "run envr resize"),
+                self.assertRaisesRegex(envr.EnvrError, "run envr machine"),
             ):
                 app.resize(16)
 
@@ -2433,7 +2452,7 @@ class ResizeTests(unittest.TestCase):
 
             with (
                 mock.patch.object(envr, "ensure_commands"),
-                self.assertRaisesRegex(envr.EnvrError, "run envr resize"),
+                self.assertRaisesRegex(envr.EnvrError, "run envr machine"),
             ):
                 app.resize(8)
 
@@ -2843,36 +2862,15 @@ class ParserTests(unittest.TestCase):
             envr.main(["help"])
         self.assertEqual(raised.exception.code, 0)
 
-    def test_up_requires_only_ram(self) -> None:
+    def test_only_four_commands_without_legacy_aliases(self) -> None:
         parser = envr.build_parser()
-        self.assertEqual(envr.PLAN_IDS[16], "vc2-6c-16gb")
-        self.assertEqual(envr.PLAN_IDS[12], "vhp-4c-12gb-amd")
-        self.assertEqual(envr.PLAN_IDS[24], "vhp-12c-24gb-amd")
-        self.assertEqual(envr.PLAN_IDS[32], "vc2-8c-32gb")
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["up"])
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["up", "3", "repo"])
-        namespace = parser.parse_args(["up", "4"])
-        self.assertEqual(namespace.ram, 4)
-        self.assertEqual(parser.parse_args(["up", "24"]).ram, 24)
-        self.assertEqual(parser.parse_args(["up", "12"]).ram, 12)
-        self.assertEqual(parser.parse_args(["up", "32"]).ram, 32)
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["up", "16", "repo"])
-
-    def test_port_is_parsed_as_integer(self) -> None:
-        namespace = envr.build_parser().parse_args(["port-open", "443"])
-        self.assertEqual(namespace.port, 443)
-
-    def test_resize_has_one_argument_free_interface(self) -> None:
-        parser = envr.build_parser()
-        self.assertEqual(parser.parse_args(["resize"]).command, "resize")
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["resize", "8"])
+        for command in ("machine", "go", "status", "relay"):
+            self.assertEqual(parser.parse_args([command]).command, command)
+        for command in ("up", "resize", "git", "cloud", "destroy", "port-open"):
+            with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([command])
+        self.assertTrue(parser.parse_args(["go", "--choose"]).choose)
 
     def test_go_accepts_optional_repository_without_ram(self) -> None:
         parser = envr.build_parser()
@@ -2886,24 +2884,24 @@ class MainDispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             app = mock.Mock()
             app.root = Path(temporary)
-            app.up.return_value = None
+            app.machine_menu.return_value = None
             with mock.patch.object(envr, "Envr", return_value=app):
-                result = envr.main(["up", "4"])
+                result = envr.main(["machine"])
 
             self.assertEqual(result, 0)
-            app.up.assert_called_once_with(4)
+            app.machine_menu.assert_called_once_with()
             app.connect_shell.assert_not_called()
 
     def test_successful_resize_without_attachment_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = mock.Mock()
             app.root = Path(temporary)
-            app.resize_menu.return_value = None
+            app.machine_menu.return_value = None
             with mock.patch.object(envr, "Envr", return_value=app):
-                result = envr.main(["resize"])
+                result = envr.main(["machine"])
 
             self.assertEqual(result, 0)
-            app.resize_menu.assert_called_once_with()
+            app.machine_menu.assert_called_once_with()
             app.connect_shell.assert_not_called()
 
     def test_go_is_the_only_command_that_attaches(self) -> None:
@@ -2933,8 +2931,8 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(app.configured_providers(), ["vultr"])
 
     def test_parser_exposes_one_cloud_menu(self) -> None:
-        namespace = envr.build_parser().parse_args(["cloud"])
-        self.assertEqual(namespace.command, "cloud")
+        namespace = envr.build_parser().parse_args(["machine"])
+        self.assertEqual(namespace.command, "machine")
         self.assertEqual(
             envr.PROVIDER_NAMES,
             ("vultr", "upcloud", "exoscale", "gcore", "digitalocean", "akamai"),

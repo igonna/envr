@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.14.0"
+VERSION = "0.15.2"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.vultr.com/v2"
 AKAMAI_API_BASE = "https://api.linode.com/v4"
@@ -4033,7 +4033,7 @@ class Envr:
             matches.extend((api, item) for item in self.managed_from(inventory))
             resizing.extend((api, item) for item in self.resize_from(inventory))
         if resizing:
-            raise EnvrError("resize is incomplete; run envr resize with its target RAM")
+            raise EnvrError("resize is incomplete; run envr machine")
         if len(matches) > 1:
             raise EnvrError(
                 f"conflict: {len(matches)} envr instances exist across configured clouds; "
@@ -4116,7 +4116,7 @@ class Envr:
             self._apis[provider] = api
         return api
 
-    def cloud_menu(self) -> None:
+    def cloud_menu(self) -> str | None:
         """Configure one provider and choose where the next VPS is created."""
         self.ensure_layout()
         while True:
@@ -4127,7 +4127,7 @@ class Envr:
                 marker = "*" if provider == selected else " "
                 state = "ready" if provider in configured else "not configured"
                 print(f"  {index}. {marker} {PROVIDER_LABELS[provider]:<13} {state}")
-            print("\nThe * provider is used by envr up. Resize asks each time.")
+            print("\nThe * provider is selected for creation. Migration asks each time.")
             choice = input(
                 f"Select 1-{len(PROVIDER_NAMES)}, [R] replace credentials, "
                 "[D] forget selected, [Q] quit: "
@@ -4183,13 +4183,13 @@ class Envr:
                 {"schema": SCHEMA_VERSION, "selected": provider},
             )
             print(f"{PROVIDER_LABELS[provider]} selected.")
-            return
+            return provider
 
-    def configure_git(self) -> None:
+    def configure_git(self, *, url: str | None = None, pending: bool = False) -> str:
         ensure_commands(("ssh-keygen",))
         self.ensure_layout()
 
-        parsed = parse_repository_url(input("Repository SSH URL: ").strip())
+        parsed = parse_repository_url(url if url is not None else input("Repository SSH URL: ").strip())
         repositories = self.repositories()
         records = repositories["repositories"]
         existing_folder = next(
@@ -4209,10 +4209,10 @@ class Envr:
                 print(public_path.read_text(encoding="utf-8").strip())
                 print()
             if not prompt_yes_no("Replace its key or Git identity?"):
-                return
+                return existing_folder
 
         collision = records.get(parsed["folder"])
-        if collision and collision.get("url") != parsed["url"]:
+        if collision and collision.get("url") != parsed["url"] and url is None:
             raise EnvrError(
                 f"folder {parsed['folder']!r} is already used by {collision.get('url')}"
             )
@@ -4287,16 +4287,19 @@ class Envr:
             "author_name": author_name,
             "author_email": author_email,
         }
+        if pending:
+            repositories.setdefault("pending", {})[parsed["folder"]] = records[parsed["folder"]]
         self.save_repositories(repositories)
         print(f"\nSaved repository as: {parsed['folder']}")
         print(f"Run: envr go {parsed['folder']}")
+        return parsed['folder']
 
     def repository(self, folder: str) -> dict[str, Any]:
         if not FOLDER_RE.fullmatch(folder):
             raise EnvrError(f"invalid repository folder: {folder!r}")
         record = self.repositories()["repositories"].get(folder)
         if not isinstance(record, dict):
-            raise EnvrError(f'Repository "{folder}" is not configured. Run: envr git')
+            raise EnvrError(f'Repository "{folder}" is not configured. Run: envr go {folder}')
         required = {
             "url",
             "folder",
@@ -4467,7 +4470,7 @@ class Envr:
         if len(instances) > 1:
             raise EnvrError(
                 f"conflict: {len(instances)} envr-managed instances exist; "
-                "run envr status, then envr destroy"
+                "run envr status, then envr machine"
             )
         if not instances:
             if allow_none:
@@ -4541,17 +4544,19 @@ class Envr:
         candidates = [region for region in preferred if region in advertised]
         available = []
         provider = self.provider_name(api)
+        missing = [region for region in candidates if (provider, str(region)) not in self._region_availability]
+        if missing:
+            # Fetch each region once per invocation, concurrently rather than
+            # once per region in series. Preserve configured fallback order.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(missing))) as executor:
+                futures = {region: executor.submit(api.get, f"regions/{region}/availability") for region in missing}
+                for region, future in futures.items():
+                    plans = future.result().get("available_plans")
+                    if not isinstance(plans, list):
+                        raise EnvrError(f"{self.provider_label(api)} returned invalid availability for {region}")
+                    self._region_availability[(provider, str(region))] = {str(value) for value in plans}
         for region in candidates:
             key = (provider, str(region))
-            if key not in self._region_availability:
-                response = api.get(f"regions/{region}/availability")
-                plans = response.get("available_plans")
-                if not isinstance(plans, list):
-                    raise EnvrError(
-                        f"{self.provider_label(api)} returned invalid availability "
-                        f"for {region}"
-                    )
-                self._region_availability[key] = {str(value) for value in plans}
             if plan_id in self._region_availability[key]:
                 available.append(region)
         if not available:
@@ -4785,9 +4790,9 @@ runcmd:
                 self.wait_for_cloud_init(active)
             except (EnvrError, subprocess.TimeoutExpired) as error:
                 resume_command = (
-                    f"envr up {ram_gb}"
+                    f"envr machine"
                     if label == LABEL
-                    else "envr resize"
+                    else "envr machine"
                 )
                 raise EnvrError(
                     f"VPS {instance.get('id')} was created and remains running "
@@ -5070,7 +5075,7 @@ runcmd:
                 raise EnvrError(
                     "this device key is not authorized on the running VPS; "
                     "retry interactively with the root SSH password, or run "
-                    "envr up once from an already-authorized device"
+                    "envr go once from an already-authorized device"
                 ) from None
             password = getpass.getpass(
                 f"Root SSH password for {instance.get('main_ip')}: "
@@ -5596,6 +5601,10 @@ fi
 
     @staticmethod
     def portable_repository(repository: dict[str, Any]) -> dict[str, str]:
+        if repository.get("kind") == "removed":
+            return {"kind": "removed", "folder": str(repository["folder"])}
+        if repository.get("kind") == "folder":
+            return {key: str(repository[key]) for key in ("kind", "folder", "path")}
         return {
             key: str(repository[key])
             for key in (
@@ -5701,6 +5710,17 @@ PY
         for folder, record in remote_records.items():
             if not isinstance(folder, str) or not isinstance(record, dict):
                 raise EnvrError("server repository manifest contains an invalid entry")
+            if folder in local_manifest.get("pending", {}):
+                continue
+            if record.get("kind") == "removed":
+                local_records.pop(folder, None)
+                continue
+            if record.get("kind") == "folder":
+                self.validate_workspace(record)
+                if record["folder"] != folder:
+                    raise EnvrError("server workspace has a name mismatch")
+                local_records[folder] = self.portable_repository(record)
+                continue
             parsed = parse_repository_url(str(record.get("url", "")))
             if folder != parsed["folder"] or record.get("folder") != folder:
                 raise EnvrError("server repository manifest has a folder mismatch")
@@ -5781,20 +5801,7 @@ PY
         )
         temporary_key = remote_key + f".tmp-{secrets.token_hex(4)}"
         self.copy_to_remote(instance, Path(repository["private_key"]), temporary_key)
-        self.remote_command(
-            instance,
-            f"chmod 600 {shlex.quote(temporary_key)} && "
-            f"mv -f {shlex.quote(temporary_key)} {shlex.quote(remote_key)}",
-            quiet=True,
-        )
-
         remote_known_hosts = f"{REMOTE_HOME}/.ssh/envr/known_hosts"
-        self.remote_command(
-            instance,
-            f"touch {shlex.quote(remote_known_hosts)} && "
-            f"chmod 600 {shlex.quote(remote_known_hosts)}",
-            quiet=True,
-        )
 
         script = r"""set -euo pipefail
 url=$1
@@ -5803,6 +5810,11 @@ key=$3
 known_hosts=$4
 author_name=$5
 author_email=$6
+temporary_key=$7
+chmod 600 "$temporary_key"
+mv -f -- "$temporary_key" "$key"
+touch "$known_hosts"
+chmod 600 "$known_hosts"
 root=/home/remote/envr
 target="$root/$folder"
 ssh_command="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o UserKnownHostsFile=$known_hosts"
@@ -5836,6 +5848,7 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
                 remote_known_hosts,
                 str(repository["author_name"]),
                 str(repository["author_email"]),
+                temporary_key,
             ),
             timeout=300,
         )
@@ -5854,7 +5867,7 @@ test -s "$manifest" || exit 0
 install -d -m 700 "$key_root"
 touch "$known_hosts"
 chmod 600 "$known_hosts"
-jq -r '.repositories | keys[]' "$manifest" |
+jq -r '.repositories | to_entries[] | select(.value.kind != "folder" and .value.kind != "removed") | .key' "$manifest" |
 while IFS= read -r folder; do
     case "$folder" in
         [A-Za-z0-9]*) ;;
@@ -5916,7 +5929,7 @@ trap - EXIT
 
     def refuse_incomplete_resize(self, instance: dict[str, Any]) -> None:
         if self.resize_marker_exists(instance):
-            raise EnvrError("resize is incomplete; run envr resize to resume it")
+            raise EnvrError("resize is incomplete; run envr machine to resume it")
 
     def resize_marker_state(
         self, instance: dict[str, Any]
@@ -5966,7 +5979,7 @@ trap - EXIT
             session = "envr-workspace"
         else:
             display_name = str(repository["folder"])
-            target = f"{REMOTE_ROOT}/{display_name}"
+            target = str(repository.get("path") or f"{REMOTE_ROOT}/{display_name}")
             session = f"envr-repo-{display_name}"
         exact_session = f"={session}"
         create_session = (
@@ -5974,11 +5987,22 @@ trap - EXIT
             f"tmux new-session -d -s {shlex.quote(session)} "
             f"-c {shlex.quote(target)}"
         )
+        save_workspace = (
+            f"last_tmp=$(mktemp {shlex.quote(REMOTE_CONFIG_ROOT + '/.last-workspace.XXXXXX')}) || exit; "
+            'trap \'rm -f -- "$last_tmp"\' EXIT; '
+            f"printf '%s\\n' {shlex.quote(display_name if repository else '.')} > \"$last_tmp\" && "
+            f"mv -f -- \"$last_tmp\" {shlex.quote(REMOTE_LAST_WORKSPACE)} || exit; "
+            "trap - EXIT; "
+        )
         command = (
+            f"if test -s {shlex.quote(REMOTE_RESIZE_MARKER)}; then "
+            "echo 'Migration in progress; connection cancelled.' >&2; exit 1; fi; "
+            + save_workspace +
             f"flock -x {shlex.quote(f'{REMOTE_CONFIG_ROOT}/tmux.lock')} "
             f"bash -lc {shlex.quote(create_session)}; "
-            f"session_id=$(tmux display-message -p -t {shlex.quote(exact_session)} "
+            f"session_id=$(tmux display-message -p -t {shlex.quote(exact_session + ':')} "
             "'#{session_id}') || exit; "
+            'test -n "$session_id" || exit 1; '
             'tmux set-option -t "$session_id" mouse on; '
             "tmux set-option -g history-limit 50000; "
             f"exec tmux attach-session -t {shlex.quote(exact_session)}"
@@ -6059,7 +6083,7 @@ trap - EXIT
         if not self.initial_setup_complete(instance):
             ram_gb = self.instance_ram_gb(instance)
             raise EnvrError(
-                f"initial setup is incomplete; run envr up {ram_gb} to resume it"
+                f"initial setup is incomplete; run envr machine to resume it"
             )
 
     def prepare_go_instance(
@@ -6070,10 +6094,49 @@ trap - EXIT
         explicitly_selected = folder is not None
         if folder is None:
             folder = self.last_workspace(instance)
+        if folder in {None, ""}:
+            folder = self.workspace_picker(instance)
+            explicitly_selected = True
+            if folder is None:
+                self.set_last_workspace(instance, None)
+        self.flush_workspace_changes(instance, folder)
         repository = None
         if folder is not None:
             if not FOLDER_RE.fullmatch(folder):
                 raise EnvrError(f"invalid repository folder: {folder!r}")
+            records = self.repositories()["repositories"]
+            configured = records.get(folder)
+            if configured is None:
+                existing = self.remote_command(
+                    instance, f"git -C {shlex.quote(f'{REMOTE_ROOT}/{folder}')} rev-parse --git-dir >/dev/null 2>&1",
+                    check=False, quiet=True, timeout=15,
+                )
+                if existing.returncode == 0:
+                    if explicitly_selected:
+                        self.set_last_workspace(instance, folder)
+                    self.record_successful_connection(instance)
+                    return instance, {"folder": folder}
+                self.sync_from_server(instance)
+                configured = self.repositories()["repositories"].get(folder)
+            if configured is None:
+                configured = self.add_workspace(instance, folder)
+                if configured is None:
+                    raise EnvrError("Cancelled.")
+                folder = configured["folder"]
+            if configured.get("kind") == "folder":
+                self.validate_workspace(configured)
+                path = configured["path"]
+                exists = self.remote_command(instance, f"test -d {shlex.quote(path)}", check=False, quiet=True)
+                if exists.returncode:
+                    if exists.returncode != 1:
+                        raise EnvrError("could not check remote folder")
+                    if not prompt_yes_no(f"Create remote folder {path}?"):
+                        raise EnvrError("Cancelled.")
+                    self.remote_command(instance, f"mkdir -p -- {shlex.quote(path)}")
+                self.update_remote_manifest(instance, configured)
+                self.set_last_workspace(instance, folder)
+                self.record_successful_connection(instance)
+                return instance, configured
             result = self.remote_command(
                 instance,
                 f"target={shlex.quote(f'{REMOTE_ROOT}/{folder}')}; "
@@ -6085,7 +6148,6 @@ trap - EXIT
                 timeout=15,
             )
             if result.returncode == 10:
-                self.sync_from_server(instance)
                 configured = self.repository(folder)
                 self.ensure_remote_repository(instance, configured)
                 repository = configured
@@ -6097,6 +6159,161 @@ trap - EXIT
                 self.set_last_workspace(instance, folder)
         self.record_successful_connection(instance)
         return instance, repository
+
+    @staticmethod
+    def validate_workspace(record: dict[str, Any]) -> None:
+        if not FOLDER_RE.fullmatch(str(record.get("folder", ""))):
+            raise EnvrError("invalid workspace name")
+        path = str(record.get("path", ""))
+        if not path.startswith("/") or any(ord(c) < 32 for c in path):
+            raise EnvrError("workspace path must be an absolute remote path")
+        if ".." in path.split("/"):
+            raise EnvrError("workspace path cannot contain '..'")
+
+    def add_workspace(self, instance: dict[str, Any] | None, name: str) -> dict[str, Any] | None:
+        if not FOLDER_RE.fullmatch(name):
+            raise EnvrError("invalid workspace name")
+        choice = input(f"Workspace {name}: [G] Git repository, [F] remote folder, [Q] quit: ").strip().lower()
+        if choice == "g":
+            saved = self.configure_git(pending=instance is None)
+            records = self.repositories()["repositories"]
+            return records[saved]
+        if choice != "f":
+            return None
+        path = input(f"Remote folder [{REMOTE_ROOT}/{name}]: ").strip() or f"{REMOTE_ROOT}/{name}"
+        if path == "~" or path.startswith("~/"):
+            path = REMOTE_HOME + path[1:]
+        record = {"kind": "folder", "folder": name, "path": path.rstrip("/") or "/"}
+        self.validate_workspace(record)
+        if not record["path"].startswith(REMOTE_ROOT + "/") and record["path"] != REMOTE_ROOT:
+            if not prompt_yes_no("This folder is outside ~/envr and will NOT migrate. Continue?"):
+                return None
+        manifest = self.repositories()
+        manifest["repositories"][name] = record
+        if instance is None:
+            manifest.setdefault("pending", {})[name] = record
+        self.save_repositories(manifest)
+        return record
+
+    def flush_workspace_changes(self, instance: dict[str, Any], selected: str | None) -> None:
+        manifest = self.repositories()
+        for name, record in list(manifest.get("pending", {}).items()):
+            if record.get("kind") in {"removed", "folder"}:
+                self.update_remote_manifest(instance, record)
+            elif name == selected:
+                self.ensure_remote_repository(instance, self.repository(name))
+            else:
+                continue
+            # Only clear a pending edit after the remote operation succeeds.
+            manifest["pending"].pop(name)
+            self.save_repositories(manifest)
+
+    def workspace_picker(self, instance: dict[str, Any] | None = None) -> str | None:
+        if instance is not None:
+            self.sync_from_server(instance)
+        while True:
+            records = self.repositories()["repositories"]
+            names = sorted(records)
+            print("\nWorkspaces")
+            for index, name in enumerate(names, 1):
+                print(f"  {index}. {name}")
+            choice = input("Number to connect, [A] add, [E] edit, [R] remove, [Q] quit: ").strip().lower()
+            if choice == "w" and instance is not None:
+                return None
+            if choice in {"", "q"}:
+                if instance is None:
+                    return None
+                raise EnvrError("Cancelled.")
+            if choice == "a":
+                name = input("Workspace name: ").strip()
+                if name in records:
+                    print("Already configured; choose Edit to change it.")
+                    continue
+                record = self.add_workspace(instance, name)
+                if record and instance is not None:
+                    return record["folder"]
+            elif choice == "e":
+                name = input("Workspace to edit: ").strip()
+                record = records.get(name)
+                if not record:
+                    print("Workspace not found.")
+                    continue
+                if record.get("kind") == "folder":
+                    self.add_workspace(None, name)
+                else:
+                    url = input(f"Repository SSH URL [{record['url']}]: ").strip() or record["url"]
+                    if parse_repository_url(url)["folder"] != name:
+                        print("That URL has a different folder name; use Add for a different repository.")
+                        continue
+                    self.configure_git(url=url, pending=True)
+            elif choice == "r":
+                name = input("Entry to remove (files and tmux remain): ").strip()
+                if name not in records or not prompt_yes_no(f"Forget {name}?"):
+                    continue
+                manifest = self.repositories()
+                manifest["repositories"].pop(name, None)
+                removed = {"kind": "removed", "folder": name}
+                manifest.setdefault("pending", {})[name] = removed
+                self.save_repositories(manifest)
+                if instance is not None:
+                    self.flush_workspace_changes(instance, None)
+                    self.set_last_workspace(instance, None)
+                print("Entry removed; remote files and sessions untouched.")
+            elif choice.isdigit() and 1 <= int(choice) <= len(names):
+                return names[int(choice) - 1]
+
+    def machine_menu(self) -> None:
+        while True:
+            state = self.state()
+            if state.get("instance_id"):
+                provider = str(state.get("provider") or "vultr")
+                print(f"\nCached machine: {PROVIDER_LABELS.get(provider, provider)} · "
+                      f"{state.get('ram_gb', '?')} GB · {state.get('main_ip', '?')}")
+            print("\nMachine\n  C. Create or migrate\n  D. Destroy\n  P. Provider credentials\n  Q. Quit")
+            choice = input("Choose C, D, P, or Q: ").strip().lower()
+            if choice in {"", "q"}:
+                return
+            if choice == "p":
+                self.cloud_menu()
+            elif choice == "d":
+                self.destroy()
+                return
+            elif choice == "c":
+                state = self.state()
+                if state.get("instance_id"):
+                    api = self.api(str(state.get("provider") or self.selected_provider()))
+                    current, pending, retired = self.resize_roles(api)
+                    if pending or retired:
+                        self.resize_menu()
+                        return
+                    if current:
+                        self.ensure_device_access(api, current[0])
+                        if self.resize_marker_state(current[0]) is not None:
+                            self.resize_menu()
+                            return
+                found = self.active_inventory() if self.configured_providers() else None
+                if found:
+                    api, instance = found
+                    self.save_instance_state(instance, ram_gb=self.instance_ram_gb(instance))
+                    self.ensure_device_access(api, instance)
+                    if not self.initial_setup_complete(instance):
+                        self.resume_initial_setup(instance)
+                        return
+                    self.resize_menu()
+                    return
+                if self.cloud_menu() is None:
+                    return
+                api = self.api(self.selected_provider())
+                options = self.resize_options(api)
+                if not options:
+                    raise EnvrError("no configurations available")
+                for index, option in enumerate(options, 1):
+                    print(f"  {index}. {option['ram_gb']} GB · {option['vcpu_count']} CPU · {region_label(str(option['region']))} · {compact_price(option['plan'])}")
+                selected = input(f"Choose 1-{len(options)}, or Q: ").strip()
+                if not selected.isdigit() or not 1 <= int(selected) <= len(options):
+                    return
+                self.up(int(options[int(selected) - 1]["ram_gb"]))
+                return
 
     def up(self, ram_gb: int) -> None:
         if ram_gb not in PLAN_IDS:
@@ -6110,12 +6327,12 @@ trap - EXIT
             if self.initial_setup_complete(cached):
                 raise EnvrError(
                     f"envr VPS already exists ({current_ram} GB); "
-                    "use envr go or envr resize"
+                    "use envr go or envr machine"
                 )
             if current_ram != ram_gb:
                 raise EnvrError(
                     f"incomplete envr VPS has {current_ram} GB; "
-                    f"run envr up {current_ram} to resume it"
+                    f"run envr machine to resume it"
                 )
             print(f"Resuming initial setup at {cached['main_ip']}...")
             self.resume_initial_setup(cached)
@@ -6138,12 +6355,12 @@ trap - EXIT
             if self.initial_setup_complete(instance):
                 raise EnvrError(
                     f"envr VPS already exists ({current_ram} GB); "
-                    "use envr go or envr resize"
+                    "use envr go or envr machine"
                 )
             if current_ram != ram_gb:
                 raise EnvrError(
                     f"incomplete envr VPS has {current_ram} GB; "
-                    f"run envr up {current_ram} to resume it"
+                    f"run envr machine to resume it"
                 )
             self.resume_initial_setup(instance)
         else:
@@ -6156,6 +6373,13 @@ trap - EXIT
         self, folder: str | None
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         ensure_commands(("ssh", "scp", "ssh-keygen"))
+        cached = self.cached_instance()
+        if cached is not None and folder != "":
+            prepared = self.fast_go_workspace(cached, folder)
+            if prepared is not None:
+                print(f"Using cached VPS at {cached['main_ip']}...")
+                self.record_successful_connection(cached)
+                return cached, prepared
         cached = self.probe_cached_instance(None)
         if cached is not None:
             print(f"Using cached VPS at {cached['main_ip']}...")
@@ -6164,7 +6388,7 @@ trap - EXIT
 
         found = self.active_inventory()
         if not found:
-            raise EnvrError("envr-codex is not running; run envr up RAM")
+            raise EnvrError("envr-codex is not running; run envr machine")
         api, instance = found
         current_ram = self.instance_ram_gb(instance)
         self.save_instance_state(instance, ram_gb=current_ram)
@@ -6174,6 +6398,94 @@ trap - EXIT
         self.ensure_device_access(api, instance)
         self.require_initial_setup_complete(instance)
         return self.prepare_go_instance(instance, folder)
+
+    def fast_go_workspace(
+        self, instance: dict[str, Any], folder: str | None
+    ) -> dict[str, Any] | None:
+        """One read-only SSH round trip for a ready, existing workspace.
+
+        Missing setup/workspaces use the full setup path. Transport errors still
+        use the normal retry/enrollment diagnostics. No state survives this call.
+        """
+        pending = self.repositories().get("pending", {})
+        if pending and (folder is None or folder in pending or any(
+            record.get("kind") in {"folder", "removed"} for record in pending.values()
+        )):
+            return None
+        if folder is not None and not FOLDER_RE.fullmatch(folder):
+            raise EnvrError("invalid workspace name")
+        record = self.repositories()["repositories"].get(folder, {}) if folder else {}
+        encoded = base64.b64encode(json.dumps({"folder": folder, "record": record}).encode()).decode()
+        script = r'''import base64, json, os, re, subprocess, sys
+from pathlib import Path
+request = json.loads(base64.b64decode(sys.argv[1]))
+home = Path('/home/remote')
+# Paths supplied by the client are constants from the same installed version.
+marker = Path(sys.argv[2])
+if marker.exists() and marker.stat().st_size:
+    print(json.dumps({'blocked': 'migration'})); sys.exit(0)
+if not Path(sys.argv[3]).exists():
+    sys.exit(10)
+if not os.access(home / '.local/bin/codex', os.X_OK):
+    sys.exit(10)
+try:
+    version = subprocess.check_output(['envr-codex-supervisor', 'version'], text=True).strip()
+    enabled = subprocess.run(['systemctl', 'is-enabled', '--quiet', 'envr-tmux.service']).returncode == 0
+except (OSError, subprocess.CalledProcessError):
+    sys.exit(10)
+if version != '4' or not enabled:
+    sys.exit(10)
+folder = request['folder']
+if folder is None:
+    last = Path(sys.argv[4])
+    folder = last.read_text().strip() if last.exists() else '.'
+if folder == '.':
+    sys.exit(10)
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', folder):
+    raise ValueError('invalid workspace name')
+record = request['record']
+manifest = Path(sys.argv[5])
+if manifest.exists():
+    record = json.loads(manifest.read_text()).get('repositories', {}).get(folder, record)
+if record.get('kind') == 'removed':
+    sys.exit(10)
+path = record.get('path') if record.get('kind') == 'folder' else str(home / 'envr' / folder)
+if not isinstance(path, str) or not path.startswith('/') or '..' in path.split('/') or any(ord(c) < 32 for c in path):
+    raise ValueError('invalid workspace path')
+if not Path(path).is_dir():
+    sys.exit(10)
+if record.get('kind') != 'folder':
+    if subprocess.run(['git', '-C', path, 'rev-parse', '--git-dir'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        sys.exit(10)
+print(json.dumps({'folder': folder, 'path': path}))
+'''
+        command = "python3 - " + " ".join(shlex.quote(value) for value in (
+            encoded, REMOTE_RESIZE_MARKER, REMOTE_INITIAL_READY,
+            REMOTE_LAST_WORKSPACE, REMOTE_REPOS,
+        ))
+        try:
+            result = self.remote_command(
+                instance, command, input_data=script, capture=True, check=False,
+                timeout=7, connect_timeout=5, strict_host_key_checking="yes",
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if result.returncode in {10, 255}:
+            return None
+        if result.returncode != 0:
+            raise EnvrError("remote workspace check failed; no changes made")
+        if not result.stdout.strip():
+            return None
+        try:
+            value = json.loads(result.stdout)
+        except ValueError as error:
+            raise EnvrError("invalid remote workspace check response") from error
+        if not isinstance(value, dict):
+            raise EnvrError("invalid remote workspace check response")
+        if value.get("blocked"):
+            raise EnvrError("resize is incomplete; run envr machine to resume it")
+        self.validate_workspace(value)
+        return value
 
     @staticmethod
     def transient_ssh_probe_failure(stderr: str) -> bool:
@@ -6288,8 +6600,8 @@ trap - EXIT
     ) -> int:
         script = r"""set -euo pipefail
 measure=$1
-if (pgrep -u remote -af '[c]odex' \
-        | grep -v '[e]nvr-codex-supervisor' | grep -q .) \
+if pgrep -u remote -x codex >/dev/null \
+        || pgrep -u remote -f '^([^[:space:]]*/)?node(js)?[[:space:]]+([^[:space:]]*/)?codex([.]js)?([[:space:]]|$)' >/dev/null \
         || (command -v envr-codex-supervisor >/dev/null 2>&1 \
             && envr-codex-supervisor armed); then
     echo CODEX_RUNNING
@@ -6346,8 +6658,8 @@ printf '%s\n' "$total"
 lock={shlex.quote(f'{REMOTE_CONFIG_ROOT}/tmux.lock')}
 exec 9>"$lock"
 flock -x 9
-if (pgrep -u remote -af '[c]odex' \
-        | grep -v '[e]nvr-codex-supervisor' | grep -q .) \
+if pgrep -u remote -x codex >/dev/null \
+        || pgrep -u remote -f '^([^[:space:]]*/)?node(js)?[[:space:]]+([^[:space:]]*/)?codex([.]js)?([[:space:]]|$)' >/dev/null \
         || (command -v envr-codex-supervisor >/dev/null 2>&1 \
             && envr-codex-supervisor armed); then
     echo CODEX_RUNNING
@@ -6652,7 +6964,7 @@ chmod 600 /home/remote/.ssh/authorized_keys
 manifest=/home/remote/.config/envr/repos.json
 test -f "$manifest" || exit 0
 jq -e '.schema == 1 and (.repositories | type == "object")' "$manifest" >/dev/null
-jq -r '.repositories | keys[]' "$manifest" |
+jq -r '.repositories | to_entries[] | select(.value.kind != "folder" and .value.kind != "removed") | .key' "$manifest" |
 while IFS= read -r folder; do
     git -C "/home/remote/envr/$folder" rev-parse --git-dir >/dev/null
     key="/home/remote/.ssh/envr/$folder"
@@ -6881,7 +7193,7 @@ done
             if promoted:
                 eprint(
                     "Warning: destination validation completed, but cleanup is "
-                    "incomplete. Run envr resize again; do not delete "
+                    "incomplete. Run envr machine again; do not delete "
                     "either VPS manually."
                 )
             raise
@@ -6971,9 +7283,7 @@ done
             f"{int(source.get('vcpu_count') or 0)} CPU · {current_price}"
         )
 
-        configured = self.configured_providers()
-        if not configured:
-            raise EnvrError("no cloud provider is configured; run envr cloud")
+        configured = list(PROVIDER_NAMES)
         print("\nDestination cloud:")
         for index, provider in enumerate(configured, 1):
             suffix = " (current)" if provider == source_provider else ""
@@ -6988,16 +7298,10 @@ done
                 break
             print(f"Choose 1-{len(configured)}, or Q.")
 
-        target_api = self.api(target_provider, prompt=False)
+        target_api = self.api(target_provider)
         self.account_response(target_api)
         options = self.resize_options(target_api)
         provider_available_sizes = {int(option["ram_gb"]) for option in options}
-        if target_provider == source_provider:
-            current_actual_ram = self.instance_ram_gb(source)
-            options = [
-                option for option in options
-                if int(option["ram_gb"]) != current_actual_ram
-            ]
         if not options:
             raise EnvrError(
                 f"{self.provider_label(target_api)} has no supported configuration "
@@ -7028,6 +7332,9 @@ done
                 break
             print(f"Choose 1-{len(options)}, or Q.")
 
+        if target_provider == source_provider and int(option["ram_gb"]) == self.instance_ram_gb(source):
+            print("Already using this size; no changes.")
+            return
         atomic_write_json(
             self.cloud_path,
             {"schema": SCHEMA_VERSION, "selected": target_provider},
@@ -7081,7 +7388,7 @@ done
             if target_ram != ram_gb:
                 raise EnvrError(
                     f"interrupted resize target is {target_ram} GB; "
-                    "run envr resize to resume it"
+                    "run envr machine to resume it"
                 )
             self.finish_resize(api, targets[0], sources[0])
             return
@@ -7090,7 +7397,7 @@ done
             if target_ram != ram_gb:
                 raise EnvrError(
                     f"promoted resize target is {target_ram} GB; "
-                    "run envr resize to finish cleanup"
+                    "run envr machine to finish cleanup"
                 )
             self.finish_resize(api, current[0], sources[0])
             return
@@ -7123,7 +7430,7 @@ done
             if marker is not None:
                 target_ram = marker[1]
                 detail = (
-                    "; run envr resize"
+                    "; run envr machine"
                     if target_ram is not None
                     else "; inspect envr status before retrying"
                 )
@@ -7194,14 +7501,14 @@ done
                 except (EnvrError, subprocess.TimeoutExpired):
                     eprint(
                         "Warning: resize cleanup could not be confirmed; "
-                        "run envr resize again"
+                        "run envr machine again"
                     )
             else:
                 eprint(
                     "Warning: the validated destination was promoted, but final "
                     "cleanup is incomplete. The old source may still be running "
                     "and billable. Do not create or delete a VPS manually; when "
-                    "the provider API recovers, run envr resize again"
+                    "the provider API recovers, run envr machine again"
                 )
             raise
 
@@ -7506,7 +7813,7 @@ done
             print(f"CONFLICT: {len(all_managed)} envr instances exist across clouds")
             return 2
         if all_resize:
-            print("Resize is incomplete. Resume with: envr resize")
+            print("Resize is incomplete. Resume with: envr machine")
             return 2
         return 1 if failures else 0
 
@@ -7604,37 +7911,13 @@ done
                     f"  {role.capitalize()}: {self.instance_ram_gb(instance)} GB · "
                     f"{instance.get('main_ip', '')} · {instance.get('status', '')}"
                 )
-            print("  Resume with: envr resize")
+            print("  Resume with: envr machine")
 
         print("\nClouds")
         print("\n".join(cloud_lines))
         conflict = len(instances) > 1
         return 2 if conflict or resizing else 0
 
-    def port_open(self, port: int) -> None:
-        if not 1 <= port <= 65535:
-            raise EnvrError("port must be an integer from 1 through 65535")
-        ensure_commands(("ssh", "ssh-keygen"))
-        found = self.active_inventory()
-        if found is None:
-            raise EnvrError(
-                "envr-codex is not running. Start it with "
-                "envr up RAM."
-            )
-        api, instance = found
-        self.ensure_device_access(api, instance)
-        script = r"""set -euo pipefail
-port=$1
-sudo ufw allow "$port/tcp"
-sudo ufw allow "$port/udp"
-sudo ufw status | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"
-sudo ufw status | grep -Eq "^${port}/udp[[:space:]]+ALLOW"
-"""
-        self.remote_script(instance, script, (str(port),), timeout=60)
-        open_provider_port = getattr(api, "open_port", None)
-        if callable(open_provider_port):
-            open_provider_port(instance, port)
-        print(f"Opened port {port} (TCP and UDP) on envr-codex.")
 
     def git_safety(self, instance: dict[str, Any]) -> list[tuple[str, str]]:
         script = r"""set -u
@@ -7800,6 +8083,7 @@ fi
             print(
                 f"Warning: {len(instances)} conflicting envr instances will be destroyed."
             )
+        print("All VPS files, including non-Git folders and Codex history, will be deleted.")
         confirmation = "Destroy envr VPS permanently?"
         if not auth_ok or unsafe:
             confirmation = "Destroy permanently despite the warnings above?"
@@ -7837,49 +8121,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser(
-        "git", help="configure one Git repository",
-        description="Configure a repository and its dedicated SSH identity.",
-    )
-    subparsers.add_parser(
         "relay", help="configure the optional SSH relay",
         description="Show, configure, edit, or remove the optional SSH relay.",
     )
-    subparsers.add_parser(
-        "cloud", help="configure and select a cloud provider",
-        description="Configure providers and choose the default used by envr up.",
-    )
-
-    up = subparsers.add_parser(
-        "up", help="create the initial VPS",
-        description="Create and prepare the one envr VPS; this command does not connect.",
-    )
-    up.add_argument(
-        "ram", type=int, choices=sorted(PLAN_IDS), metavar="RAM_GB",
-        help="memory size: %(choices)s",
-    )
+    subparsers.add_parser("machine", help="create, migrate, destroy, or configure providers")
 
     go = subparsers.add_parser(
-        "go", help="reconnect without specifying RAM",
-        description="Attach to the last workspace, or select one repository.",
+        "go", help="connect; --choose manages Git repos/folders offline",
+        description="Attach to the last workspace, or open a Git repository or remote folder.",
     )
     go.add_argument(
-        "repository_folder", nargs="?", metavar="REPOSITORY",
-        help="configured repository folder; omit for the last workspace",
+        "repository_folder", nargs="?", metavar="WORKSPACE",
+        help="workspace name; unknown names offer setup; omit for the last workspace",
     )
-
-    resize = subparsers.add_parser(
-        "resize", help="move the environment to a fresh VPS size",
-        description="Choose a live cloud configuration and safely migrate the environment.",
-    )
+    go.add_argument("--choose", action="store_true", help="add, edit, remove, or select workspaces (offline)")
 
     subparsers.add_parser("status", help="show account and VPS status")
 
-    port_open = subparsers.add_parser("port-open", help="open one TCP/UDP port")
-    port_open.add_argument(
-        "port", type=int, metavar="PORT", help="TCP and UDP port (1-65535)"
-    )
-
-    subparsers.add_parser("destroy", help="check work and destroy the VPS")
     return parser
 
 
@@ -7897,29 +8155,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         attachment: tuple[dict[str, Any], dict[str, Any] | None] | None = None
         with exclusive_lock(app.root):
-            if namespace.command == "git":
-                app.configure_git()
-                return 0
             if namespace.command == "relay":
                 app.relay_menu()
                 return 0
-            if namespace.command == "cloud":
-                app.cloud_menu()
-                return 0
-            if namespace.command == "up":
-                attachment = app.up(namespace.ram)
-            elif namespace.command == "go":
-                attachment = app.go(namespace.repository_folder)
-            elif namespace.command == "resize":
-                attachment = app.resize_menu()
+            if namespace.command == "go":
+                if namespace.choose and namespace.repository_folder:
+                    raise EnvrError("use a workspace name or --choose, not both")
+                folder = namespace.repository_folder
+                if namespace.choose:
+                    folder = app.workspace_picker()
+                    if folder is None:
+                        return 0
+                attachment = app.go(folder)
+            elif namespace.command == "machine":
+                app.machine_menu()
             elif namespace.command == "status":
                 return app.status()
-            elif namespace.command == "port-open":
-                app.port_open(namespace.port)
-                return 0
-            elif namespace.command == "destroy":
-                app.destroy()
-                return 0
         if attachment is not None:
             app.close_api_tunnel()
             app.connect_shell(*attachment)

@@ -10,16 +10,11 @@ official API contracts and locally tested.
 from Android Termux, macOS, or Linux. The normal interface remains:
 
 ```bash
-envr git
-envr relay
-envr cloud
-envr up 4
-envr go
-envr go repository-folder
-envr resize
+envr machine              # create, migrate, destroy, provider credentials
+envr go [workspace]       # connect; add unknown workspaces interactively
+envr go --choose          # pick, add, or remove entries
 envr status
-envr port-open 443
-envr destroy
+envr relay
 ```
 
 There is no `init`, `connect`, `shell`, separate relay-edit/delete, or envr
@@ -36,9 +31,9 @@ tag:   envr-managed
 ```
 
 Legacy tags beginning with `envr-managed-` are also recognized. Finding more
-than one matching normal VPS is a conflict: `up` and `port-open` refuse to
-guess, `status` lists them, and `destroy` checks and offers to remove all of
-them. `resize` is the sole controlled exception: while it runs, one temporary
+than one matching normal VPS is a conflict: creation and connection refuse to
+guess, `status` lists them, and machine destruction checks and offers to remove all of
+them. Migration is the sole controlled exception: while it runs, one temporary
 target or one retired source can coexist under distinct labels.
 
 This provider-wide identity is deliberate. Inventory across all configured
@@ -53,8 +48,8 @@ plans, regions, Ubuntu images, instances, creation, relabel/start, and deletion.
 Core SSH, cloud-init, Git, Codex, tmux, safety checks, and migration logic are
 shared. Adding a provider must not fork that lifecycle.
 
-`envr cloud` is the only provider configuration interface. It verifies and
-stores provider API credentials, and selects the destination used by `up` and `resize`.
+`envr machine` is the only provider configuration interface. It verifies and
+stores provider API credentials, and selects the destination used by machine creation and migration.
 Old state without a provider field is interpreted as Vultr. Tokens remain
 separate and are never sent to a VPS.
 
@@ -228,7 +223,7 @@ attaches to that repository's persistent tmux
 session.
 
 If no VPS exists, repository configuration must already be cached locally or
-the user must run `envr git`. Once a VPS has been destroyed, a completely new
+the user must run `envr go --choose`. Once a VPS has been destroyed, a completely new
 device cannot recover credentials that existed only on that deleted VPS.
 
 ## Clean local state
@@ -275,7 +270,7 @@ messaging applications, email, or cloud notes.
 
 ## Repository configuration
 
-`envr git` takes no arguments and asks for:
+`envr go --choose` takes no arguments and asks for:
 
 ```text
 Repository SSH URL:
@@ -305,18 +300,17 @@ host from the client device.
 Imported keys are copied atomically into the private configuration directory.
 Repository access is tested later, only from the disposable VPS.
 
-## `envr up`
+## `envr machine`
 
 The exact grammar is:
 
 ```text
-envr up RAM
+envr machine
 ```
 
-`RAM` is required and must be `1`, `2`, `4`, `8`, `12`, `16`, `24`, or `32`. `up`
-owns only initial creation and recovery of an interrupted initial deployment.
-It never selects a repository, changes an existing size, or opens an
-interactive shell.
+`envr machine` is interactive: create or migrate, destroy, provider credentials,
+or quit. Creation and migration ask for a live cloud configuration rather than
+positional RAM arguments. It never opens an interactive shell.
 
 If no VPS exists:
 
@@ -334,21 +328,20 @@ query live plan, OS, and regional availability data from the selected provider
 If creation was interrupted before the durable initial-ready condition:
 
 ```text
-repeat envr up with the original RAM
+choose create or migrate in envr machine
 → locate the same VPS through trusted cache or API
 → finish bootstrap without creating a replacement
 → record initial-ready
 → exit with the instruction to run envr go
 ```
 
-A healthy existing VPS makes `up` fail with the two valid choices: `envr go`
-to connect or `envr resize` to choose a new cloud configuration. A different RAM cannot be
-used while initial setup is incomplete; the original size must finish first.
+A healthy VPS offers migration through the same menu. Incomplete initial setup
+finishes on the original VPS before migration is allowed.
 
 Regional fallback is permitted only before the provider returns an instance ID. Once
 an instance exists, `envr` never deletes it or creates a replacement because
 of an SSH, cloud-init, setup, or local timeout. It reports that the VPS remains
-billable, and the same `envr up RAM` command resumes setup. Interruption also
+billable, and the same `envr machine` command resumes setup. Interruption also
 leaves that single instance intact.
 
 ## `envr go`
@@ -368,17 +361,18 @@ keys remain repository-local and are never loaded into a global SSH agent.
 `go` tries the trusted cached IP, host key, and device key before using the API.
 It may start an existing stopped VPS, but it never creates, replaces, or
 resizes one. With no managed VPS it fails with the single instruction to run
-`envr up RAM`.
+`envr machine`.
 
-## `envr resize`
+## `envr machine`
 
 The exact grammar is:
 
 ```text
-envr resize
+envr machine
 ```
 
-Resize lists configured destination clouds and then queries the selected
+Migration lists all supported destination clouds, configures credentials when
+missing, and then queries the selected
 provider's live plans, Ubuntu image, and regional availability. Its second
 numbered menu contains only exact allocated RAM sizes, CPU counts, the first
 available preferred region, and live price when exposed. Resize always creates
@@ -411,7 +405,7 @@ containers, services, firewall
 rules, and open ports are not copied. The destination receives the normal
 fresh envr bootstrap and current Codex CLI.
 
-Codex must not be running. `resize` refuses before creating a target when a
+Codex must not be running. migration refuses before creating a target when a
 Codex process or armed supervisor record is found. Immediately before cutover,
 resize takes the same lock used to create tmux sessions, checks both conditions
 again, and only then stops the old tmux server. This closes the concurrent
@@ -457,14 +451,14 @@ The source and target also carry role-specific resize markers; the promoted
 target keeps its marker until old-source deletion is confirmed, preventing a
 second device from mistaking incomplete cleanup for a finished resize.
 `go` refuses when the source marker says resize is incomplete, `status` shows
-the migration roles, and `destroy` refuses until resize is resolved.
+the migration roles, and machine destruction refuses until resize is resolved.
 
 ## VPS bootstrap
 
 The fixed initial server choices are:
 
 ```text
-Provider:          selected with envr cloud
+Provider:          selected with envr machine
 Plan type:         provider shared/general-purpose compute
 OS:                Ubuntu 24.04 LTS x64
 Regions:           Frankfurt first, then provider-specific European fallbacks
@@ -492,7 +486,7 @@ disk. Its zones are Frankfurt, Munich, Vienna, then Zurich. Exoscale's HMAC
 authentication is signed locally with the API key and secret; relay mode opens
 a separate hostname-validated TLS tunnel for each zone API host. A reusable,
 unbilled `envr-managed` security group permits SSH and only ports explicitly
-added with `port-open`.
+added manually.
 Gcore uses the account's single default project, discovers region IDs, flavors,
 prices, and Ubuntu image IDs live, and exposes 12/24 GB only when exact flavors
 exist. Its order is
@@ -638,17 +632,7 @@ Vultr represents prepaid credit as a negative balance. `envr` converts the sign
 and subtracts pending charges. Runway excludes taxes, overages, other services,
 and the spending capacity of a linked payment card.
 
-## `envr port-open`
-
-```text
-envr port-open PORT
-```
-
-The port must be `1..65535`. The command enrolls the current device if needed,
-then idempotently opens both TCP and UDP in UFW and verifies the rules. It does
-not alter a provider firewall product or reset any existing VPS firewall rules.
-
-## `envr destroy`
+## `envr machine`
 
 Before deletion:
 
@@ -661,7 +645,7 @@ ensure device access
 → ask for confirmation
 ```
 
-`destroy` refuses while a resize target or retired source exists. This keeps a
+machine destruction refuses while a resize target or retired source exists. This keeps a
 partially completed migration out of the older conflicting-instance deletion
 path.
 
@@ -728,3 +712,22 @@ configure repo on macOS
 → destroy from Android
 → recreate from a synchronized device
 ```
+
+## Workspace entries
+
+The `go --choose` menu runs locally before any server discovery. It supports
+add, edit, remove, select, and quit without requiring a VPS. Local changes are
+recorded in the manifest's pending map and protected from inbound sync. Folder
+mappings and removals are published on connection; Git changes apply when the
+corresponding repository is opened. Pending entries clear only after successful
+remote application. This does not pull or push repository work.
+
+`envr go` reconnects to the last workspace. With no last workspace, or with
+`--choose`, it offers a picker, adding entries, removing entries, and the workspace root.
+Removing an entry does not delete files, keys, or tmux sessions. A remote manifest
+tombstone propagates removal to other devices on synchronization.
+Plain folders default to `~/envr/NAME`; creation requires confirmation if absent.
+Paths outside `~/envr` require an explicit warning acknowledgment because they
+are not included in migration. Existing tmux sessions are attached unchanged.
+The old up, resize, git, cloud, destroy, and port-open command entry points are
+removed, with no aliases. Provider tokens remain local to each device.
