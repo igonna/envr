@@ -104,6 +104,36 @@ It also restores an armed session after a VPS reboot. Recovery never uses
 remains part of the resumed Codex thread. Recovery stops after three repeated
 OOM restarts in ten minutes. Plain `codex` remains completely unsupervised.
 
+On Codex 0.153.4, supervised resumes also watch the same live backend for
+temporary service failures and usage limits. Recognized capacity/server failures
+retry after 1, 2, 5, then 15 minutes; usage exhaustion waits for the reported
+reset plus a margin and rechecks availability. No model prompts are used for
+polling. A backend-generated `blocked` goal is recoverable only when correlated
+with that exact turn's recognized service error. User pauses, genuine blockers,
+completed goals, exhausted goal budgets, and unknown errors remain stopped.
+Ctrl-C disables this monitor for the current `scodex` invocation; a later
+`scodex resume` starts monitoring again. This does not change the OOM keeper.
+
+Each supervised resume owns one backend through a private socket in `/tmp`,
+outside the directories copied during migration. Its terminal and monitor join
+that same backend; no global daemon is started or restarted and no TCP port is
+exposed. A small lifetime guard cleans up the owned backend even if the wrapper
+is killed, retaining the conversation lock until cleanup finishes. Normal exit
+also removes its temporary socket directory.
+It uses the experimental app-server protocol,
+so an incompatible CLI/control connection disables goal recovery without closing
+Codex. A tmux notice and private status record under
+`~/.config/envr/supervision/goal-recovery/` make that failure visible.
+It watches new failures after subscribing, not arbitrary old stalled sessions.
+It does not recover every possible hang. Pause events and state are checked
+before recovery, but Codex currently has no atomic conditional goal-update API:
+a simultaneous pause from another client remains a protocol-level race.
+
+Local tests include an actual Codex backend, a loopback fake capacity response,
+and two clients verifying continuation on the same thread. Run the optional
+installed-binary tests with `ENVR_TEST_CODEX_PROTOCOL=1 python3 -m unittest discover -s tests -p test_goal_recovery.py`.
+No real account credentials or model requests are used by those tests.
+
 Codex is installed as `remote` under `~/.local`, with npm's user prefix set
 there, so its built-in update action works without sudo. `scodex` uses that
 same installation even inside an older tmux shell.

@@ -165,7 +165,7 @@ class InterfaceTests(unittest.TestCase):
             argv = [value.replace("/home/remote", str(root)) for value in shlex.split(command)[1:]]
             output = io.StringIO()
             status = 0
-            with mock.patch("sys.argv", argv), contextlib.redirect_stdout(output), mock.patch("subprocess.check_output", return_value="5"), mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)):
+            with mock.patch("sys.argv", argv), contextlib.redirect_stdout(output), mock.patch("subprocess.check_output", return_value="7"), mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)):
                 try:
                     exec(compile(script, "remote-go-check", "exec"), {})
                 except SystemExit as error:

@@ -2594,6 +2594,9 @@ class RemoteSupervisorTests(unittest.TestCase):
         fake_tmux.chmod(0o755)
         codex_log = root / "codex.log"
         fake_codex = root / "codex"
+        # A separate owned backend lives until the wrapper terminates it. Do not
+        # count it as a conversation launch in the process/OOM simulations.
+        codex_script = codex_script.replace("#!/bin/sh\n", '#!/bin/sh\nif [ "$1" = app-server ]; then touch "${3#unix://}"; exec sleep 60; fi\n', 1)
         fake_codex.write_text(codex_script, encoding="utf-8")
         fake_codex.chmod(0o755)
         memory_events = root / "memory.events"
@@ -2638,6 +2641,7 @@ class RemoteSupervisorTests(unittest.TestCase):
             invocation = Path(environment["ENVR_CODEX_LOG"]).read_text()
             self.assertIn(f"-C {repository} {self.THREAD_ONE}", invocation)
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", invocation)
+            self.assertIn("--remote unix://", invocation)
             self.assertNotIn("--last", invocation)
             self.assertNotIn("/goal", invocation)
 

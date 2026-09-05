@@ -590,6 +590,44 @@ VPS reboot. No prompt and no `/goal resume` command are injected: persisted goal
 state belongs to the exact Codex thread itself. Automatic recovery is capped at
 three retries in ten minutes.
 
+Goal recovery is a separate observer inside the supervised wrapper, not a
+second Codex runner. Protocol version 7 gives each wrapper one owned app-server
+backend with a private socket in a mode-700 temporary directory under `/tmp`.
+The TUI attaches with `--remote unix://PATH`; the observer joins that same backend
+through `codex app-server proxy --sock PATH` (raw WebSocket transport).
+An independent lifetime guard terminates the owned backend process group when
+the wrapper exits, including SIGKILL, and retains the conversation lock until
+cleanup finishes. Normal exit also removes its temporary socket directory.
+No global daemon is started/restarted; temporary sockets are outside migrated
+state. Killing the guard itself is outside this cleanup guarantee. OOM detection covers the
+owned backend's exit as well as the TUI's exit, with the same counter guard.
+It subscribes only after verifying the exact UUID is already loaded; live
+`thread/resume` joins without configuration overrides. No second backend is created,
+no TCP port is opened, and no user prompt is injected. Missing/incompatible
+control interfaces disable this observer with a tmux notice and an atomic
+private diagnostic record, without ending the user's Codex process.
+
+Error/turn/goal events identify eligible service failures. Codex's native
+`willRetry` takes precedence. Generic errors are not retried except the anchored
+HTTP 502/503/504 transport diagnostic used by Codex 0.153.4. A blocked goal is
+eligible only after an observed active-to-blocked transition attributed to the
+same failed turn. Delays are 60/120/300/900 seconds. Usage-limit recovery checks
+account limit windows and waits until exhausted windows reset, plus 30 seconds;
+missing quota information waits 15 minutes. These checks do not submit prompts.
+
+Before activation the observer checks goal identity/budget, idle/error thread
+state, repository, and the newest failed turn, then rechecks the goal. User
+interruption, goal replacement/pause/clear, a new turn, or completion cancels
+pending recovery. Ctrl-C stops the observer for that wrapper invocation.
+Only `thread/goal/set` with the exact UUID and `status: active` is sent; objective,
+model, permissions, accounting, and budget are not replaced. A lost mutation
+response disables the observer rather than blindly retrying an accepted command.
+Codex lacks compare-and-set goal updates, so a truly simultaneous cross-client
+pause remains a documented race, not a guaranteed atomic operation. The observer
+does not reconstruct missed failure events after disconnection or recover
+arbitrary preexisting blocked sessions. Backend integration is experimental;
+tests use an isolated real backend and a loopback-only fake model provider.
+
 Recovery checks pane ownership and never replaces a live pane using a stale
 numeric pane ID. When necessary it creates a recovery window in the original
 named session. Ctrl-C is handled by the foreground Codex process; supervision

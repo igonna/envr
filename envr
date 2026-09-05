@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.15.5"
+VERSION = "0.15.7"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -201,6 +201,8 @@ CODEX_SUPERVISOR_SCRIPT = r'''#!/usr/bin/env python3
 from __future__ import annotations
 
 import fcntl
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -210,6 +212,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import select
 import time
 import uuid
 
@@ -229,7 +233,7 @@ TMUX = os.environ.get("ENVR_TMUX", "tmux")
 CODEX = os.environ.get("ENVR_CODEX", "codex")
 os.environ["NPM_CONFIG_PREFIX"] = str(REMOTE_HOME / ".local")
 os.environ["PATH"] = str(REMOTE_HOME / ".local/bin") + os.pathsep + os.environ.get("PATH", "")
-PROTOCOL_VERSION = "5"
+PROTOCOL_VERSION = "7"
 UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -506,7 +510,7 @@ def run_bound(state: dict) -> int:
         save(state)
         raise RuntimeError("that Codex conversation is already running")
     try:
-        return run_child(state)
+        return run_child(state, thread_lock.fileno())
     except KeyboardInterrupt:
         state.update({"desired": "stopped", "status": "stopped", "last_exit": 130})
         save(state)
@@ -515,7 +519,379 @@ def run_bound(state: dict) -> int:
         thread_lock.close()
 
 
-def run_child(state: dict) -> int:
+class GoalRecovery:
+    """Observe one live thread; never create a backend or replay user input."""
+
+    DELAYS = (60, 120, 300, 900)
+    TRANSIENT = {"serverOverloaded", "internalServerError", "rateLimitExceeded"}
+
+    def __init__(self, state: dict, stop: threading.Event):
+        self.thread_id = state["thread_id"]
+        self.cwd = state["cwd"]
+        self.pane = state.get("pane")
+        self.control_socket = state.get("control_socket")
+        self.path = STATE_ROOT / "goal-recovery" / (state["slot"] + ".json")
+        self.stop = stop
+        self.process = None
+        self.buffer = b""
+        self.fragments = bytearray()
+        self.serial = 0
+        self.pending = None
+        self.attempts = 0
+        self.goal = None
+        self.subscribed = False
+        self.service_block_turn = None
+
+    def report(self, status: str, reason: str = "") -> None:
+        atomic_json(self.path, {"thread_id": self.thread_id, "status": status,
+                               "reason": reason, "next_retry": self.pending["due"] if self.pending else None})
+
+    def cancel(self) -> None:
+        was_pending = self.pending is not None
+        self.pending = None
+        if was_pending:
+            self.report("watching")
+
+    @staticmethod
+    def identity(goal):
+        if not goal:
+            return None
+        return (goal.get("createdAt"), goal.get("objective"), goal.get("tokenBudget"))
+
+    def event(self, message: dict) -> None:
+        params = message.get("params") or {}
+        if params.get("threadId") != self.thread_id:
+            return
+        method = message.get("method")
+        if method == "thread/goal/updated":
+            goal = params.get("goal")
+            # Backend admission failures may label the goal blocked before
+            # emitting the turn error. Only that same failed turn may recover it.
+            self.service_block_turn = (params.get("turnId") if goal and self.goal
+                and self.goal.get("status") == "active" and goal.get("status") == "blocked"
+                and self.identity(goal) == self.identity(self.goal) else None)
+            if (self.identity(goal) != self.identity(self.goal)
+                    or not goal or goal.get("status") not in {"active", "usageLimited"}):
+                self.cancel()
+            self.goal = goal
+        elif method in {"thread/goal/cleared", "thread/closed", "thread/archived", "thread/deleted"}:
+            self.goal = None
+            self.cancel()
+        elif method == "turn/started":
+            self.cancel()
+        elif method == "turn/completed":
+            turn = params.get("turn") or {}
+            if turn.get("status") == "failed":
+                self.schedule(turn.get("id"), turn.get("error") or {})
+            else:
+                self.cancel()
+                self.attempts = 0
+        elif method == "error":
+            if params.get("willRetry") is True:
+                self.cancel()
+            elif params.get("willRetry") is False:
+                self.schedule(params.get("turnId"), params.get("error") or {})
+        elif method == "item/started" and (params.get("item") or {}).get("type") == "userMessage":
+            self.cancel()
+
+    def schedule(self, turn_id, error: dict) -> None:
+        code = error.get("codexErrorInfo")
+        # Codex 0.153 also maps HTTP admission failures to `other`. Match only
+        # the anchored transport diagnostic, never conversational/TUI content.
+        if code == "other" and re.match(r"^unexpected status (?:502|503|504)\b", error.get("message", "")):
+            code = "serverOverloaded"
+        if not isinstance(code, str) or code not in self.TRANSIENT | {"usageLimitExceeded"}:
+            self.cancel()
+            return
+        allowed = self.goal and (self.goal.get("status") in {"active", "usageLimited"}
+            or (self.goal.get("status") == "blocked" and self.service_block_turn == turn_id))
+        if not allowed or not turn_id:
+            return
+        if self.pending and self.pending["turn"] == turn_id:
+            return
+        self.pending = {"turn": turn_id, "code": code, "identity": self.identity(self.goal),
+                        "status": self.goal["status"],
+                        "due": time.time() + self.DELAYS[min(self.attempts, len(self.DELAYS) - 1)]}
+        self.report("waiting", code)
+
+    def read_bytes(self, timeout: float) -> bool:
+        if not select.select([self.process.stdout], [], [], timeout)[0]:
+            return False
+        chunk = os.read(self.process.stdout.fileno(), 65536)
+        if not chunk:
+            raise RuntimeError("Codex control connection closed")
+        self.buffer += chunk
+        if len(self.buffer) + len(self.fragments) > 16 * 1024 * 1024:
+            raise RuntimeError("Codex control message exceeds limit")
+        return True
+
+    def handshake(self):
+        # `app-server proxy` forwards raw Unix-socket bytes, not JSONL. The
+        # control socket uses RFC 6455 even though it never leaves this host.
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.process.stdin.write(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\n\r\n").encode())
+        self.process.stdin.flush()
+        deadline = time.monotonic() + 10
+        while b"\r\n\r\n" not in self.buffer:
+            if self.stop.is_set() or time.monotonic() >= deadline:
+                raise RuntimeError("Codex control handshake timed out")
+            self.read_bytes(0.2)
+        header, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        lines = header.decode("ascii").split("\r\n")
+        headers = {name.lower(): value.strip() for line in lines[1:] if ":" in line
+                   for name, value in [line.split(":", 1)]}
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        if " 101 " not in lines[0] or headers.get("sec-websocket-accept") != expected:
+            raise RuntimeError("Codex control handshake rejected")
+
+    def send_frame(self, payload: bytes, opcode=1):
+        length = len(payload)
+        header = bytes([0x80 | opcode])
+        if length < 126:
+            header += bytes([0x80 | length])
+        elif length < 65536:
+            header += b"\xfe" + length.to_bytes(2, "big")
+        else:
+            header += b"\xff" + length.to_bytes(8, "big")
+        mask = os.urandom(4)
+        self.process.stdin.write(header + mask + bytes(value ^ mask[i % 4] for i, value in enumerate(payload)))
+        self.process.stdin.flush()
+
+    def receive(self, timeout: float):
+        if len(self.buffer) < 2 and not self.read_bytes(timeout):
+            return None
+        if len(self.buffer) < 2:
+            return None
+        first, second = self.buffer[:2]
+        if first & 0x70 or second & 0x80:
+            raise RuntimeError("unsupported Codex control frame")
+        length, offset = second & 127, 2
+        extra = 2 if length == 126 else 8 if length == 127 else 0
+        if len(self.buffer) < offset + extra:
+            self.read_bytes(timeout)
+            return None
+        if extra:
+            length = int.from_bytes(self.buffer[offset:offset + extra], "big")
+            offset += extra
+        if length > 16 * 1024 * 1024:
+            raise RuntimeError("Codex control frame exceeds limit")
+        if len(self.buffer) < offset + length:
+            self.read_bytes(timeout)
+            return None
+        payload, self.buffer = self.buffer[offset:offset + length], self.buffer[offset + length:]
+        opcode = first & 15
+        if opcode == 8:
+            raise RuntimeError("Codex control connection closed")
+        if opcode == 9:
+            self.send_frame(payload, 10)
+            return None
+        if opcode == 10:
+            return None
+        if opcode not in (0, 1):
+            raise RuntimeError("unsupported Codex control message")
+        self.fragments.extend(payload)
+        if not first & 0x80:
+            return None
+        message = json.loads(self.fragments)
+        self.fragments.clear()
+        return message
+
+    def request(self, method: str, params: dict):
+        self.serial += 1
+        request_id = self.serial
+        self.send_frame(json.dumps({"id": request_id, "method": method, "params": params}).encode())
+        deadline = time.monotonic() + 10
+        while not self.stop.is_set() and time.monotonic() < deadline:
+            message = self.receive(0.2)
+            if message is None:
+                continue
+            if message.get("id") == request_id:
+                if "error" in message:
+                    raise RuntimeError("Codex control request failed: " + method)
+                return message.get("result") or {}
+            self.event(message)
+        raise RuntimeError("Codex control request interrupted or timed out")
+
+    def retry(self) -> None:
+        pending = self.pending
+        if pending is None or time.time() < pending["due"]:
+            return
+        goal = self.request("thread/goal/get", {"threadId": self.thread_id}).get("goal")
+        if (self.pending is not pending or self.identity(goal) != pending["identity"]
+                or not goal or goal.get("status") != pending["status"]):
+            self.cancel()
+            return
+        if goal.get("tokenBudget") is not None and goal.get("tokensUsed", 0) >= goal["tokenBudget"]:
+            self.cancel()
+            return
+        thread = self.request("thread/read", {"threadId": self.thread_id}).get("thread") or {}
+        if os.path.realpath(thread.get("cwd") or "") != os.path.realpath(self.cwd) or (thread.get("status") or {}).get("type") not in {"idle", "systemError"}:
+            self.cancel()
+            return
+        turns = self.request("thread/turns/list", {"threadId": self.thread_id, "limit": 1,
+                                                  "sortDirection": "desc", "itemsView": "summary"}).get("data") or []
+        if not turns or turns[0].get("id") != pending["turn"] or turns[0].get("status") != "failed":
+            self.cancel()
+            return
+        if pending["code"] == "usageLimitExceeded" or goal.get("status") == "usageLimited":
+            limits = self.request("account/rateLimits/read", {})
+            buckets = limits.get("rateLimitsByLimitId") or {"default": limits.get("rateLimits")}
+            if not buckets or not any(buckets.values()):
+                pending["due"] = time.time() + 900
+                return
+            resets = []
+            for bucket in buckets.values():
+                for key in ("primary", "secondary"):
+                    window = (bucket or {}).get(key) or {}
+                    if window.get("usedPercent", 0) >= 100:
+                        resets.append(window.get("resetsAt") or time.time() + 900)
+            if resets:
+                pending["due"] = max(time.time() + 60, max(resets) + 30)
+                self.report("waiting", "usage reset")
+                return
+        # Events received during every request can invalidate this attempt.
+        # Re-read the goal last; never change an explicitly paused/changed goal.
+        latest = self.request("thread/goal/get", {"threadId": self.thread_id}).get("goal")
+        if self.stop.is_set() or self.pending is not pending or latest != goal:
+            self.cancel()
+            return
+        self.cancel()  # A timeout must not blindly repeat a possibly accepted mutation.
+        self.attempts += 1
+        self.request("thread/goal/set", {"threadId": self.thread_id, "status": "active"})
+        self.report("resumed", pending["code"])
+
+    def run(self) -> None:
+        try:
+            # The TUI owns startup. A proxy only joins the already-running backend;
+            # it must not launch a second runner against the same history.
+            if self.stop.wait(0.05):
+                return
+            self.process = subprocess.Popen([CODEX, "app-server", "proxy", "--sock", self.control_socket],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.handshake()
+            self.request("initialize", {"clientInfo": {"name": "envr_recovery", "version": "1"},
+                                        "capabilities": {"experimentalApi": True}})
+            self.send_frame(b'{"method":"initialized"}')
+            for _ in range(60):
+                loaded = self.request("thread/loaded/list", {}).get("data") or []
+                if self.thread_id in loaded:
+                    break
+                if self.stop.wait(0.5):
+                    return
+            else:
+                raise RuntimeError("conversation is not on the shared Codex backend")
+            # Loaded-thread resume subscribes to the same live thread, no overrides.
+            thread = self.request("thread/resume", {"threadId": self.thread_id,
+                                                     "excludeTurns": True}).get("thread") or {}
+            self.subscribed = True
+            if os.path.realpath(thread.get("cwd") or "") != os.path.realpath(self.cwd):
+                raise RuntimeError("Codex conversation directory mismatch")
+            self.goal = self.request("thread/goal/get", {"threadId": self.thread_id}).get("goal")
+            self.report("watching")
+            while not self.stop.is_set():
+                message = self.receive(0.5)
+                if message is not None:
+                    self.event(message)
+                self.retry()
+        except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError) as error:
+            self.cancel()
+            if not self.stop.is_set():
+                self.report("unavailable", str(error))
+                if self.pane:
+                    run_tmux("display-message", "-t", self.pane,
+                             "envr: goal recovery unavailable; Codex remains open. See ~/.config/envr/supervision/goal-recovery/")
+        finally:
+            if self.process is not None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+                self.process.stdin.close()
+                self.process.stdout.close()
+            if self.stop.is_set():
+                self.report("stopped")
+
+
+BACKEND_GUARD_SCRIPT = r"""
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+# This single-purpose process owns the backend's group and retains the inherited
+# conversation lock. EOF on stdin means the wrapper exited, including SIGKILL.
+# No backend or tool inherits this lifetime pipe.
+process = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, start_new_session=True)
+code = 0
+try:
+    while process.poll() is None:
+        if select.select([sys.stdin.buffer], [], [], 0.2)[0] and not os.read(0, 1):
+            break
+    code = process.poll() or 0
+finally:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+    # Also reap tools that outlive the backend leader before releasing its lock.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+sys.exit(code if code >= 0 else 128 - code)
+"""
+
+
+class CodexBackend:
+    """One owned backend for this wrapper's terminal and observer, not a daemon."""
+
+    def __init__(self, lock_fd=None):
+        self.lock_fd = lock_fd
+
+    def __enter__(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="envr-codex-", dir="/tmp")
+        self.socket = str(Path(self.directory.name) / "control.sock")
+        self.process = None
+        try:
+            self.process = subprocess.Popen([sys.executable, "-c", BACKEND_GUARD_SCRIPT,
+                                            CODEX, "app-server", "--listen", "unix://" + self.socket],
+                                            stdin=subprocess.PIPE,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                            start_new_session=True,
+                                            pass_fds=(() if self.lock_fd is None else (self.lock_fd,)))
+            deadline = time.monotonic() + 15
+            while not Path(self.socket).exists():
+                if self.process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("Codex backend did not start; update Codex and retry")
+                time.sleep(0.05)
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *args):
+        if self.process is not None:
+            self.process.stdin.close()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Never release the conversation lock by killing its owner
+                # while an unconfirmed backend might still be running.
+                raise RuntimeError("Codex backend cleanup is still pending; its conversation remains locked")
+        self.directory.cleanup()
+
+
+def run_child(state: dict, lock_fd=None) -> int:
     while True:
         baseline = oom_kills()
         state.update({
@@ -535,16 +911,26 @@ def run_child(state: dict) -> int:
             str(state["thread_id"]),
         ]
         try:
-            child = subprocess.Popen(command)
-            while True:
+            with CodexBackend(lock_fd) as backend:
+                child = subprocess.Popen(command + ["--remote", "unix://" + backend.socket])
+                stop_recovery = threading.Event()
+                recovery = GoalRecovery(dict(state, control_socket=backend.socket), stop_recovery)
+                monitor = threading.Thread(target=recovery.run, daemon=True)
+                monitor.start()
                 try:
-                    returncode = child.wait()
-                    break
-                except KeyboardInterrupt:
-                    # The foreground child receives Ctrl-C as well. Let Codex
-                    # handle it; never abandon a still-running child process.
-                    continue
-        except OSError as error:
+                    while True:
+                        try:
+                            returncode = child.wait()
+                            break
+                        except KeyboardInterrupt:
+                            stop_recovery.set()
+                            # The foreground child receives Ctrl-C as well.
+                            continue
+                    backend_oom = backend.process.poll() in {-9, 137}
+                finally:
+                    stop_recovery.set()
+                    monitor.join(timeout=5)
+        except (OSError, RuntimeError) as error:
             state.update({
                 "desired": "stopped",
                 "status": "failed",
@@ -554,7 +940,7 @@ def run_child(state: dict) -> int:
             print(f"scodex: could not start Codex: {error}", file=sys.stderr)
             return 1
         current_oom = oom_kills()
-        oom_exit = returncode in {-9, 137} and current_oom > baseline
+        oom_exit = (returncode in {-9, 137} or backend_oom) and current_oom > baseline
         if not oom_exit:
             state.update({"desired": "stopped", "status": "stopped", "last_exit": returncode})
             save(state)
@@ -5580,7 +5966,7 @@ fi
     def ensure_remote_runtime_current(self, instance: dict[str, Any]) -> None:
         result = self.remote_command(
             instance,
-            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 5 "
+            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 7 "
             "&& test -x /home/remote/.local/bin/codex "
             "&& systemctl is-enabled --quiet envr-tmux.service",
             check=False,
@@ -6494,7 +6880,7 @@ try:
     enabled = subprocess.run(['systemctl', 'is-enabled', '--quiet', 'envr-tmux.service']).returncode == 0
 except (OSError, subprocess.CalledProcessError):
     sys.exit(10)
-if version != '5' or not enabled:
+if version != '7' or not enabled:
     sys.exit(10)
 folder = request['folder']
 if folder is None:
