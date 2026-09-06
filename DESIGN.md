@@ -571,7 +571,12 @@ other terminal command themselves. Plain `codex` is not supervised.
 Candidate sessions are filtered by the exact repository directory using the
 local Codex state database, with rollout metadata as a compatibility fallback.
 Subagent and non-interactive threads are excluded. The latest eligible main
-conversation binds automatically. A stored UUID is reused thereafter;
+conversation binds automatically. With empty history the wrapper creates a
+legacy thread on its owned backend and names it to materialize the empty rollout
+without a model turn. Its temporary conversation lock is hard-linked to the
+returned UUID before publication, so the lifetime guard retains the same locked
+inode. The terminal resumes this exact thread and first-run supervision applies.
+A stored UUID is reused thereafter;
 `scodex resume --choose` offers up to ten recent eligible conversations and explicitly
 rebinds the pane, and one UUID cannot be armed in two panes. Recovery therefore
 never relies on recency or `--last`.
@@ -591,7 +596,7 @@ state belongs to the exact Codex thread itself. Automatic recovery is capped at
 three retries in ten minutes.
 
 Goal recovery is a separate observer inside the supervised wrapper, not a
-second Codex runner. Protocol version 7 gives each wrapper one owned app-server
+second Codex runner. Protocol version 8 gives each wrapper one owned app-server
 backend with a private socket in a mode-700 temporary directory under `/tmp`.
 The TUI attaches with `--remote unix://PATH`; the observer joins that same backend
 through `codex app-server proxy --sock PATH` (raw WebSocket transport).
@@ -624,8 +629,14 @@ model, permissions, accounting, and budget are not replaced. A lost mutation
 response disables the observer rather than blindly retrying an accepted command.
 Codex lacks compare-and-set goal updates, so a truly simultaneous cross-client
 pause remains a documented race, not a guaranteed atomic operation. The observer
-does not reconstruct missed failure events after disconnection or recover
-arbitrary preexisting blocked sessions. Backend integration is experimental;
+reconciles the newest failed turn on startup, checking goal timestamps before
+attributing a missed failure to an active/usage-limited goal. A preexisting
+blocked goal requires persisted evidence of the exact goal snapshot and failed
+turn; arbitrary blocked goals remain stopped and report needs-attention.
+Status records include a 30-second heartbeat, wrapper PID and boot ID.
+`scodex status` also checks the live pane and held wrapper lock, exposing
+unsupervised or stale sessions. Runtime updates do not retrofit running plain
+Codex processes; those require a normal exit and exact-UUID supervised resume. Backend integration is experimental;
 tests use an isolated real backend and a loopback-only fake model provider.
 
 Recovery checks pane ownership and never replaces a live pane using a stale
@@ -650,6 +661,14 @@ and the dedicated service owns tmux after the next reboot or fresh resize.
 The resulting remote
 `/home/remote/.codex/auth.json` is pulled atomically after disconnection and
 before destruction.
+
+Goal recovery also classifies structured network/stream errors with absent or
+transient HTTP statuses (408, 429, 500, 502, 503, 504). Authentication and other
+client errors remain ineligible. The observer reconnects to its existing backend
+with capped 5/15/30/60-second delays, revalidates persisted goal/turn evidence, and
+preserves pending deadlines. Ambiguous goal mutation results and incompatible
+protocols remain visible failures requiring attention.
+
 
 ## `envr status`
 
@@ -769,3 +788,27 @@ Paths outside `~/envr` require an explicit warning acknowledgment because they
 are not included in migration. Existing tmux sessions are attached unchanged.
 The old up, resize, git, cloud, destroy, and port-open command entry points are
 removed, with no aliases. Provider tokens remain local to each device.
+
+
+## Private update boundary
+
+`PrivateUpdates` owns local key handling, package authentication, source validation,
+and atomic executable replacement. `Envr.update_menu` owns only menu/SSH transport
+using the cached machine and strict known-host verification. Neither path starts
+Codex, calls provider APIs, or synchronizes the update key to the VPS.
+
+Envelope v1 is `ENVR-UPDATE-1\n`, followed by OpenSSL salted AES-256-CBC ciphertext,
+then HMAC-SHA256 over the complete preceding envelope. Independent encryption and
+MAC secrets are derived from the 256-bit shared key using distinct HMAC
+labels. Generated hexadecimal keys retain their original interpretation; ordinary
+UTF-8 passphrases are stretched with scrypt (N=16384, r=8, p=1, 32-byte output,
+fixed domain salt `envr-update-passphrase-v1`) to agree across devices. Authentication is constant-time and precedes decryption. OpenSSL receives
+its encryption secret through an inherited pipe, not argv/environment or a file;
+PBKDF2 uses SHA-256, 100,000 iterations, and an explicit-compatible 8-byte salt.
+OpenSSL's `enc` alone is not authenticated; the outer MAC is mandatory.
+See https://docs.openssl.org/3.0/man1/openssl-enc/.
+
+The authenticated Python source supplies the version without being executed.
+Only a higher semantic version replaces differing contents. No release registry,
+key recovery mechanism, or server-side decryption is involved. Losing the key
+means replacing it and publishing anew from a trusted local installation.

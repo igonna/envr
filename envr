@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.15.7"
+VERSION = "0.16.2"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -188,8 +188,11 @@ case "${1:-}" in
         shift
         exec envr-codex-supervisor resume "$@"
         ;;
+    status)
+        exec envr-codex-supervisor status
+        ;;
     *)
-        echo "usage: scodex auth | scodex resume [--choose|SESSION_UUID]" >&2
+        echo "usage: scodex auth | scodex resume [--choose|SESSION_UUID] | scodex status" >&2
         exit 2
         ;;
 esac
@@ -233,7 +236,7 @@ TMUX = os.environ.get("ENVR_TMUX", "tmux")
 CODEX = os.environ.get("ENVR_CODEX", "codex")
 os.environ["NPM_CONFIG_PREFIX"] = str(REMOTE_HOME / ".local")
 os.environ["PATH"] = str(REMOTE_HOME / ".local/bin") + os.pathsep + os.environ.get("PATH", "")
-PROTOCOL_VERSION = "7"
+PROTOCOL_VERSION = "9"
 UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -500,7 +503,9 @@ def save(state: dict) -> None:
 
 def run_bound(state: dict) -> int:
     # Lock the conversation too: two different panes can select it concurrently.
-    thread_lock = (STATE_ROOT / f"thread-{state['thread_id']}.lock").open("a+")
+    fresh = state['thread_id'] is None
+    lock_name = STATE_ROOT / f"thread-{state['thread_id'] or ('new-' + str(uuid.uuid4()))}.lock"
+    thread_lock = lock_name.open("a+")
     try:
         fcntl.flock(thread_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -510,20 +515,24 @@ def run_bound(state: dict) -> int:
         save(state)
         raise RuntimeError("that Codex conversation is already running")
     try:
-        return run_child(state, thread_lock.fileno())
+        return run_child(state, thread_lock.fileno(), lock_name if fresh else None)
     except KeyboardInterrupt:
         state.update({"desired": "stopped", "status": "stopped", "last_exit": 130})
         save(state)
         return 130
     finally:
         thread_lock.close()
+        if fresh:
+            lock_name.unlink(missing_ok=True)
 
 
 class GoalRecovery:
     """Observe one live thread; never create a backend or replay user input."""
 
     DELAYS = (60, 120, 300, 900)
-    TRANSIENT = {"serverOverloaded", "internalServerError", "rateLimitExceeded"}
+    TRANSIENT = {"serverOverloaded", "internalServerError", "rateLimitExceeded", "transportFailure"}
+    NETWORK_ERRORS = {"httpConnectionFailed", "responseStreamConnectionFailed",
+                      "responseStreamDisconnected", "responseTooManyFailedAttempts"}
 
     def __init__(self, state: dict, stop: threading.Event):
         self.thread_id = state["thread_id"]
@@ -541,9 +550,17 @@ class GoalRecovery:
         self.goal = None
         self.subscribed = False
         self.service_block_turn = None
+        self.report_status = "watching"
+        self.report_reason = ""
+        self.report_time = 0
+        self.mutation_uncertain = False
 
     def report(self, status: str, reason: str = "") -> None:
-        atomic_json(self.path, {"thread_id": self.thread_id, "status": status,
+        self.report_status, self.report_reason = status, reason
+        self.report_time = time.monotonic()
+        atomic_json(self.path, {"schema": 1, "thread_id": self.thread_id, "status": status,
+                               "pending": self.pending, "updated_at": int(time.time()),
+                               "monitor_pid": os.getpid(), "boot_id": boot_id(),
                                "reason": reason, "next_retry": self.pending["due"] if self.pending else None})
 
     def cancel(self) -> None:
@@ -596,6 +613,12 @@ class GoalRecovery:
 
     def schedule(self, turn_id, error: dict) -> None:
         code = error.get("codexErrorInfo")
+        if isinstance(code, dict) and len(code) == 1:
+            name, detail = next(iter(code.items()))
+            if name in self.NETWORK_ERRORS and isinstance(detail, dict):
+                status = detail.get("httpStatusCode")
+                if status is None or status in {408, 429, 500, 502, 503, 504}:
+                    code = "transportFailure"
         # Codex 0.153 also maps HTTP admission failures to `other`. Match only
         # the anchored transport diagnostic, never conversational/TUI content.
         if code == "other" and re.match(r"^unexpected status (?:502|503|504)\b", error.get("message", "")):
@@ -610,9 +633,76 @@ class GoalRecovery:
         if self.pending and self.pending["turn"] == turn_id:
             return
         self.pending = {"turn": turn_id, "code": code, "identity": self.identity(self.goal),
+                        "goal": self.goal.copy(),
                         "status": self.goal["status"],
                         "due": time.time() + self.DELAYS[min(self.attempts, len(self.DELAYS) - 1)]}
         self.report("waiting", code)
+
+    def reconcile(self, previous=None) -> None:
+        """Recover missed terminal failures, never infer intent from screen text."""
+        goal = self.goal
+        if not goal or self.pending:
+            return
+        turns = self.request("thread/turns/list", {"threadId": self.thread_id, "limit": 1,
+                            "sortDirection": "desc", "itemsView": "summary"}).get("data") or []
+        latest = self.request("thread/goal/get", {"threadId": self.thread_id}).get("goal")
+        if latest != goal or self.goal != goal or self.pending or not turns:
+            return
+        turn = turns[0]
+        if turn.get("status") != "failed":
+            return
+        if goal.get("status") == "blocked":
+            evidence = (previous or {}).get("pending") or {}
+            if ((previous or {}).get("thread_id") != self.thread_id
+                    or evidence.get("turn") != turn.get("id") or evidence.get("goal") != goal):
+                self.report("needs-attention", "blocked goal has no recorded service-failure provenance")
+                return
+            self.service_block_turn = turn["id"]
+        else:
+            completed = turn.get("completedAt")
+            started = turn.get("startedAt")
+            if (not isinstance(completed, (int, float)) or not isinstance(started, (int, float))
+                    or goal.get("createdAt", completed + 1) > started
+                    or goal.get("updatedAt", completed + 1) > completed):
+                return
+        self.schedule(turn.get("id"), turn.get("error") or {})
+
+    def connect(self) -> None:
+        self.process = subprocess.Popen([CODEX, "app-server", "proxy", "--sock", self.control_socket],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.handshake()
+        self.request("initialize", {"clientInfo": {"name": "envr_recovery", "version": "2"},
+                                    "capabilities": {"experimentalApi": True}})
+        self.send_frame(b'{"method":"initialized"}')
+
+    def disconnect(self) -> None:
+        if self.process is not None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            self.process.stdin.close()
+            self.process.stdout.close()
+            self.process = None
+
+    def create_thread(self, state, lock_name) -> None:
+        self.connect()
+        thread = self.request("thread/start", {"cwd": self.cwd, "approvalPolicy": "never",
+                              "sandbox": "danger-full-access", "historyMode": "legacy"}).get("thread") or {}
+        identifier = thread.get("id", "")
+        if not UUID.fullmatch(identifier) or os.path.realpath(thread.get("cwd", "")) != self.cwd:
+            raise RuntimeError("Codex did not create the requested conversation")
+        # The guard already inherited this locked inode. Publish its canonical
+        # name before exposing the UUID, retaining ownership even after SIGKILL.
+        os.link(lock_name, STATE_ROOT / f"thread-{identifier}.lock")
+        self.thread_id = state["thread_id"] = identifier
+        # Codex 0.153.4 only materializes an empty legacy rollout after naming it.
+        # This makes the first thread resumable without submitting a model prompt.
+        self.request("thread/name/set", {"threadId": identifier, "name": "New conversation"})
+        save(state)
+        print(f"Starting a new supervised conversation: {identifier}", flush=True)
 
     def read_bytes(self, timeout: float) -> bool:
         if not select.select([self.process.stdout], [], [], timeout)[0]:
@@ -739,6 +829,7 @@ class GoalRecovery:
             buckets = limits.get("rateLimitsByLimitId") or {"default": limits.get("rateLimits")}
             if not buckets or not any(buckets.values()):
                 pending["due"] = time.time() + 900
+                self.report("waiting", "usage information unavailable")
                 return
             resets = []
             for bucket in buckets.values():
@@ -758,59 +849,90 @@ class GoalRecovery:
             return
         self.cancel()  # A timeout must not blindly repeat a possibly accepted mutation.
         self.attempts += 1
+        self.mutation_uncertain = True
         self.request("thread/goal/set", {"threadId": self.thread_id, "status": "active"})
+        self.mutation_uncertain = False
         self.report("resumed", pending["code"])
 
-    def run(self) -> None:
-        try:
-            # The TUI owns startup. A proxy only joins the already-running backend;
-            # it must not launch a second runner against the same history.
-            if self.stop.wait(0.05):
+    def observe(self, previous) -> None:
+        # The TUI owns startup. A proxy only joins the already-running backend;
+        # it must not launch a second runner against the same history.
+        if self.stop.wait(0.05):
+            return
+        if self.process is None:
+            self.connect()
+        for _ in range(60):
+            loaded = self.request("thread/loaded/list", {}).get("data") or []
+            if self.thread_id in loaded:
+                break
+            if self.stop.wait(0.5):
                 return
-            self.process = subprocess.Popen([CODEX, "app-server", "proxy", "--sock", self.control_socket],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            self.handshake()
-            self.request("initialize", {"clientInfo": {"name": "envr_recovery", "version": "1"},
-                                        "capabilities": {"experimentalApi": True}})
-            self.send_frame(b'{"method":"initialized"}')
-            for _ in range(60):
-                loaded = self.request("thread/loaded/list", {}).get("data") or []
-                if self.thread_id in loaded:
-                    break
-                if self.stop.wait(0.5):
-                    return
-            else:
-                raise RuntimeError("conversation is not on the shared Codex backend")
-            # Loaded-thread resume subscribes to the same live thread, no overrides.
-            thread = self.request("thread/resume", {"threadId": self.thread_id,
-                                                     "excludeTurns": True}).get("thread") or {}
-            self.subscribed = True
-            if os.path.realpath(thread.get("cwd") or "") != os.path.realpath(self.cwd):
-                raise RuntimeError("Codex conversation directory mismatch")
-            self.goal = self.request("thread/goal/get", {"threadId": self.thread_id}).get("goal")
+        else:
+            raise RuntimeError("conversation is not on the shared Codex backend")
+        # Loaded-thread resume subscribes to the same live thread, no overrides.
+        thread = self.request("thread/resume", {"threadId": self.thread_id,
+                                                 "excludeTurns": True}).get("thread") or {}
+        if os.path.realpath(thread.get("cwd") or "") != os.path.realpath(self.cwd):
+            raise RuntimeError("Codex conversation directory mismatch")
+        self.goal = self.request("thread/goal/get", {"threadId": self.thread_id}).get("goal")
+        self.pending = None
+        self.reconcile(previous)
+        self.subscribed = True
+        if self.pending is None and self.report_status != "needs-attention":
             self.report("watching")
+        saved = (previous or {}).get("pending") or {}
+        if (self.pending and self.pending["turn"] == saved.get("turn")
+                and self.pending["goal"] == saved.get("goal")):
+            self.pending["due"] = max(self.pending["due"], saved.get("due", 0))
+            self.report("waiting", self.pending["code"])
+        while not self.stop.is_set():
+            message = self.receive(0.5)
+            if message is not None:
+                self.event(message)
+            self.retry()
+            if time.monotonic() - self.report_time >= 30:
+                self.report(self.report_status, self.report_reason)
+
+    def run(self) -> None:
+        previous = load_state(self.path)
+        failures = 0
+        try:
             while not self.stop.is_set():
-                message = self.receive(0.5)
-                if message is not None:
-                    self.event(message)
-                self.retry()
-        except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError) as error:
-            self.cancel()
-            if not self.stop.is_set():
-                self.report("unavailable", str(error))
-                if self.pane:
-                    run_tmux("display-message", "-t", self.pane,
-                             "envr: goal recovery unavailable; Codex remains open. See ~/.config/envr/supervision/goal-recovery/")
-        finally:
-            if self.process is not None:
-                self.process.terminate()
                 try:
-                    self.process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait()
-                self.process.stdin.close()
-                self.process.stdout.close()
+                    self.observe(previous)
+                    return
+                except (OSError, ValueError, RuntimeError, TypeError, KeyError, AttributeError) as error:
+                    transport = isinstance(error, OSError) or str(error) in {
+                        "Codex control connection closed", "Codex control handshake timed out",
+                        "Codex control request interrupted or timed out"}
+                    if self.stop.is_set():
+                        return
+                    if not transport or self.mutation_uncertain:
+                        self.cancel()
+                        self.report("unavailable", str(error))
+                        if self.pane:
+                            run_tmux("display-message", "-t", self.pane,
+                                     "envr: goal recovery unavailable; run scodex status")
+                        return
+                    # Rejoin only this backend. Preserve failure evidence and deadlines,
+                    # then re-read goal/turn state before considering any mutation.
+                    if self.subscribed:
+                        previous = {"thread_id": self.thread_id, "pending": self.pending}
+                    self.disconnect()
+                    self.buffer = b""
+                    self.fragments.clear()
+                    self.subscribed = False
+                    self.goal = None
+                    self.pending = (previous or {}).get("pending")
+                    self.service_block_turn = None
+                    delay = (5, 15, 30, 60)[min(failures, 3)]
+                    failures += 1
+                    for remaining in range(delay, 0, -30):
+                        self.report("unavailable", "reconnecting control connection")
+                        if self.stop.wait(min(remaining, 30)):
+                            return
+        finally:
+            self.disconnect()
             if self.stop.is_set():
                 self.report("stopped")
 
@@ -891,7 +1013,7 @@ class CodexBackend:
         self.directory.cleanup()
 
 
-def run_child(state: dict, lock_fd=None) -> int:
+def run_child(state: dict, lock_fd=None, new_lock_name=None) -> int:
     while True:
         baseline = oom_kills()
         state.update({
@@ -912,9 +1034,16 @@ def run_child(state: dict, lock_fd=None) -> int:
         ]
         try:
             with CodexBackend(lock_fd) as backend:
-                child = subprocess.Popen(command + ["--remote", "unix://" + backend.socket])
                 stop_recovery = threading.Event()
                 recovery = GoalRecovery(dict(state, control_socket=backend.socket), stop_recovery)
+                try:
+                    if state["thread_id"] is None:
+                        recovery.create_thread(state, new_lock_name)
+                        command[-1] = state["thread_id"]
+                    child = subprocess.Popen(command + ["--remote", "unix://" + backend.socket])
+                except BaseException:
+                    recovery.disconnect()
+                    raise
                 monitor = threading.Thread(target=recovery.run, daemon=True)
                 monitor.start()
                 try:
@@ -998,14 +1127,6 @@ def resume(arguments: list[str]) -> int:
             fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
             if (STATE_ROOT.parent / "resize-in-progress").exists():
                 raise RuntimeError("resize is in progress; reconnect after it finishes")
-            if thread_id is None:
-                # A new CLI conversation has no known UUID yet. Never guess a
-                # different conversation for recovery or claim it is supervised.
-                print("Starting a new conversation. Automatic recovery applies on a later resume.", flush=True)
-                try:
-                    os.execvp(CODEX, [CODEX, "--dangerously-bypass-approvals-and-sandbox", "-C", cwd])
-                except OSError as error:
-                    raise RuntimeError(f"could not start Codex: {error}") from error
             state.update({"desired": "running", "status": "starting",
                           "boot_id": boot_id(), "oom_baseline": oom_kills()})
             save(state)
@@ -1214,6 +1335,42 @@ def disarm_all() -> int:
     return 0
 
 
+def protection_status() -> int:
+    panes = run_tmux("list-panes", "-a", "-F", "#{session_name}\t#{pane_id}", capture=True)
+    if panes.returncode != 0:
+        print("No live envr panes; goal recovery is not running.")
+        return 1
+    states = [load_state(path) for path in STATE_ROOT.glob("*.json")]
+    unprotected = False
+    for line in panes.stdout.splitlines():
+        session, _, pane = line.partition("\t")
+        if not SESSION.fullmatch(session):
+            continue
+        state = next((s for s in states if s and s.get("pane") == pane
+                      and s.get("tmux_session") == session and s.get("desired") == "running"), None)
+        record = load_state(STATE_ROOT / "goal-recovery" / (state["slot"] + ".json")) if state else None
+        live = False
+        if (record and record.get("thread_id") == state.get("thread_id")
+                and record.get("boot_id") == boot_id()
+                and time.time() - record.get("updated_at", 0) < 90):
+            try:
+                pid = int(record.get("monitor_pid", 0))
+                if pid > 0:
+                    os.kill(pid, 0)
+                    handle = lock_slot(state["slot"], blocking=False)
+                    live = handle is None
+                    if handle:
+                        handle.close()
+            except (OSError, ValueError, TypeError):
+                pass
+        protected = live and record.get("status") in {"watching", "waiting", "resumed"}
+        label = record["status"] if protected else "UNPROTECTED"
+        detail = (record or {}).get("reason") or ""
+        print(f"{session} {pane}: {label}" + (f" ({detail})" if detail else ""))
+        unprotected |= not protected
+    return int(unprotected)
+
+
 def main(arguments: list[str]) -> int:
     try:
         if arguments and arguments[0] == "resume":
@@ -1232,6 +1389,8 @@ def main(arguments: list[str]) -> int:
         if arguments == ["version"]:
             print(PROTOCOL_VERSION)
             return 0
+        if arguments == ["status"]:
+            return protection_status()
         raise RuntimeError("invalid envr Codex supervisor operation")
     except RuntimeError as error:
         print(f"scodex: {error}", file=sys.stderr)
@@ -3825,6 +3984,136 @@ class UpCloudAPI:
         raise EnvrError(f"unsupported UpCloud operation: {method} {resource}")
 
 
+class PrivateUpdates:
+    """Local package authentication/installation; the VPS stores opaque bytes only."""
+
+    MAGIC = b"ENVR-UPDATE-1\n"
+    LIMIT = 4 * 1024 * 1024
+
+    def __init__(self, root: Path):
+        self.key_path = root / "update-key"
+
+    @staticmethod
+    def parse_key(value: str) -> bytes:
+        if not value:
+            raise EnvrError("set an update key first")
+        # Retain compatibility with generated keys; ordinary passphrases are
+        # deterministically stretched so matching input works on every device.
+        if re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            return bytes.fromhex(value)
+        return hashlib.scrypt(value.encode("utf-8"), salt=b"envr-update-passphrase-v1",
+                              n=16384, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
+
+    def key(self) -> bytes:
+        try:
+            return self.parse_key(self.key_path.read_text().strip())
+        except OSError as error:
+            raise EnvrError("set an update key first") from error
+
+    def set_key(self) -> None:
+        value = getpass.getpass("Enter update key or passphrase, or press Enter to generate: ").strip()
+        generated = not value
+        value = value or secrets.token_hex(32)
+        self.parse_key(value)
+        atomic_write_text(self.key_path, value + "\n")
+        if generated:
+            print("Copy this key to your other devices (it is saved only here):")
+            print(value)
+        print("Update key saved.")
+
+    @staticmethod
+    def require_crypto() -> None:
+        if shutil.which("openssl") is None:
+            hint = "pkg install openssl-tool" if package_environment() == "termux" else "install OpenSSL or rerun install.sh"
+            raise EnvrError(f"private updates need OpenSSL; run {hint}. No packages were installed")
+
+    @staticmethod
+    def crypt(data: bytes, key: bytes, decrypt: bool = False) -> bytes:
+        # OpenSSL handles encryption; authenticate the entire envelope separately
+        # before decryption. Domain-separated keys prevent encryption/MAC reuse.
+        PrivateUpdates.require_crypto()
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, hmac.digest(key, b"envr-update-encryption-v1", "sha256").hex().encode() + b"\n")
+            os.close(write_fd)
+            write_fd = -1
+            args = ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "100000",
+                    "-md", "sha256", "-pass", f"fd:{read_fd}"]
+            # OpenSSL 3.2 changed its default salt length; fix it across versions.
+            help_result = subprocess.run(["openssl", "enc", "-help"], capture_output=True, timeout=10)
+            if b"-saltlen" in help_result.stderr:
+                args += ["-saltlen", "8"]
+            if decrypt:
+                args.append("-d")
+            result = subprocess.run(args, input=data, capture_output=True,
+                                    pass_fds=(read_fd,), timeout=30)
+            if result.returncode:
+                raise EnvrError("update encryption/decryption failed; installation unchanged")
+            return result.stdout
+        finally:
+            os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
+    @staticmethod
+    def version(source: bytes) -> tuple[int, ...]:
+        import ast
+        try:
+            tree = ast.parse(source)
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "VERSION" for t in node.targets):
+                    value = ast.literal_eval(node.value)
+                    if isinstance(value, str) and re.fullmatch(r"\d+\.\d+\.\d+", value):
+                        return tuple(map(int, value.split(".")))
+        except (SyntaxError, ValueError, TypeError, UnicodeError):
+            pass
+        raise EnvrError("update does not contain a valid envr version")
+
+    def pack(self, source: bytes) -> bytes:
+        if len(source) > self.LIMIT:
+            raise EnvrError("update exceeds size limit")
+        self.version(source)
+        key = self.key()
+        body = self.MAGIC + self.crypt(source, key)
+        return body + hmac.digest(hmac.digest(key, b"envr-update-authentication-v1", "sha256"), body, "sha256")
+
+    def unpack(self, package: bytes) -> bytes:
+        if not len(self.MAGIC) + 32 < len(package) <= self.LIMIT + 128:
+            raise EnvrError("invalid update package size")
+        key = self.key()
+        body, tag = package[:-32], package[-32:]
+        expected = hmac.digest(hmac.digest(key, b"envr-update-authentication-v1", "sha256"), body, "sha256")
+        if not hmac.compare_digest(tag, expected) or not body.startswith(self.MAGIC):
+            raise EnvrError("update key mismatch or package tampering; installation unchanged")
+        source = self.crypt(body[len(self.MAGIC):], key, decrypt=True)
+        self.version(source)
+        return source
+
+    def install(self, package: bytes, target: Path) -> bool:
+        source = self.unpack(package)
+        current = target.read_bytes()
+        if self.version(source) < self.version(current):
+            raise EnvrError("refusing an older envr version")
+        if source == current:
+            return False
+        if self.version(source) == self.version(current):
+            raise EnvrError("same version has different contents; publish with a higher VERSION")
+        # Do not execute downloaded code to validate it or change parent permissions.
+        descriptor, name = tempfile.mkstemp(prefix=".envr-update-", dir=target.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                os.fchmod(output.fileno(), target.stat().st_mode & 0o777)
+                output.write(source)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(name, target)
+            fsync_directory(target.parent)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name)
+        return True
+
+
 class Envr:
     def __init__(self, root: Path | None = None):
         self.root = root or data_root()
@@ -5966,7 +6255,7 @@ fi
     def ensure_remote_runtime_current(self, instance: dict[str, Any]) -> None:
         result = self.remote_command(
             instance,
-            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 7 "
+            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 9 "
             "&& test -x /home/remote/.local/bin/codex "
             "&& systemctl is-enabled --quiet envr-tmux.service",
             check=False,
@@ -6708,6 +6997,66 @@ trap - EXIT
                     break
                 else:
                     print("Choose C, E, R, or B.")
+
+    def update_menu(self) -> None:
+        updates = PrivateUpdates(self.root)
+        while True:
+            print(f"\nPrivate updates · envr {VERSION}\n  P. Pull update\n  U. Publish this device's version\n  K. Set or replace update key\n  Q. Quit")
+            choice = input("Choose P, U, K, or Q: ").strip().lower()
+            if choice in {"", "q"}:
+                return
+            if choice == "k":
+                updates.set_key()
+                continue
+            if choice not in {"p", "u"}:
+                continue
+            updates.require_crypto()
+            updates.key()
+            instance = self.cached_instance()
+            if instance is None:
+                raise EnvrError("connect with envr go first so this device knows your machine")
+            target = Path(__file__).resolve()
+            if choice == "u":
+                package = updates.pack(target.read_bytes())
+                # One atomic remote replacement; key and plaintext never leave here.
+                script = """import base64, os, pathlib, sys, tempfile
+p = pathlib.Path.home() / '.local/share/envr/update.pkg'
+p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+data = base64.b64decode(sys.stdin.buffer.read(6000000), validate=True)
+fd, name = tempfile.mkstemp(prefix='.update-', dir=p.parent)
+try:
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(name, p)
+finally:
+    if os.path.exists(name): os.unlink(name)
+"""
+                self.remote_command(instance, "python3 -c " + shlex.quote(script),
+                                    input_data=base64.b64encode(package).decode(),
+                                    quiet=True, timeout=60, strict_host_key_checking="yes")
+                print(f"Published envr {VERSION} to your private machine.")
+            else:
+                script = """import base64, pathlib, sys
+p = pathlib.Path.home() / '.local/share/envr/update.pkg'
+with p.open('rb') as f: data = f.read(4194433)
+if len(data) > 4194432: sys.exit('update package exceeds size limit')
+sys.stdout.write(base64.b64encode(data).decode())
+"""
+                result = self.remote_command(instance, "python3 -c " + shlex.quote(script),
+                                             capture=True, timeout=60, strict_host_key_checking="yes")
+                try:
+                    if len(result.stdout) > 6000000:
+                        raise ValueError("oversized update")
+                    package = base64.b64decode(result.stdout, validate=True)
+                except ValueError as error:
+                    raise EnvrError("invalid update download; installation unchanged") from error
+                if updates.install(package, target):
+                    print("Updated envr. Run envr again to use the new version.")
+                else:
+                    print("Already up to date.")
+                return
 
     def machine_menu(self) -> None:
         while True:
@@ -8584,6 +8933,7 @@ def build_parser() -> argparse.ArgumentParser:
     go.add_argument("--choose", action="store_true", help="add, edit, remove, or select workspaces (offline)")
 
     subparsers.add_parser("status", help="show account and VPS status")
+    subparsers.add_parser("update", help="pull/publish private updates or set the shared key")
 
     return parser
 
@@ -8602,6 +8952,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         attachment: tuple[dict[str, Any], dict[str, Any] | None] | None = None
         with exclusive_lock(app.root):
+            if namespace.command == "update":
+                try:
+                    app.update_menu()
+                except OSError as error:
+                    raise EnvrError(f"private update failed: {error}") from error
+                return 0
             if namespace.command == "relay":
                 app.relay_menu()
                 return 0

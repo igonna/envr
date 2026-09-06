@@ -82,14 +82,16 @@ VPS exists, it tells you to run `envr machine`.
 ```bash
 scodex auth
 scodex resume
+# From another shell, check live pane coverage:
+scodex status
 ```
 
 `scodex auth` starts device authentication. `scodex resume` resumes Codex with
 approvals and sandboxing explicitly bypassed; use it only because this VPS is
 disposable and isolated for that purpose. With no saved conversation in the
-repository, it starts a new conversation using the same bypass flag. That first
-run is not automatically recovered: exact-thread supervision begins on a later
-resume, once the conversation has a saved UUID. Explicit missing UUIDs still fail
+repository, it creates a named empty conversation on the owned backend and
+supervises that first run with the same bypass permissions. No prompt is sent
+to create it. Explicit missing UUIDs still fail
 rather than silently starting a different conversation. On first resume it binds
 the tmux pane to the latest main interactive conversation in that repository,
 excluding subagents, and remembers its exact UUID. `scodex resume --choose`
@@ -106,7 +108,8 @@ OOM restarts in ten minutes. Plain `codex` remains completely unsupervised.
 
 On Codex 0.153.4, supervised resumes also watch the same live backend for
 temporary service failures and usage limits. Recognized capacity/server failures
-retry after 1, 2, 5, then 15 minutes; usage exhaustion waits for the reported
+and structured transient network/stream failures retry after 1, 2, 5, then
+15 minutes; usage exhaustion waits for the reported
 reset plus a margin and rechecks availability. No model prompts are used for
 polling. A backend-generated `blocked` goal is recoverable only when correlated
 with that exact turn's recognized service error. User pauses, genuine blockers,
@@ -121,10 +124,22 @@ exposed. A small lifetime guard cleans up the owned backend even if the wrapper
 is killed, retaining the conversation lock until cleanup finishes. Normal exit
 also removes its temporary socket directory.
 It uses the experimental app-server protocol,
-so an incompatible CLI/control connection disables goal recovery without closing
-Codex. A tmux notice and private status record under
+so an incompatible CLI/control protocol disables goal recovery without closing
+Codex. Temporary control disconnects reconnect to the same backend after 5, 15,
+30, then 60 seconds, rechecking the goal and latest turn and preserving pending
+retry deadlines. A lost response to a goal-resume mutation still stops recovery
+for attention rather than risking a duplicate mutation. A tmux notice and private status record under
 `~/.config/envr/supervision/goal-recovery/` make that failure visible.
-It watches new failures after subscribing, not arbitrary old stalled sessions.
+On startup it also checks the latest failed turn for missed service errors.
+Active/usage-limited goals must predate that failure; blocked goals additionally
+require saved evidence tying the unchanged goal to that service failure. An old
+blocked goal without that evidence reports `needs-attention` and stays stopped.
+`scodex status` checks each live envr pane against its wrapper lock, process, and
+monitor heartbeat. It reports `UNPROTECTED` for plain Codex, stopped or broken
+monitors, and goals requiring attention. Installing an update cannot attach to
+an already-running plain Codex process: exit that terminal normally, then run
+`scodex resume SESSION_UUID` in the same pane. If its goal was already blocked
+before monitoring existed, explicitly resume the goal once inside Codex.
 It does not recover every possible hang. Pause events and state are checked
 before recovery, but Codex currently has no atomic conditional goal-update API:
 a simultaneous pause from another client remains a protocol-level race.
@@ -416,3 +431,35 @@ Paths outside `~/envr` require an explicit warning acknowledgment because they
 are not included in migration. Existing tmux sessions are attached unchanged.
 The old up, resize, git, cloud, destroy, and port-open command entry points are
 removed, with no aliases. Provider tokens remain local to each device.
+
+## Private updates
+
+Run `envr update` to open the menu: **Pull**, **Publish this device's version**,
+**Set or replace update key**, or **Quit**. Connect once with `envr go` on each
+device first so it has the machine address and trusted SSH access.
+
+Set key accepts a normal passphrase or a generated key; use the same value on
+your other devices. Case matters. Leave the input empty to generate a random key
+and display it for copying to your other trusted devices. It is saved locally
+as `update-key` in envr's configuration directory with mode 0600. Losing it needs
+no recovery: set a new key and publish again, then set that key on other devices.
+
+Publish uploads the currently running envr executable as an encrypted package to
+`~/.local/share/envr/update.pkg` on your cached VPS. Pull authenticates the package
+before decrypting or installing it and atomically replaces the local executable.
+No public repository is involved. The key and plaintext executable are never
+uploaded by this command. Updates require OpenSSL 1.1.1 or newer locally; `install.sh` installs the
+missing command (the `openssl-tool` package on Termux). Pull and Publish never
+install packages; they report a missing dependency before connecting. Other
+envr commands do not use it. On macOS, use Homebrew OpenSSL if the system version
+lacks PBKDF2 support.
+
+Every device with the shared key can publish. A wrong key or modified package
+leaves the installed executable untouched. Older versions are rejected, and a
+changed executable must have a higher `VERSION`; matching contents are a no-op.
+A new device cannot detect an unseen newer release being withheld by the server.
+The first installation must come from a trusted device. Running sessions are
+undisturbed; remote supervisor upgrades follow the usual next-connection path.
+
+Existing devices need this version installed once before they have the update
+menu. Publishing is explicit; ordinary connections never publish a package.

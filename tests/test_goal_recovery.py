@@ -1,9 +1,14 @@
 """No production credentials or VPS connections are used by these tests."""
 import json
 import fcntl
+import contextlib
 import http.server
 import io
 import os
+import pty
+import select
+import shutil
+import signal
 from pathlib import Path
 import queue
 import subprocess
@@ -14,6 +19,7 @@ import time
 import unittest
 from unittest import mock
 
+import test_envr
 from test_envr import envr
 
 
@@ -54,6 +60,74 @@ class GoalRecoveryTests(unittest.TestCase):
         self.watcher.retry()
         self.assertEqual(self.mutations(), [{"threadId": "thread-a", "status": "active"}])
         self.assertIsNone(self.watcher.pending)
+
+    def test_startup_recovers_capacity_failure_missed_before_subscription(self):
+        self.turn.update(startedAt=2, completedAt=3, error={"codexErrorInfo": "serverOverloaded"})
+        self.watcher.reconcile()
+        self.assertIsNotNone(self.watcher.pending)
+        self.watcher.pending["due"] = 0
+        self.watcher.retry()
+        self.assertEqual(self.mutations(), [{"threadId": "thread-a", "status": "active"}])
+
+    def test_startup_does_not_attribute_old_error_to_a_new_or_edited_goal(self):
+        self.turn.update(startedAt=2, completedAt=3, error={"codexErrorInfo": "serverOverloaded"})
+        for field in ("createdAt", "updatedAt"):
+            self.goal[field] = 4
+            self.watcher.goal = self.goal.copy()
+            self.watcher.reconcile()
+            self.assertIsNone(self.watcher.pending)
+
+    def test_startup_blocked_goal_requires_exact_saved_provenance(self):
+        self.goal["status"] = "blocked"
+        self.watcher.goal = self.goal.copy()
+        self.turn["error"] = {"codexErrorInfo": "serverOverloaded"}
+        self.watcher.reconcile()
+        self.assertIsNone(self.watcher.pending)
+        evidence = {"thread_id": "thread-a", "pending": {"turn": "turn-a", "goal": self.goal.copy()}}
+        self.watcher.reconcile(evidence)
+        self.assertIsNotNone(self.watcher.pending)
+        self.watcher.pending["due"] = 0
+        self.watcher.retry()
+        self.assertEqual(len(self.mutations()), 1)
+
+    def test_startup_preserves_user_pause_and_interrupt(self):
+        self.turn.update(startedAt=2, completedAt=3, error={"codexErrorInfo": "serverOverloaded"})
+        for status in ("paused", "complete", "budgetLimited"):
+            self.goal["status"] = status
+            self.watcher.goal = self.goal.copy()
+            self.watcher.reconcile()
+            self.assertIsNone(self.watcher.pending)
+        self.goal["status"] = "active"
+        self.watcher.goal = self.goal.copy()
+        self.turn["status"] = "interrupted"
+        self.watcher.reconcile()
+        self.assertIsNone(self.watcher.pending)
+
+    def test_status_requires_live_monitor_heartbeat_and_locked_wrapper(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.namespace["STATE_ROOT"] = Path(root)
+            self.namespace["boot_id"] = lambda: "boot"
+            self.namespace["run_tmux"] = mock.Mock(return_value=subprocess.CompletedProcess(
+                [], 0, "envr-repo-a\t%1\n", ""))
+            lock_slot = mock.Mock(return_value=None)
+            self.namespace["lock_slot"] = lock_slot
+            state = {"schema": 1, "slot": "slot-a", "pane": "%1", "tmux_session": "envr-repo-a",
+                     "desired": "running", "thread_id": "thread-a"}
+            record = {"schema": 1, "thread_id": "thread-a", "boot_id": "boot",
+                      "monitor_pid": os.getpid(), "updated_at": time.time(), "status": "watching"}
+            atomic = self.namespace["atomic_json"]
+            atomic(Path(root) / "slot-a.json", state)
+            for change, expected in (({}, 0), ({"status": "unavailable"}, 1),
+                                     ({"updated_at": time.time() - 100}, 1),
+                                     ({"thread_id": "different"}, 1)):
+                atomic(Path(root) / "goal-recovery/slot-a.json", dict(record, **change))
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(self.namespace["protection_status"](), expected)
+                self.assertEqual("UNPROTECTED" in output.getvalue(), bool(expected))
+            atomic(Path(root) / "goal-recovery/slot-a.json", record)
+            lock_slot.return_value = mock.Mock()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.namespace["protection_status"](), 1)
 
     def test_unknown_errors_and_text_are_not_classified_as_capacity(self):
         for code in ["other", "unauthorized", "badRequest", "contextWindowExceeded", "sandboxError",
@@ -192,6 +266,87 @@ class GoalRecoveryTests(unittest.TestCase):
             self.watcher.retry()
         self.assertIsNone(self.watcher.pending)
 
+    def test_structured_network_failures_retry_only_transient_statuses(self):
+        for name in self.watcher.NETWORK_ERRORS:
+            for status in (None, 408, 429, 500, 502, 503, 504):
+                with self.subTest(name=name, status=status):
+                    self.watcher.pending = None
+                    self.schedule({name: {"httpStatusCode": status}})
+                    self.assertIsNotNone(self.watcher.pending)
+            for status in (400, 401, 403, 404):
+                self.watcher.pending = None
+                self.schedule({name: {"httpStatusCode": status}})
+                self.assertIsNone(self.watcher.pending)
+
+    def test_monitor_reconnects_with_capped_backoff_and_retains_evidence(self):
+        self.schedule()
+        pending = self.watcher.pending
+        self.watcher.buffer = b"partial"
+        self.watcher.fragments.extend(b"partial")
+        self.watcher.subscribed = True
+        observations = []
+        def observe(previous):
+            observations.append(previous)
+            if len(observations) == 6:
+                self.assertEqual(previous["pending"], pending)
+                self.assertEqual(self.watcher.buffer, b"")
+                self.assertEqual(self.watcher.fragments, bytearray())
+                return
+            raise RuntimeError("Codex control connection closed")
+        self.watcher.observe = observe
+        self.watcher.disconnect = mock.Mock()
+        self.watcher.stop = mock.Mock()
+        self.watcher.stop.is_set.return_value = False
+        self.watcher.stop.wait.return_value = False
+        with mock.patch.dict(self.namespace["GoalRecovery"].run.__globals__, load_state=lambda path: None):
+            self.watcher.run()
+        self.assertEqual([c.args[0] for c in self.watcher.stop.wait.call_args_list],
+                         [5, 15, 30, 30, 30, 30, 30])
+        self.assertFalse(self.mutations())
+
+    def test_reconnect_rechecks_pause_and_preserves_future_retry_deadline(self):
+        for paused in (False, True):
+            with self.subTest(paused=paused):
+                self.goal["status"] = "active"
+                self.watcher.goal = self.goal.copy()
+                self.watcher.pending = None
+                self.schedule()
+                self.watcher.pending["due"] = time.time() + 5000
+                previous = {"thread_id": "thread-a", "pending": self.watcher.pending}
+                self.turn.update(startedAt=2, completedAt=3,
+                                 error={"codexErrorInfo": "serverOverloaded"})
+                if paused:
+                    self.goal["status"] = "paused"
+                original = self.request
+                def request(method, params):
+                    if method == "thread/loaded/list":
+                        return {"data": ["thread-a"]}
+                    if method == "thread/resume":
+                        return {"thread": {"cwd": "/workspace/a"}}
+                    return original(method, params)
+                self.watcher.request = request
+                self.watcher.connect = mock.Mock()
+                self.watcher.stop = mock.Mock()
+                self.watcher.stop.wait.return_value = False
+                self.watcher.stop.is_set.return_value = True
+                self.watcher.observe(previous)
+                if paused:
+                    self.assertIsNone(self.watcher.pending)
+                else:
+                    self.assertEqual(self.watcher.pending["due"], previous["pending"]["due"])
+                self.assertFalse(self.mutations())
+
+    def test_monitor_does_not_reconnect_after_uncertain_mutation_or_protocol_error(self):
+        for uncertain, message in ((True, "Codex control request interrupted or timed out"),
+                                   (False, "unsupported Codex control frame")):
+            self.watcher.mutation_uncertain = uncertain
+            self.watcher.observe = mock.Mock(side_effect=RuntimeError(message))
+            self.watcher.disconnect = mock.Mock()
+            with mock.patch.dict(self.namespace["GoalRecovery"].run.__globals__, load_state=lambda path: None):
+                self.watcher.run()
+            self.watcher.observe.assert_called_once()
+            self.watcher.report.assert_called_with("unavailable", message)
+
     def test_control_transport_handles_fragmented_json_and_ping(self):
         self.watcher.process = mock.Mock(stdin=io.BytesIO())
         self.watcher.buffer = b'\x01\x05{"id"' + b'\x89\x01x' + b'\x80\x03:1}'
@@ -284,14 +439,79 @@ class GoalRecoveryTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("ENVR_TEST_CODEX_PROTOCOL") == "1", "opt-in installed Codex protocol test")
 class InstalledCodexProtocolTests(unittest.TestCase):
+    def test_first_launch_real_terminal_is_supervised_without_a_prompt(self):
+        with tempfile.TemporaryDirectory(prefix="envr-first-", dir="/tmp") as root:
+            fixture = test_envr.RemoteSupervisorTests()
+            supervisor, repository, environment = fixture.fixture(root, "#!/bin/sh\nexit 1\n")
+            home = Path(environment["ENVR_CODEX_HOME"])
+            (home / "state_5.sqlite").unlink()
+            environment = {k: v for k, v in environment.items()
+                           if not any(word in k for word in ("TOKEN", "API_KEY"))
+                           and (not k.startswith("CODEX") or k == "CODEX_HOME")}
+            environment.update(CODEX_HOME=str(home), ENVR_CODEX=shutil.which("codex"), TERM="xterm-256color")
+            (home / "config.toml").write_text('model_provider="probe"\nmodel="probe"\n'
+                'features.goals=true\nmodel_providers.probe={name="probe",'
+                'base_url="http://127.0.0.1:1/v1",wire_api="responses",request_max_retries=0}\n')
+            terminal, slave = pty.openpty()
+            process = subprocess.Popen([str(supervisor), "resume"], cwd=repository, env=environment,
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+            os.close(slave)
+            output = bytearray()
+            record = {}
+            try:
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    if select.select([terminal], [], [], 0.1)[0]:
+                        try:
+                            chunk = os.read(terminal, 65536)
+                        except OSError:
+                            break
+                        output.extend(chunk)
+                        if b'\x1b[6n' in chunk:
+                            os.write(terminal, b'\x1b[1;1R')
+                    path = Path(environment["ENVR_SUPERVISION_ROOT"]) / "goal-recovery" / (fixture.SLOT + ".json")
+                    if path.exists():
+                        record = json.loads(path.read_text())
+                        if record.get("status") == "watching":
+                            break
+                self.assertEqual(record.get("status"), "watching", output.decode(errors="replace"))
+                state = fixture.state(environment)
+                self.assertEqual(record["thread_id"], state["thread_id"])
+                self.assertEqual(state["desired"], "running")
+                self.assertIn(b"Starting a new supervised conversation:", output)
+                # The first conversation lock must be the guard's inherited inode.
+                lock = Path(environment["ENVR_SUPERVISION_ROOT"]) / ("thread-" + state["thread_id"] + ".lock")
+                with lock.open("a+") as handle:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+                os.close(terminal)
+
     def test_real_capacity_error_recovers_through_same_backend(self):
+        self.check_capacity_recovery("server_overloaded", "other")
+
+    def test_native_capacity_error_recovers_through_same_backend(self):
+        self.check_capacity_recovery("server_is_overloaded", "serverOverloaded")
+
+    def check_capacity_recovery(self, provider_code, expected_code):
         class Capacity(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
             def do_POST(self):
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
-                body = json.dumps({"error": {"message": "Selected model is at capacity.",
-                                             "type": "server_error", "code": "server_overloaded"}}).encode()
+                # The native error code must generate Codex's own capacity
+                # message; the body deliberately does not contain that text.
+                body = json.dumps({"error": {"message": "Local test condition",
+                                             "type": "server_error", "code": provider_code}}).encode()
                 self.send_response(503)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -338,15 +558,10 @@ class InstalledCodexProtocolTests(unittest.TestCase):
                     watcher.send_frame(b'{"method":"initialized"}')
                     return watcher
                 terminal = client()
-                thread = terminal.request("thread/start", {"cwd": root, "approvalPolicy": "never", "sandbox": "read-only"})["thread"]
-                # Persist a saved conversation, as `scodex resume` requires.
-                terminal.request("turn/start", {"threadId": thread["id"], "input": [
-                    {"type": "text", "text": "Reply OK only"}]})
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    event = terminal.receive(0.2)
-                    if event and event.get("method") == "turn/completed":
-                        break
+                thread = terminal.request("thread/start", {"cwd": root, "approvalPolicy": "never", "sandbox": "read-only", "historyMode": "legacy"})["thread"]
+                terminal.request("thread/name/set", {"threadId": thread["id"], "name": "New conversation"})
+                # Join the first, still-empty conversation on the SAME backend.
+                # No priming user prompt or persisted prior conversation exists.
                 watcher = client()
                 watcher.thread_id = thread["id"]
                 watcher.cwd = thread["cwd"]
@@ -360,7 +575,19 @@ class InstalledCodexProtocolTests(unittest.TestCase):
                     if event:
                         watcher.event(event)
                         if event.get("method") == "turn/completed":
+                            error = event["params"]["turn"]["error"]
+                            self.assertEqual(error["codexErrorInfo"], expected_code)
+                            if expected_code == "serverOverloaded":
+                                self.assertEqual(error["message"],
+                                    "Selected model is at capacity. Please try a different model.")
                             break
+                self.assertIsNotNone(watcher.pending, watcher.goal)
+                # Simulate an observer starting after the failure, retaining
+                # only its durable provenance for the backend-blocked goal.
+                evidence = {"thread_id": thread["id"], "pending": watcher.pending.copy()}
+                watcher.pending = None
+                watcher.service_block_turn = None
+                watcher.reconcile(evidence)
                 self.assertIsNotNone(watcher.pending, watcher.goal)
                 first_turn = watcher.pending["turn"]
                 reads = []
