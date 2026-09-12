@@ -439,6 +439,34 @@ class GoalRecoveryTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("ENVR_TEST_CODEX_PROTOCOL") == "1", "opt-in installed Codex protocol test")
 class InstalledCodexProtocolTests(unittest.TestCase):
+    def test_existing_thread_inherits_permissions_from_owned_backend(self):
+        with tempfile.TemporaryDirectory(prefix="envr-permissions-", dir="/tmp") as root:
+            environment = {k: v for k, v in os.environ.items()
+                           if not any(word in k for word in ("CODEX", "TOKEN", "API_KEY"))}
+            environment.update(CODEX_HOME=root, ENVR_CODEX=shutil.which("codex"))
+            Path(root, "config.toml").write_text('model_provider="probe"\nmodel="probe"\n'
+                'model_providers.probe={name="probe",base_url="http://127.0.0.1:1/v1",wire_api="responses"}\n')
+            with mock.patch.dict(os.environ, environment, clear=True):
+                ns = {"__name__": "permissions_test"}
+                exec(envr.CODEX_SUPERVISOR_SCRIPT, ns)
+                state = {"thread_id": "unused", "cwd": root, "slot": "test"}
+                for create in (True, False):
+                    with ns["CodexBackend"]() as backend:
+                        client = ns["GoalRecovery"](dict(state, control_socket=backend.socket), threading.Event())
+                        try:
+                            client.connect()
+                            if create:
+                                result = client.request("thread/start", {"cwd": root, "approvalPolicy": "on-request",
+                                    "sandbox": "read-only", "historyMode": "legacy"})
+                                identifier = result["thread"]["id"]
+                                client.request("thread/name/set", {"threadId": identifier, "name": "Permissions test"})
+                            else:
+                                result = client.request("thread/resume", {"threadId": identifier, "excludeTurns": True})
+                                self.assertEqual(result["approvalPolicy"], "never")
+                                self.assertEqual(result["sandbox"]["type"], "dangerFullAccess")
+                        finally:
+                            client.disconnect()
+
     def test_first_launch_real_terminal_is_supervised_without_a_prompt(self):
         with tempfile.TemporaryDirectory(prefix="envr-first-", dir="/tmp") as root:
             fixture = test_envr.RemoteSupervisorTests()

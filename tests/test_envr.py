@@ -561,7 +561,7 @@ class LifecycleLogicTests(unittest.TestCase):
         self.assertIn("codex login --device-auth", envr.SCODEX_SCRIPT)
         self.assertIn("envr-codex-supervisor resume", envr.SCODEX_SCRIPT)
         self.assertIn(
-            "--dangerously-bypass-approvals-and-sandbox",
+            'sandbox_mode="danger-full-access"',
             envr.CODEX_SUPERVISOR_SCRIPT,
         )
         self.assertIn(
@@ -2647,7 +2647,7 @@ class RemoteSupervisorTests(unittest.TestCase):
             self.assertEqual(state["desired"], "stopped")
             invocation = Path(environment["ENVR_CODEX_LOG"]).read_text()
             self.assertIn(f"-C {repository} {self.THREAD_ONE}", invocation)
-            self.assertIn("--dangerously-bypass-approvals-and-sandbox", invocation)
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", invocation)
             self.assertIn("--remote unix://", invocation)
             self.assertNotIn("--last", invocation)
             self.assertNotIn("/goal", invocation)

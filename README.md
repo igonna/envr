@@ -97,6 +97,9 @@ the tmux pane to the latest main interactive conversation in that repository,
 excluding subagents, and remembers its exact UUID. `scodex resume --choose`
 offers the ten most recent eligible conversations to change the binding later.
 
+The owned backend sets the approval and sandbox policy. The remote terminal
+resumes without permission overrides, as required by Codex 0.154.0.
+
 That binding is supervised. A normal Codex exit, including exiting with
 `Ctrl-C`, leaves it stopped. Ctrl-C handled internally by Codex does not abandon
 the running process. If Linux records an out-of-memory kill and Codex is killed, envr waits
@@ -106,7 +109,7 @@ It also restores an armed session after a VPS reboot. Recovery never uses
 remains part of the resumed Codex thread. Recovery stops after three repeated
 OOM restarts in ten minutes. Plain `codex` remains completely unsupervised.
 
-On Codex 0.153.4, supervised resumes also watch the same live backend for
+On tested Codex 0.153.4 and 0.154.0, supervised resumes also watch the same live backend for
 temporary service failures and usage limits. Recognized capacity/server failures
 and structured transient network/stream failures retry after 1, 2, 5, then
 15 minutes; usage exhaustion waits for the reported

@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.16.2"
+VERSION = "0.16.3"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -236,7 +236,7 @@ TMUX = os.environ.get("ENVR_TMUX", "tmux")
 CODEX = os.environ.get("ENVR_CODEX", "codex")
 os.environ["NPM_CONFIG_PREFIX"] = str(REMOTE_HOME / ".local")
 os.environ["PATH"] = str(REMOTE_HOME / ".local/bin") + os.pathsep + os.environ.get("PATH", "")
-PROTOCOL_VERSION = "9"
+PROTOCOL_VERSION = "10"
 UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -986,7 +986,9 @@ class CodexBackend:
         self.process = None
         try:
             self.process = subprocess.Popen([sys.executable, "-c", BACKEND_GUARD_SCRIPT,
-                                            CODEX, "app-server", "--listen", "unix://" + self.socket],
+                                            CODEX, "app-server", "--listen", "unix://" + self.socket,
+                                            "-c", 'approval_policy="never"',
+                                            "-c", 'sandbox_mode="danger-full-access"'],
                                             stdin=subprocess.PIPE,
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                             start_new_session=True,
@@ -1027,7 +1029,6 @@ def run_child(state: dict, lock_fd=None, new_lock_name=None) -> int:
         command = [
             CODEX,
             "resume",
-            "--dangerously-bypass-approvals-and-sandbox",
             "-C",
             str(state["cwd"]),
             str(state["thread_id"]),
@@ -6255,7 +6256,7 @@ fi
     def ensure_remote_runtime_current(self, instance: dict[str, Any]) -> None:
         result = self.remote_command(
             instance,
-            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 9 "
+            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 10 "
             "&& test -x /home/remote/.local/bin/codex "
             "&& systemctl is-enabled --quiet envr-tmux.service",
             check=False,
