@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.18.7"
+VERSION = "0.18.8"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -4373,7 +4373,9 @@ class PrivateUpdates:
         source = self.unpack(package)
         current = target.read_bytes()
         if self.version(source) < self.version(current):
-            raise EnvrError("refusing an older envr version")
+            published = '.'.join(map(str, self.version(source)))
+            installed = '.'.join(map(str, self.version(current)))
+            raise EnvrError(f"published envr {published} is older than your {installed}; installation unchanged")
         if source == current:
             return False
         if self.version(source) == self.version(current):
@@ -7370,7 +7372,7 @@ sudo -n chmod 660 /dev/kvm
     def update_menu(self) -> None:
         updates = PrivateUpdates(self.root)
         while True:
-            print(f"\nPrivate updates · envr {VERSION}\n  P. Pull update\n  U. Publish this device's version\n  K. Set or replace update key\n  Q. Quit")
+            print(f"\nenvr updates · {VERSION}\n  P. Update this device\n  U. Publish this version\n  K. Set or replace update key\n  Q. Quit")
             choice = input("Choose P, U, K, or Q: ").strip().lower()
             if choice in {"", "q"}:
                 return
@@ -7381,9 +7383,11 @@ sudo -n chmod 660 /dev/kvm
                 continue
             updates.require_crypto()
             updates.key()
+            print("Connecting to your update server...", flush=True)
             instance = self.update_instance()
             target = Path(__file__).resolve()
             if choice == "u":
+                print(f"Publishing envr {VERSION}...", flush=True)
                 package = updates.pack(target.read_bytes())
                 # One atomic remote replacement; key and plaintext never leave here.
                 script = """import base64, os, pathlib, sys, tempfile
@@ -7404,25 +7408,49 @@ finally:
                                     input_data=base64.b64encode(package).decode(),
                                     quiet=True, timeout=60, strict_host_key_checking="yes")
                 print(f"Published envr {VERSION} to your private machine.")
+                print("Other devices can now install it with envr update.")
+                return
             else:
+                print("Checking the published update...", flush=True)
                 script = """import base64, pathlib, sys
 p = pathlib.Path.home() / '.local/share/envr/update.pkg'
-with p.open('rb') as f: data = f.read(4194433)
+if not p.exists(): sys.exit(44)
+try:
+    with p.open('rb') as f: data = f.read(4194433)
+except OSError:
+    sys.exit('could not read the published update')
 if len(data) > 4194432: sys.exit('update package exceeds size limit')
 sys.stdout.write(base64.b64encode(data).decode())
 """
-                result = self.remote_command(instance, "python3 -c " + shlex.quote(script),
-                                             capture=True, timeout=60, strict_host_key_checking="yes")
+                for attempt in range(3):
+                    try:
+                        result = self.remote_command(instance, "python3 -c " + shlex.quote(script),
+                                                     capture=True, check=False, timeout=60, strict_host_key_checking="yes")
+                    except subprocess.TimeoutExpired:
+                        result = subprocess.CompletedProcess([], 255, '', 'connection timed out')
+                    if result.returncode == 0:
+                        break
+                    if result.returncode == 44:
+                        raise EnvrError("no update has been published on this machine; run envr update and choose U on your up-to-date device")
+                    detail = (result.stderr or 'download failed').strip()
+                    if result.returncode != 255 or not self.transient_ssh_probe_failure(detail) or attempt == 2:
+                        raise EnvrError("could not download the update; installation unchanged. " + detail)
+                    print(f"Connection interrupted; retrying download ({attempt + 1}/2)...", flush=True)
+                    time.sleep(attempt + 1)
                 try:
                     if len(result.stdout) > 6000000:
                         raise ValueError("oversized update")
                     package = base64.b64decode(result.stdout, validate=True)
                 except ValueError as error:
                     raise EnvrError("invalid update download; installation unchanged") from error
-                if updates.install(package, target):
-                    print("Updated envr. Run envr again to use the new version.")
+                previous = '.'.join(map(str, updates.version(target.read_bytes())))
+                changed = updates.install(package, target)
+                installed = '.'.join(map(str, updates.version(target.read_bytes())))
+                if changed:
+                    print(f"Updated envr {previous} → {installed}.")
+                    print("Ready. Your next envr command uses the new version.")
                 else:
-                    print("Already up to date.")
+                    print(f"Already up to date: envr {installed}.")
                 return
 
     def machine_menu(self) -> None:

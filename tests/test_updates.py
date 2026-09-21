@@ -133,9 +133,42 @@ class PrivateUpdateTests(unittest.TestCase):
              mock.patch.object(app, 'remote_command', return_value=response), \
              mock.patch.object(envr, '__file__', str(self.target)), \
              mock.patch('builtins.input', return_value='p'), \
-             contextlib.redirect_stdout(io.StringIO()):
+             contextlib.redirect_stdout(output := io.StringIO()):
             app.update_menu()
         self.assertEqual(self.target.read_bytes(), self.new)
+        self.assertIn('Updated envr 0.15.9 → 0.16.0.', output.getvalue())
+
+    def test_download_retries_timeout_but_not_host_key_failure(self):
+        app = envr.Envr(self.root / 'config')
+        success = subprocess.CompletedProcess([], 0, base64.b64encode(self.updates.pack(self.new)).decode())
+        with mock.patch.object(app, 'update_instance', return_value={'id': 'test'}), \
+             mock.patch.object(app, 'remote_command', side_effect=[subprocess.TimeoutExpired('ssh', 60), success]) as remote, \
+             mock.patch.object(envr, '__file__', str(self.target)), \
+             mock.patch.object(envr.time, 'sleep'), \
+             mock.patch('builtins.input', return_value='p'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            app.update_menu()
+            self.assertEqual(remote.call_count, 2)
+        failure = subprocess.CompletedProcess([], 255, '', 'Host key verification failed.')
+        with mock.patch.object(app, 'update_instance', return_value={'id': 'test'}), \
+             mock.patch.object(app, 'remote_command', return_value=failure) as remote, \
+             mock.patch.object(envr, '__file__', str(self.target)), \
+             mock.patch('builtins.input', return_value='p'), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             self.assertRaisesRegex(envr.EnvrError, 'Host key verification failed'):
+            app.update_menu()
+        self.assertEqual(remote.call_count, 1)
+        self.assertEqual(self.target.read_bytes(), self.new)
+
+    def test_missing_publication_explains_how_to_publish(self):
+        app = envr.Envr(self.root / 'config')
+        with mock.patch.object(app, 'update_instance', return_value={'id': 'test'}), \
+             mock.patch.object(app, 'remote_command', return_value=subprocess.CompletedProcess([], 44, '', '')), \
+             mock.patch('builtins.input', return_value='p'), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             self.assertRaisesRegex(envr.EnvrError, 'no update has been published'):
+            app.update_menu()
+        self.assertEqual(self.target.read_bytes(), self.old)
 
     def test_publish_and_pull_remote_scripts_round_trip(self):
         import shlex
