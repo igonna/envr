@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.18.0"
+VERSION = "0.18.3"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -122,6 +122,11 @@ PROVIDER_LABELS = {
     "digitalocean": "DigitalOcean",
     "exoscale": "Exoscale",
     "gcore": "Gcore",
+}
+PROVIDER_KVM_LABELS = {
+    "vultr": " [KVM: VX1]",
+    "exoscale": " [KVM experimental]",
+    "scaleway": " [KVM: bare metal]",
 }
 PROVIDER_API_HOSTS = {
     "scaleway": "api.scaleway.com",
@@ -5117,7 +5122,7 @@ class Envr:
             for index, provider in enumerate(PROVIDER_NAMES, 1):
                 marker = "*" if provider == selected else " "
                 state = "ready" if provider in configured else "not configured"
-                print(f"  {index}. {marker} {PROVIDER_LABELS[provider]:<13} {state}")
+                print(f"  {index}. {marker} {PROVIDER_LABELS[provider]:<13} {state}{PROVIDER_KVM_LABELS.get(provider, '')}")
             print("\nThe * provider is selected for creation. Migration asks each time.")
             choice = input(
                 f"Select 1-{len(PROVIDER_NAMES)}, [R] replace credentials, "
@@ -7438,7 +7443,7 @@ sys.stdout.write(base64.b64encode(data).decode())
                 if not options:
                     raise EnvrError("no configurations available")
                 for index, option in enumerate(options, 1):
-                    print(f"  {index}. {option['ram_gb']} GB · {option['vcpu_count']} CPU · {region_label(str(option['region']))} · {compact_price(option['plan'])}" + (f" · [{option['kvm']}]" if option.get("kvm") else ""))
+                    print(f"  {index}. {option['ram_gb']} GB · {option['vcpu_count']} CPU · {region_label(str(option['region']))} · {compact_price(option['plan'])}" + (f" · [{option['kvm'].replace('KVM · VX1', 'KVM')}]" if option.get("kvm") else ""))
                 selected = input(f"Choose 1-{len(options)}, or Q: ").strip()
                 if not selected.isdigit() or not 1 <= int(selected) <= len(options):
                     return
@@ -8388,7 +8393,7 @@ done
                 "kvm": kvm_label(self.provider_name(api), str(plan_id)),
                 "plan": plan,
             })
-        return options
+        return sorted(options, key=lambda option: option["ram_gb"])
 
     def resize_menu(self) -> None:
         """Choose one live destination and delegate to the transactional resize."""
@@ -8442,7 +8447,7 @@ done
             f"{region_label(str(source.get('region') or ''))} · "
             f"{self.instance_ram_gb(source)} GB · "
             f"{int(source.get('vcpu_count') or 0)} CPU · {current_price}"
-            + (f" · [{kvm_label(source_provider, str(source.get('plan') or ''))}]"
+            + (f" · [{kvm_label(source_provider, str(source.get('plan') or '')).replace('KVM · VX1', 'KVM')}]"
                if kvm_label(source_provider, str(source.get("plan") or "")) else "")
         )
 
@@ -8450,7 +8455,7 @@ done
         print("\nDestination cloud:")
         for index, provider in enumerate(configured, 1):
             suffix = " (current)" if provider == source_provider else ""
-            print(f"  {index}. {PROVIDER_LABELS[provider]}{suffix}")
+            print(f"  {index}. {PROVIDER_LABELS[provider]}{suffix}{PROVIDER_KVM_LABELS.get(provider, '')}")
         while True:
             choice = input(f"Choose 1-{len(configured)}, or Q to cancel: ").strip().lower()
             if choice in {"", "q"}:
@@ -8477,11 +8482,8 @@ done
                 f"{option['vcpu_count']} CPU · "
                 f"{region_label(str(option['region']))} · "
                 f"{compact_price(option['plan'])}"
-                + (f" · [{option['kvm']}]" if option.get("kvm") else "")
+                + (f" · [{option['kvm'].replace('KVM · VX1', 'KVM')}]" if option.get("kvm") else "")
             )
-            if option.get("kvm") and len(option.get("regions", [])) > 1:
-                print("     Available in: " + ", ".join(region_label(r) for r in option["regions"]))
-        print("  KVM = hardware virtualization; experimental = no production support. Unmarked plans do not promise KVM.")
         unavailable_sizes = [
             size for size in sorted(PLAN_IDS)
             if size not in provider_available_sizes

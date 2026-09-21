@@ -504,7 +504,7 @@ still require a first deployment. See the official [Elastic Metal API](https://w
 
 `envr machine` includes three additional Vultr VX1 general-purpose choices:
 8 GB / 2 vCPU / 120 GB local NVMe, 16 GB / 4 vCPU / 240 GB, and
-32 GB / 8 vCPU / 480 GB. They are marked **[KVM · VX1]**. Live prices and
+32 GB / 8 vCPU / 480 GB. They are marked **[KVM]**. Live prices and
 regional capacity come from the provider API, alongside the existing ordinary
 plans. The KVM choices prefer existing configured locations, then London,
 Paris, and Milan. As checked on 2026-09-21, the API offered all three in Amsterdam,
