@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.18.3"
+VERSION = "0.18.5"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -5784,6 +5784,10 @@ runcmd:
                 if kvm_label(self.provider_name(api), plan_id).startswith("KVM ·"):
                     self.ensure_kvm(dict(active, provider=self.provider_name(api), plan=plan_id))
             except (EnvrError, subprocess.TimeoutExpired) as error:
+                if label == RESIZE_TARGET_LABEL:
+                    raise EnvrError(
+                        f"migration target {instance.get('id')} setup failed: {error}"
+                    ) from error
                 resume_command = (
                     f"envr machine"
                     if label == LABEL
@@ -5854,6 +5858,7 @@ runcmd:
                 if (
                     instance.get("status") == "active"
                     and instance.get("power_status") == "running"
+                    and instance.get("server_status") not in {"locked", "installing"}
                     and ip
                     and ip != "0.0.0.0"
                 ):
@@ -5861,8 +5866,9 @@ runcmd:
                         self.save_instance_state(instance)
                     return instance
             time.sleep(5)
-        status = (
-            last.get("status") or last.get("server_status") or "unknown"
+        status = ", ".join(
+            f"{key}={last.get(key, 'unknown')}"
+            for key in ("status", "power_status", "server_status")
         ) if last else "unknown"
         raise EnvrError(f"instance did not become active (last status: {status})")
 
@@ -6329,9 +6335,11 @@ done
         quiet: bool = False,
         connect_timeout: int = SSH_CONNECT_TIMEOUT,
         strict_host_key_checking: str = "accept-new",
+        fresh_connection: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         ssh = [
             "ssh",
+            *(["-o", "ControlMaster=no", "-o", "ControlPath=none"] if fresh_connection else []),
             *self.ssh_options(
                 instance,
                 connect_timeout=connect_timeout,
@@ -6377,14 +6385,21 @@ done
     def wait_for_ssh(self, instance: dict[str, Any]) -> None:
         print(f"Waiting for SSH at {instance.get('main_ip')}...")
         deadline = time.monotonic() + INSTANCE_TIMEOUT
+        detail = ""
         while time.monotonic() < deadline:
-            result = self.remote_command(
-                instance, "true", check=False, quiet=True, timeout=15
-            )
+            try:
+                result = self.remote_command(
+                    instance, "true", check=False, capture=True, timeout=15
+                )
+            except subprocess.TimeoutExpired:
+                detail = "SSH attempt timed out"
+                time.sleep(5)
+                continue
             if result.returncode == 0:
                 return
+            detail = (result.stderr or "").strip()[-1000:]
             time.sleep(5)
-        raise EnvrError("SSH did not become reachable")
+        raise EnvrError("SSH did not become reachable" + (f": {detail}" if detail else ""))
 
     def wait_for_cloud_init(self, instance: dict[str, Any]) -> None:
         print("Waiting for cloud-init...")
@@ -7069,13 +7084,16 @@ sudo -n chmod 660 /dev/kvm
         result = self.remote_script(instance, setup, capture=True, check=False, timeout=30)
         if result.returncode:
             raise EnvrError("KVM setup failed on selected host: " + (result.stderr or "no /dev/kvm").strip())
-        # A fresh SSH login picks up the group membership. Creating and closing
+        # Multiplexed SSH sessions retain the master's old groups. Force a
+        # fresh login to pick up membership added above. Creating and closing
         # an empty VM tests usable KVM, not just the existence of a device node.
         probe = "import os,fcntl; fd=os.open('/dev/kvm',os.O_RDWR); assert fcntl.ioctl(fd,0xAE00,0)==12; vm=fcntl.ioctl(fd,0xAE01,0); os.close(vm); os.close(fd)"
         result = self.remote_command(instance, "python3 -c " + shlex.quote(probe),
-                                     capture=True, check=False, timeout=30)
+                                     capture=True, check=False, timeout=30, fresh_connection=True)
         if result.returncode:
-            raise EnvrError("KVM is not usable by remote on selected host; migration will not be promoted")
+            detail = (getattr(result, "stderr", "") or "").strip()[-1000:]
+            raise EnvrError("KVM is not usable by remote on selected host; migration will not be promoted"
+                            + (f": {detail}" if detail else ""))
         print("KVM verified: /dev/kvm is usable by remote.")
 
     def resume_initial_setup(self, instance: dict[str, Any]) -> None:
@@ -8669,6 +8687,7 @@ done
                         for candidate in rollback_targets:
                             self.delete_instance(api, candidate)
                         self.clear_resize_marker(source)
+                        print("Migration rolled back: failed target removed; original machine retained.")
                 except (EnvrError, subprocess.TimeoutExpired):
                     eprint(
                         "Warning: resize cleanup could not be confirmed; "

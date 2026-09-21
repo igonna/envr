@@ -40,6 +40,31 @@ class KVMTests(unittest.TestCase):
         self.app.available_regions = mock.Mock(side_effect=envr.EnvrError('no capacity'))
         self.assertEqual(self.app.resize_options(self.api), [])
 
+    def test_running_but_locked_host_is_not_ready(self):
+        locked = {'id': 'target', 'status': 'active', 'power_status': 'running',
+                  'server_status': 'locked', 'main_ip': '192.0.2.1'}
+        ready = dict(locked, server_status='ok')
+        self.api.get = mock.Mock(side_effect=[{'instance': locked}, {'instance': ready}])
+        with mock.patch.object(envr.time, 'sleep') as sleep:
+            result = self.app.wait_for_instance(self.api, 'target', cache_state=False)
+        self.assertEqual(result, ready)
+        sleep.assert_called_once_with(5)
+
+    def test_ssh_attempt_timeout_is_retried_within_startup_window(self):
+        self.app.remote_command = mock.Mock(side_effect=[
+            envr.subprocess.TimeoutExpired(['ssh'], 15), SimpleNamespace(returncode=0)])
+        with mock.patch.object(envr.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+            self.app.wait_for_ssh({'main_ip': '192.0.2.1'})
+        self.assertEqual(self.app.remote_command.call_count, 2)
+
+    def test_ssh_failure_preserves_diagnostic(self):
+        self.app.remote_command = mock.Mock(return_value=SimpleNamespace(
+            returncode=255, stderr='Permission denied (publickey).'))
+        with mock.patch.object(envr.time, 'monotonic', side_effect=[0, 0, 601]), \
+                mock.patch.object(envr.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaisesRegex(envr.EnvrError, 'Permission denied'):
+            self.app.wait_for_ssh({'main_ip': '192.0.2.1'})
+
     def test_kvm_regions_follow_live_availability(self):
         self.api.get = mock.Mock(side_effect=lambda path: {'available_plans': [self.plan] if '/lhr/' in path else []})
         self.assertEqual(self.app.available_regions(self.api, self.plan, {'locations': ['ams','lhr','ewr']}), ['lhr'])
@@ -83,6 +108,19 @@ class KVMTests(unittest.TestCase):
         self.app.remote_script.assert_not_called()
         self.assertEqual(envr.kvm_label('exoscale', 'standard.large'), 'KVM experimental')
         self.assertEqual(envr.kvm_label('upcloud', '4xCPU-8GB'), '')
+
+    def test_kvm_probe_uses_new_login_after_group_change(self):
+        self.app.remote_script = mock.Mock(return_value=SimpleNamespace(returncode=0))
+        self.app.remote_command = mock.Mock(return_value=SimpleNamespace(returncode=0))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.app.ensure_kvm({'plan': self.plan})
+        self.assertTrue(self.app.remote_command.call_args.kwargs['fresh_connection'])
+
+    def test_fresh_login_disables_connection_reuse(self):
+        with mock.patch.object(envr, 'run') as run:
+            self.app.remote_command({'main_ip': '192.0.2.1'}, 'true', fresh_connection=True)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:5], ['ssh', '-o', 'ControlMaster=no', '-o', 'ControlPath=none'])
 
     def test_creation_uses_selected_plan_and_checks_kvm(self):
         a = self.app
