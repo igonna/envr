@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.16.3"
+VERSION = "0.18.0"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -89,15 +89,33 @@ PLAN_IDS = {
     24: "vhp-12c-24gb-amd",
     32: "vc2-8c-32gb",
 }
+# Explicitly documented nested virtualization; use local disks, not extra volumes.
+KVM_PLAN_IDS = {
+    "vultr": {8: "vx1-g-2c-8g-120s", 16: "vx1-g-4c-16g-240s", 32: "vx1-g-8c-32g-480s"},
+    "scaleway": {32: "EM-A610R-NVMe"},
+}
+
+
+def kvm_label(provider: str, plan_id: str) -> str:
+    if provider == "scaleway" and plan_id in SCALEWAY_PLANS:
+        return "KVM · bare metal · " + SCALEWAY_PLANS[plan_id][1]
+    if plan_id in KVM_PLAN_IDS.get(provider, {}).values():
+        return "KVM · VX1"
+    if provider == "exoscale" and plan_id in {"standard.large", "standard.extra-large", "standard.huge"}:
+        return "KVM experimental"
+    return ""
+
+
 SSH_CONNECT_TIMEOUT = 10
 INSTANCE_TIMEOUT = 600
 CLOUD_INIT_TIMEOUT = 900
 DELETE_TIMEOUT = 300
 # User-facing preference order: proven fit/value first, onboarding friction last.
 PROVIDER_NAMES = (
-    "vultr", "upcloud", "exoscale", "gcore", "digitalocean", "akamai"
+    "vultr", "upcloud", "exoscale", "gcore", "digitalocean", "akamai", "scaleway"
 )
 PROVIDER_LABELS = {
+    "scaleway": "Scaleway",
     "vultr": "Vultr",
     "akamai": "Akamai Cloud",
     "upcloud": "UpCloud",
@@ -106,6 +124,7 @@ PROVIDER_LABELS = {
     "gcore": "Gcore",
 }
 PROVIDER_API_HOSTS = {
+    "scaleway": "api.scaleway.com",
     "vultr": "api.vultr.com",
     "akamai": "api.linode.com",
     "upcloud": "api.upcloud.com",
@@ -114,6 +133,7 @@ PROVIDER_API_HOSTS = {
     "gcore": "api.gcore.com",
 }
 PROVIDER_REGIONS = {
+    "scaleway": ("nl-ams-1", "nl-ams-2", "fr-par-1", "fr-par-2", "pl-waw-2", "pl-waw-3"),
     "vultr": ("fra", "ams", "waw"),
     "akamai": ("de-fra-2", "eu-central", "nl-ams", "se-sto"),
     "upcloud": ("de-fra1", "nl-ams1", "pl-waw1", "fi-hel1"),
@@ -122,6 +142,9 @@ PROVIDER_REGIONS = {
     "gcore": ("frankfurt-2", "amsterdam", "warsaw"),
 }
 REGION_LABELS = {
+    "nl-ams-1": "Amsterdam 1", "nl-ams-2": "Amsterdam 2",
+    "fr-par-1": "Paris 1", "fr-par-2": "Paris 2",
+    "pl-waw-2": "Warsaw 2", "pl-waw-3": "Warsaw 3",
     "fra": "Frankfurt", "fra1": "Frankfurt", "de-fra1": "Frankfurt",
     "de-fra-1": "Frankfurt", "de-fra-2": "Frankfurt",
     "frankfurt-2": "Frankfurt",
@@ -130,9 +153,10 @@ REGION_LABELS = {
     "waw": "Warsaw", "pl-waw1": "Warsaw", "warsaw": "Warsaw",
     "de-muc-1": "Munich", "at-vie-1": "Vienna", "ch-dk-2": "Zurich",
     "eu-central": "Frankfurt", "se-sto": "Stockholm", "lon1": "London",
-    "fi-hel1": "Helsinki",
+    "fi-hel1": "Helsinki", "lhr": "London", "cdg": "Paris", "mxp": "Milan",
 }
 PROVIDER_PLAN_IDS = {
+    "scaleway": {16: "EM-A215R-HDD", 32: "EM-A116X-SSD"},
     "vultr": PLAN_IDS,
     "akamai": {
         1: "g6-nanode-1",
@@ -172,6 +196,12 @@ PROVIDER_PLAN_IDS = {
         size: f"gcore-envr-{size}gb"
         for size in (1, 2, 4, 8, 12, 16, 24, 32)
     },
+}
+
+SCALEWAY_PLANS = {
+    "EM-A215R-HDD": (16, "HDD"),
+    "EM-A116X-SSD": (32, "SSD"),
+    "EM-A610R-NVMe": (32, "NVMe"),
 }
 
 SCODEX_SCRIPT = """#!/bin/sh
@@ -236,7 +266,7 @@ TMUX = os.environ.get("ENVR_TMUX", "tmux")
 CODEX = os.environ.get("ENVR_CODEX", "codex")
 os.environ["NPM_CONFIG_PREFIX"] = str(REMOTE_HOME / ".local")
 os.environ["PATH"] = str(REMOTE_HOME / ".local/bin") + os.pathsep + os.environ.get("PATH", "")
-PROTOCOL_VERSION = "10"
+PROTOCOL_VERSION = "11"
 UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -294,6 +324,13 @@ def memory_events_path() -> Path | None:
     except OSError:
         pass
     return None
+
+
+def service_generation() -> str:
+    try:
+        return (STATE_ROOT / "service-generation").read_text().strip()
+    except FileNotFoundError:
+        return ""
 
 
 def oom_kills() -> int:
@@ -1023,6 +1060,7 @@ def run_child(state: dict, lock_fd=None, new_lock_name=None) -> int:
             "status": "running",
             "boot_id": boot_id(),
             "oom_baseline": baseline,
+            "service_generation": service_generation(),
             "pane": os.environ.get("TMUX_PANE", state.get("pane", "")),
         })
         save(state)
@@ -1233,6 +1271,7 @@ def inspect_orphans() -> None:
             recoverable = (
                 str(state.get("boot_id") or "") != current_boot
                 or current_oom > int(state.get("oom_baseline") or 0)
+                or state.get("service_generation", "") != service_generation()
             )
             if not recoverable:
                 state.update({
@@ -1255,6 +1294,7 @@ def inspect_orphans() -> None:
             state.update({
                 "status": "recovering",
                 "launching_at": int(time.time()),
+                "service_generation": service_generation(),
                 "boot_id": current_boot,
                 "oom_baseline": current_oom,
             })
@@ -1402,6 +1442,8 @@ if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
 '''
 
+NEEDRESTART_CONFIG = "push @{$nrconf{blacklist_rc}}, qr/^envr-tmux\\.service$/;\n"
+
 TMUX_KEEPER_SERVICE = """[Unit]
 Description=envr persistent tmux and Codex recovery keeper
 After=network.target
@@ -1414,6 +1456,7 @@ Environment=HOME=/home/remote
 WorkingDirectory=/home/remote/envr
 ExecStart=/usr/local/bin/envr-codex-supervisor keeper
 ExecStopPost=/bin/sh -c 'if [ "$SERVICE_RESULT" = oom-kill ]; then mkdir -p /home/remote/.config/envr/supervision; chmod 700 /home/remote/.config/envr/supervision; : > /home/remote/.config/envr/supervision/recover-after-oom; fi'
+ExecStopPost=/bin/sh -c 'umask 077; mkdir -p /home/remote/.config/envr/supervision; date +%%s%%N > /home/remote/.config/envr/supervision/service-generation'
 Restart=always
 RestartSec=2
 MemoryAccounting=yes
@@ -1663,6 +1706,8 @@ def compact_price(plan: dict[str, Any]) -> str:
     monthly = plan.get("monthly_cost")
     if monthly not in (None, ""):
         text += f" · {prefix}{float(monthly):g}/month"
+    if plan.get("hourly_only"):
+        text += " · no setup fee (excl. tax)"
     return text
 
 
@@ -2031,12 +2076,14 @@ class JSONAPI:
         *,
         opener: urllib.request.OpenerDirector | None = None,
         auth_scheme: str = "Bearer",
+        auth_header: str = "Authorization",
     ):
         self.token = token
         self.base_url = base_url.rstrip("/")
         self.display_name = display_name
         self.opener = opener
         self.auth_scheme = auth_scheme
+        self.auth_header = auth_header
 
     def request(
         self,
@@ -2052,7 +2099,7 @@ class JSONAPI:
             url += "?" + urllib.parse.urlencode(query)
         body = None
         headers = {
-            "Authorization": f"{self.auth_scheme} {self.token}",
+            self.auth_header: f"{self.auth_scheme} {self.token}".strip(),
             "Accept": "application/json",
             "User-Agent": f"envr/{VERSION}",
         }
@@ -2098,6 +2145,233 @@ class JSONAPI:
         if not isinstance(value, dict):
             raise EnvrError(f"{self.display_name} API returned an unexpected response")
         return value
+
+
+class ScalewayAPI:
+    """Hourly Elastic Metal only; no monthly offers or optional paid resources."""
+
+    provider_name = "scaleway"
+    display_name = "Scaleway"
+    api_host = "api.scaleway.com"
+    plan_ids = PROVIDER_PLAN_IDS["scaleway"]
+    regions = PROVIDER_REGIONS["scaleway"]
+    instance_timeout = 3600  # Physical OS installation can take longer than a VM.
+
+    def __init__(self, credentials: str, base_url: str | None = None,
+                 opener: urllib.request.OpenerDirector | None = None):
+        parts = credentials.strip().splitlines()
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-fA-F-]{36}", parts[0]) or not parts[1].strip():
+            raise EnvrError("Scaleway credentials require a Project ID and secret key")
+        self.project_id, secret = parts
+        self.raw = JSONAPI(secret, base_url or "https://api.scaleway.com", self.display_name,
+                           opener=opener, auth_scheme="", auth_header="X-Auth-Token")
+        self._offers: dict[tuple[str, str], dict[str, Any]] = {}
+        self._choices: dict[tuple[str, str], dict[str, Any]] = {}
+        self._systems: dict[str, str] = {}
+
+    @staticmethod
+    def _path(zone: str, resource: str) -> str:
+        return f"baremetal/v1/zones/{zone}/{resource}"
+
+    def _all(self, resource: str, key: str, *, query: dict[str, Any] | None = None,
+             timeout: int = 30) -> list[dict[str, Any]]:
+        result = []
+        for page in range(1, 101):
+            response = self.raw.request("GET", resource,
+                                        query={**(query or {}), "page_size": 100, "page": page},
+                                        timeout=timeout)
+            values = response.get(key)
+            if not isinstance(values, list) or any(not isinstance(v, dict) for v in values):
+                raise EnvrError(f"Scaleway returned an invalid {key} list")
+            result.extend(values)
+            if len(result) >= int(response.get("total_count", len(result))) or not values:
+                return result
+        raise EnvrError("Scaleway API pagination did not terminate")
+
+    @staticmethod
+    def _money(value: Any) -> float:
+        if not isinstance(value, dict) or "units" not in value:
+            raise EnvrError("Scaleway offer has no verifiable price or setup fee")
+        return float(value["units"]) + int(value.get("nanos", 0)) / 1_000_000_000
+
+    @staticmethod
+    def _hardware(offer: dict[str, Any]) -> dict[str, int]:
+        return {
+            "ram": sum(int(m["capacity"]) for m in offer.get("memories", [])) // (1024 ** 2),
+            "vcpu_count": sum(int(c["core_count"]) for c in offer.get("cpus", [])),
+            "disk": sum(int(d["capacity"]) for d in offer.get("disks", [])) // (1000 ** 3),
+        }
+
+    def _eligible(self, offer: dict[str, Any], os_id: str) -> bool:
+        name = str(offer.get("name") or "")
+        if (name not in SCALEWAY_PLANS or offer.get("subscription_period") != "hourly"
+                or offer.get("enable") is not True or offer.get("stock") not in {"available", "low"}
+                or os_id in (offer.get("incompatible_os_ids") or [])):
+            return False
+        return (self._money(offer.get("fee")) == 0
+                and self._money(offer.get("price_per_hour")) > 0
+                and offer["price_per_hour"].get("currency_code") == "EUR"
+                and self._hardware(offer)["ram"] == SCALEWAY_PLANS[name][0] * 1024)
+
+    def _os(self, zone: str, *, fresh: bool = False) -> str | None:
+        if not fresh and zone in self._systems:
+            return self._systems[zone]
+        systems = self._all(self._path(zone, "os"), "os")
+        matches = [s for s in systems if str(s.get("name", "")).lower() == "ubuntu"
+                   and re.fullmatch(r"24\.04(?: LTS)?", str(s.get("version", "")))
+                   and s.get("enabled") is True and s.get("allowed") is True
+                   and s.get("cloud_init_supported") is True and not s.get("license_required")]
+        if len(matches) != 1:
+            self._systems.pop(zone, None)
+            return None
+        self._systems[zone] = str(matches[0]["id"])
+        return self._systems[zone]
+
+    def _catalog(self) -> list[dict[str, Any]]:
+        plans: dict[str, dict[str, Any]] = {}
+        self._choices.clear()
+        for zone in self.regions:
+            os_id = self._os(zone)
+            if not os_id:
+                continue
+            for offer in self._all(self._path(zone, "offers"), "offers",
+                                   query={"subscription_period": "hourly"}):
+                self._offers[(zone, str(offer["id"]))] = offer
+                if not self._eligible(offer, os_id):
+                    continue
+                name = offer["name"]
+                plan = {"id": name, **self._hardware(offer),
+                        "hourly_cost": self._money(offer["price_per_hour"]),
+                        "monthly_cost": None, "currency": "EUR", "locations": [zone],
+                        "hourly_only": True}
+                # A region fallback must never silently change the displayed rate or hardware.
+                previous = plans.get(name)
+                if previous:
+                    if any(previous[k] != plan[k] for k in ("ram", "vcpu_count", "disk", "hourly_cost")):
+                        continue
+                    previous["locations"].append(zone)
+                else:
+                    plans[name] = plan
+                self._choices[(zone, name)] = offer
+        return list(plans.values())
+
+    def _instance(self, value: dict[str, Any], zone: str) -> dict[str, Any]:
+        if value.get("project_id") != self.project_id:
+            raise EnvrError("Scaleway server belongs to a different project")
+        offer_id = str(value.get("offer_id") or "")
+        key = (zone, offer_id)
+        if key not in self._offers:
+            self._offers[key] = self.raw.request("GET", self._path(zone, f"offers/{offer_id}"))
+        offer = self._offers[key]
+        install = value.get("install") or {}
+        ready = value.get("status") == "ready" and install.get("status") == "completed"
+        status = "error" if install.get("status") == "error" else value.get("status")
+        return {"id": zone + ":" + str(value["id"]), "provider": self.provider_name,
+                "label": value.get("name"), "hostname": install.get("hostname"),
+                "tags": value.get("tags") or [], "region": zone, **self._hardware(offer),
+                "main_ip": next((ip["address"] for ip in value.get("ips", []) if ip.get("version") == "IPv4"), "0.0.0.0"),
+                "status": "active" if ready else status,
+                "power_status": "running" if ready else "stopped",
+                "plan": offer.get("name"), "date_created": value.get("created_at") or ""}
+
+    def _server_path(self, resource: str) -> str:
+        identifier = resource.split("/", 1)[1]
+        zone, separator, server_id = identifier.partition(":")
+        if not separator or zone not in self.regions or not re.fullmatch(r"[0-9a-fA-F-]{36}", server_id):
+            raise EnvrError("invalid Scaleway server ID")
+        return self._path(zone, f"servers/{server_id}")
+
+    @staticmethod
+    def _ssh_key(value: dict[str, Any]) -> dict[str, Any]:
+        return {"id": value["id"], "name": value.get("name"), "ssh_key": value.get("public_key")}
+
+    def get(self, resource: str, *, query: dict[str, Any] | None = None,
+            timeout: int = 30) -> dict[str, Any]:
+        if resource == "account":
+            self.raw.request("GET", f"account/v3/projects/{self.project_id}", timeout=timeout)
+            return {"account": {"currency": "EUR", "credit_model": "postpaid", "billing_available": False}}
+        if resource == "plans":
+            return {"plans": self._catalog()}
+        if resource == "os":
+            available = any(self._os(zone) for zone in self.regions)
+            return {"os": [{"id": "ubuntu-24.04", "name": "Ubuntu 24.04 LTS x64",
+                            "family": "ubuntu", "arch": "x64"}] if available else []}
+        if resource == "ssh-keys":
+            keys = self._all("iam/v1alpha1/ssh-keys", "ssh_keys",
+                             query={"project_id": self.project_id}, timeout=timeout)
+            return {"ssh_keys": [self._ssh_key(k) for k in keys if not k.get("disabled")]}
+        if resource == "instances":
+            servers = []
+            for zone in self.regions:
+                servers.extend(self._instance(v, zone) for v in self._all(
+                    self._path(zone, "servers"), "servers",
+                    query={"project_id": self.project_id}, timeout=timeout))
+            return {"instances": servers}
+        if resource.startswith("instances/"):
+            path = self._server_path(resource)
+            return {"instance": self._instance(self.raw.request("GET", path, timeout=timeout), path.split("/")[3])}
+        if resource.startswith("regions/") and resource.endswith("/availability"):
+            zone = resource.split("/")[1]
+            if not self._choices:
+                self._catalog()
+            return {"available_plans": [name for z, name in self._choices if z == zone]}
+        raise EnvrError(f"unsupported Scaleway operation: GET {resource}")
+
+    def post(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if resource == "ssh-keys":
+            value = self.raw.request("POST", "iam/v1alpha1/ssh-keys", payload={
+                "project_id": self.project_id, "name": payload["name"], "public_key": payload["ssh_key"]})
+            return {"ssh_key": self._ssh_key(value)}
+        if resource == "instances":
+            zone, name = payload["region"], payload["plan"]
+            if not self._choices:
+                self._catalog()
+            selected = self._choices.get((zone, name))
+            if not selected or payload["os_id"] != "ubuntu-24.04":
+                raise EnvrError("selected Scaleway hourly configuration is unavailable")
+            # Revalidate immediately before creating a billable server.
+            os_id = self._os(zone, fresh=True)
+            offer = self.raw.request("GET", self._path(zone, f"offers/{selected['id']}"))
+            if (not os_id or not self._eligible(offer, os_id) or offer.get("name") != name
+                    or self._money(offer["price_per_hour"]) != self._money(selected["price_per_hour"])
+                    or self._hardware(offer) != self._hardware(selected)):
+                raise EnvrError("Scaleway offer changed; refresh envr machine before creating")
+            self._offers[(zone, str(offer["id"]))] = offer
+            value = self.raw.request("POST", self._path(zone, "servers"), payload={
+                "project_id": self.project_id, "offer_id": offer["id"],
+                "name": payload["label"], "description": "envr hourly workspace",
+                "tags": payload.get("tags") or [], "protected": False, "option_ids": [],
+                "install": {"os_id": os_id, "hostname": payload["hostname"],
+                            "ssh_key_ids": payload["sshkey_id"]},
+                "user_data": payload["user_data"],
+            })
+            return {"instance": self._instance(value, zone)}
+        raise EnvrError(f"unsupported Scaleway operation: POST {resource}")
+
+    def patch(self, resource: str, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._server_path(resource)
+        self._check_project(path)
+        return self.raw.request("PATCH", path, payload={"name": payload["label"]})
+
+    def delete(self, resource: str) -> None:
+        path = self._server_path(resource)
+        self._check_project(path)
+        self.raw.request("DELETE", path)
+
+    def _check_project(self, path: str) -> None:
+        value = self.raw.request("GET", path)
+        if value.get("project_id") != self.project_id:
+            raise EnvrError("Scaleway server belongs to a different project")
+
+    def request(self, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
+        if method == "GET":
+            return self.get(resource, **kwargs)
+        if method == "POST" and resource.startswith("instances/") and resource.endswith("/start"):
+            server = resource.removesuffix("/start")
+            path = self._server_path(server)
+            self._check_project(path)
+            return self.raw.request("POST", path + "/start", payload={"boot_type": "normal"})
+        raise EnvrError(f"unsupported Scaleway operation: {method} {resource}")
 
 
 class ExoscaleAPI:
@@ -4141,6 +4415,7 @@ class Envr:
         self._managed_ssh_keys: dict[str, list[dict[str, Any]]] = {}
         self._region_availability: dict[tuple[str, str], set[str]] = {}
         self._authorized_instances: set[tuple[str, str]] = set()
+        self._resize_plan_ids: dict[str, str] = {}
         self._resize_markers: dict[str, tuple[str, int | None] | None] = {}
         self.repos_path = self.root / "repos.json"
         self.state_path = self.root / "state.json"
@@ -4765,6 +5040,12 @@ class Envr:
     @staticmethod
     def prompt_api_credentials(provider: str, *, replacement: bool = False) -> str:
         prefix = "New " if replacement else ""
+        if provider == "scaleway":
+            project = input(f"{prefix}Scaleway Project ID: ").strip()
+            secret = getpass.getpass(f"{prefix}Scaleway secret key: ").strip()
+            if not project or not secret:
+                raise EnvrError("Scaleway Project ID and secret key cannot be empty")
+            return project + "\n" + secret
         if provider == "exoscale":
             api_key = getpass.getpass(f"{prefix}Exoscale API key: ").strip()
             api_secret = getpass.getpass(f"{prefix}Exoscale API secret: ").strip()
@@ -4789,6 +5070,7 @@ class Envr:
             return ExoscaleAPI(credentials, opener_factory=factory)
         opener = self.ensure_api_tunnel(relay, provider) if relay is not None else None
         classes = {
+            "scaleway": ScalewayAPI,
             "vultr": VultrAPI,
             "akamai": AkamaiAPI,
             "upcloud": UpCloudAPI,
@@ -5250,6 +5532,8 @@ class Envr:
             if isinstance(configured_regions, (tuple, list))
             else REGIONS
         )
+        if self.provider_name(api) == "vultr" and plan_id in KVM_PLAN_IDS["vultr"].values():
+            preferred = tuple(dict.fromkeys((*preferred, "lhr", "cdg", "mxp")))
         candidates = [region for region in preferred if region in advertised]
         available = []
         provider = self.provider_name(api)
@@ -5339,6 +5623,10 @@ write_files:
     permissions: '0755'
     encoding: b64
     content: {supervisor_encoded}
+  - path: /etc/needrestart/conf.d/envr.conf
+    permissions: '0644'
+    encoding: b64
+    content: {base64.b64encode(NEEDRESTART_CONFIG.encode()).decode()}
   - path: /etc/systemd/system/envr-tmux.service
     permissions: '0644'
     encoding: b64
@@ -5383,6 +5671,7 @@ runcmd:
         label: str = LABEL,
         cache_state: bool = True,
         prepare_workspace: bool = True,
+        plan_id: str | None = None,
     ) -> dict[str, Any]:
         ensure_writable = getattr(api, "ensure_writable", None)
         if callable(ensure_writable):
@@ -5394,7 +5683,10 @@ runcmd:
             raise EnvrError(
                 f"{self.provider_label(api)} has no exact {ram_gb} GB configuration"
             )
-        plan_id = plan_ids[ram_gb]
+        if plan_id is not None and plan_id not in {
+                plan_ids[ram_gb], KVM_PLAN_IDS.get(self.provider_name(api), {}).get(ram_gb)}:
+            raise EnvrError("selected plan is not supported for this provider and size")
+        plan_id = plan_id or plan_ids[ram_gb]
         catalog = self.plan_catalog(api)
         plan = catalog.get(plan_id)
         if not plan:
@@ -5464,7 +5756,7 @@ runcmd:
                         "ambiguous creation produced multiple envr instances; "
                         "run envr status"
                     ) from error
-                elif error.status == 0:
+                elif error.status == 0 or (self.provider_name(api) == "scaleway" and error.status >= 500):
                     raise EnvrError(
                         "instance creation outcome is unknown after a network "
                         "failure; run envr status before retrying"
@@ -5484,6 +5776,8 @@ runcmd:
                 )
                 self.wait_for_ssh(active)
                 self.wait_for_cloud_init(active)
+                if kvm_label(self.provider_name(api), plan_id).startswith("KVM ·"):
+                    self.ensure_kvm(dict(active, provider=self.provider_name(api), plan=plan_id))
             except (EnvrError, subprocess.TimeoutExpired) as error:
                 resume_command = (
                     f"envr machine"
@@ -5541,13 +5835,16 @@ runcmd:
         *,
         cache_state: bool = True,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + INSTANCE_TIMEOUT
+        timeout = getattr(api, "instance_timeout", INSTANCE_TIMEOUT)
+        deadline = time.monotonic() + (timeout if isinstance(timeout, int) else INSTANCE_TIMEOUT)
         last: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             response = api.get(f"instances/{instance_id}")
             instance = response.get("instance")
             if isinstance(instance, dict):
                 last = instance
+                if self.provider_name(api) == "scaleway" and instance.get("status") in {"error", "out_of_stock"}:
+                    raise EnvrError(f"Scaleway installation failed: {instance['status']}")
                 ip = str(instance.get("main_ip", ""))
                 if (
                     instance.get("status") == "active"
@@ -6206,6 +6503,8 @@ trap 'rm -f "$temporary" "$supervisor_temporary" "$service_temporary"' EXIT
 printf '%s' "$1" | base64 -d > "$temporary"
 printf '%s' "$2" | base64 -d > "$supervisor_temporary"
 printf '%s' "$3" | base64 -d > "$service_temporary"
+sudo install -d -m 755 /etc/needrestart/conf.d
+printf '%s' '{base64.b64encode(NEEDRESTART_CONFIG.encode()).decode()}' | base64 -d | sudo tee /etc/needrestart/conf.d/envr.conf >/dev/null
 sudo install -m 755 "$temporary" /usr/local/bin/scodex
 sudo install -m 755 "$supervisor_temporary" /usr/local/bin/envr-codex-supervisor
 sudo install -m 644 "$service_temporary" /etc/systemd/system/envr-tmux.service
@@ -6256,7 +6555,7 @@ fi
     def ensure_remote_runtime_current(self, instance: dict[str, Any]) -> None:
         result = self.remote_command(
             instance,
-            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 10 "
+            "test \"$(envr-codex-supervisor version 2>/dev/null)\" = 11 "
             "&& test -x /home/remote/.local/bin/codex "
             "&& systemctl is-enabled --quiet envr-tmux.service",
             check=False,
@@ -6675,11 +6974,13 @@ trap - EXIT
             if identity:
                 self._resize_markers[identity] = None
             return None
-        match = re.fullmatch(r"(source|target):([0-9]+)", result.stdout.strip())
+        match = re.fullmatch(r"(source|target):([0-9]+)(?::([A-Za-z0-9_.-]+))?", result.stdout.strip())
         if match is None:
             marker: tuple[str, int | None] = ("unknown", None)
         else:
             marker = (match.group(1), int(match.group(2)))
+            if match.group(3):
+                self._resize_plan_ids[identity] = match.group(3)
         if identity:
             self._resize_markers[identity] = marker
         return marker
@@ -6741,9 +7042,41 @@ trap - EXIT
             except EnvrError as error:
                 eprint(f"Warning: could not refresh the local envr cache: {error}")
 
+    def ensure_kvm(self, instance: dict[str, Any]) -> None:
+        """Verify advertised KVM before accepting a new host or promoting a target."""
+        provider = str(instance.get("provider") or "vultr")
+        if not kvm_label(provider, str(instance.get("plan") or "")).startswith("KVM ·"):
+            return
+        setup = r"""set -eu
+if grep -qw svm /proc/cpuinfo; then module=kvm_amd
+elif grep -qw vmx /proc/cpuinfo; then module=kvm_intel
+else echo 'CPU virtualization extensions are unavailable' >&2; exit 1
+fi
+sudo -n modprobe "$module"
+test -c /dev/kvm
+sudo -n groupadd -f kvm
+sudo -n usermod -aG kvm remote
+printf '%s\n' "$module" | sudo -n tee /etc/modules-load.d/envr-kvm.conf >/dev/null
+printf '%s\n' 'KERNEL=="kvm", GROUP="kvm", MODE="0660"' | sudo -n tee /etc/udev/rules.d/60-envr-kvm.rules >/dev/null
+sudo -n chgrp kvm /dev/kvm
+sudo -n chmod 660 /dev/kvm
+"""
+        result = self.remote_script(instance, setup, capture=True, check=False, timeout=30)
+        if result.returncode:
+            raise EnvrError("KVM setup failed on selected host: " + (result.stderr or "no /dev/kvm").strip())
+        # A fresh SSH login picks up the group membership. Creating and closing
+        # an empty VM tests usable KVM, not just the existence of a device node.
+        probe = "import os,fcntl; fd=os.open('/dev/kvm',os.O_RDWR); assert fcntl.ioctl(fd,0xAE00,0)==12; vm=fcntl.ioctl(fd,0xAE01,0); os.close(vm); os.close(fd)"
+        result = self.remote_command(instance, "python3 -c " + shlex.quote(probe),
+                                     capture=True, check=False, timeout=30)
+        if result.returncode:
+            raise EnvrError("KVM is not usable by remote on selected host; migration will not be promoted")
+        print("KVM verified: /dev/kvm is usable by remote.")
+
     def resume_initial_setup(self, instance: dict[str, Any]) -> None:
         self.refuse_incomplete_resize(instance)
         self.wait_for_cloud_init(instance)
+        self.ensure_kvm(instance)
         self.ensure_remote_runtime(instance)
         self.ensure_recovery_password(instance)
         synchronized = self.sync_from_server(instance)
@@ -7105,14 +7438,14 @@ sys.stdout.write(base64.b64encode(data).decode())
                 if not options:
                     raise EnvrError("no configurations available")
                 for index, option in enumerate(options, 1):
-                    print(f"  {index}. {option['ram_gb']} GB · {option['vcpu_count']} CPU · {region_label(str(option['region']))} · {compact_price(option['plan'])}")
+                    print(f"  {index}. {option['ram_gb']} GB · {option['vcpu_count']} CPU · {region_label(str(option['region']))} · {compact_price(option['plan'])}" + (f" · [{option['kvm']}]" if option.get("kvm") else ""))
                 selected = input(f"Choose 1-{len(options)}, or Q: ").strip()
                 if not selected.isdigit() or not 1 <= int(selected) <= len(options):
                     return
-                self.up(int(options[int(selected) - 1]["ram_gb"]))
+                self.up(int(options[int(selected) - 1]["ram_gb"]), plan_id=options[int(selected) - 1]["plan_id"])
                 return
 
-    def up(self, ram_gb: int) -> None:
+    def up(self, ram_gb: int, *, plan_id: str | None = None) -> None:
         if ram_gb not in PLAN_IDS:
             supported = ", ".join(str(size) for size in sorted(PLAN_IDS))
             raise EnvrError(f"RAM must be one of: {supported}")
@@ -7163,7 +7496,7 @@ sys.stdout.write(base64.b64encode(data).decode())
         else:
             api = self.api(self.selected_provider())
             self.account_response(api)
-            self.create_instance(api, ram_gb)
+            self.create_instance(api, ram_gb, **({"plan_id": plan_id} if plan_id else {}))
         print("VPS ready. Connect with envr go.")
 
     def go(
@@ -7360,7 +7693,7 @@ print(json.dumps({'folder': folder, 'path': path}))
         instance["label"] = label
 
     def set_resize_marker(
-        self, instance: dict[str, Any], ram_gb: int, *, role: str = "source"
+        self, instance: dict[str, Any], ram_gb: int, *, role: str = "source", plan_id: str | None = None
     ) -> None:
         if role not in {"source", "target"}:
             raise EnvrError(f"invalid resize marker role: {role}")
@@ -7368,17 +7701,25 @@ print(json.dumps({'folder': folder, 'path': path}))
 install -d -m 700 {shlex.quote(REMOTE_CONFIG_ROOT)}
 temporary=$(mktemp {shlex.quote(REMOTE_CONFIG_ROOT)}/.resize.XXXXXX)
 trap 'rm -f "$temporary"' EXIT
-printf '%s:%s\n' "$1" "$2" > "$temporary"
+if test -n "${{3:-}}"; then
+    printf '%s:%s:%s\n' "$1" "$2" "$3" > "$temporary"
+else
+    printf '%s:%s\n' "$1" "$2" > "$temporary"
+fi
 chmod 600 "$temporary"
 mv -f "$temporary" {shlex.quote(REMOTE_RESIZE_MARKER)}
 trap - EXIT
 """
         self.remote_script(
-            instance, script, (role, str(ram_gb)), quiet=True, timeout=30
+            instance, script, (role, str(ram_gb), *([plan_id] if plan_id else [])), quiet=True, timeout=30
         )
         identity = str(instance.get("id") or instance.get("main_ip") or "")
         if identity:
             self._resize_markers[identity] = (role, ram_gb)
+            if plan_id:
+                self._resize_plan_ids[identity] = plan_id
+            else:
+                self._resize_plan_ids.pop(identity, None)
 
     def clear_resize_marker(self, instance: dict[str, Any]) -> None:
         result = self.remote_command(
@@ -7391,9 +7732,10 @@ trap - EXIT
         identity = str(instance.get("id") or instance.get("main_ip") or "")
         if identity and result.returncode == 0:
             self._resize_markers[identity] = None
+            self._resize_plan_ids.pop(identity, None)
 
     def ensure_resize_source_ready(
-        self, instance: dict[str, Any], *, measure: bool = True
+        self, instance: dict[str, Any], *, measure: bool = True, token: str | None = None
     ) -> int:
         script = r"""set -euo pipefail
 measure=$1
@@ -7408,14 +7750,9 @@ if test "$measure" != yes; then
     printf '0\n'
     exit 0
 fi
-for path in /home/remote/envr /home/remote/.codex /home/remote/.ssh/envr; do
-    test -d "$path" || continue
-    if find "$path" -xdev \( -type b -o -type c -o -type p -o -type s \) \
-        -print -quit | grep -q .; then
-        echo SPECIAL_FILE
-        exit 21
-    fi
-done
+excludes=$2
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
 total=0
 for path in \
     /home/remote/envr \
@@ -7424,7 +7761,21 @@ for path in \
     /home/remote/.config/envr/repos.json \
     /home/remote/.config/envr/last-workspace; do
     test -e "$path" || continue
-    size=$(du -sb -- "$path" | awk '{print $1}')
+    filters=()
+    if test "$path" = /home/remote/envr && test -n "$excludes"; then
+        filters=(--from0 --exclude-from="$excludes")
+    fi
+    source="$path"
+    test ! -d "$path" || source="$path/"
+    # Match transfer traversal and exclusions, without copying any file data.
+    stats=$(sudo -n env LC_ALL=C rsync -aHn --no-owner --no-group \
+        --stats --out-format='ENVR_ITEM:%i' "${filters[@]}" -- "$source" "$temporary/")
+    if printf '%s\n' "$stats" | grep '^ENVR_ITEM:.[DS]' >/dev/null; then
+        echo SPECIAL_FILE
+        exit 21
+    fi
+    size=$(printf '%s\n' "$stats" | sed -nE 's/^Total file size: ([0-9,]+) (bytes|B)$/\1/p' | tr -d ',')
+    test -n "$size"
     total=$((total + size))
 done
 printf '%s\n' "$total"
@@ -7432,7 +7783,8 @@ printf '%s\n' "$total"
         result = self.remote_script(
             instance,
             script,
-            ("yes" if measure else "no",),
+            ("yes" if measure else "no",
+             f"{REMOTE_CONFIG_ROOT}/.resize-excludes-{token}" if token else ""),
             capture=True,
             check=False,
             timeout=120,
@@ -7446,7 +7798,8 @@ printf '%s\n' "$total"
         if result.returncode == 21 or detail == "SPECIAL_FILE":
             raise EnvrError("a preserved directory contains a special file")
         if result.returncode != 0 or not detail.isdigit():
-            raise EnvrError("could not measure the resize data")
+            raise EnvrError("could not measure the resize data: " +
+                            ((getattr(result, "stderr", "") or "").strip()[-1500:] or "invalid size output"))
         return int(detail)
 
     def quiesce_resize_source(self, instance: dict[str, Any]) -> None:
@@ -7751,6 +8104,7 @@ verify_file /home/remote/.config/envr/last-workspace /home/remote/.config/envr/l
         )
 
     def validate_resize_target(self, target: dict[str, Any]) -> None:
+        self.ensure_kvm(target)
         self.sync_from_server(target)
         script = r"""set -euo pipefail
 test -d /home/remote/envr
@@ -7857,7 +8211,7 @@ done
         print("Connect with envr go.")
 
     def resize_cross_provider(
-        self, source_api: Any, target_api: Any, ram_gb: int
+        self, source_api: Any, target_api: Any, ram_gb: int, *, plan_id: str | None = None
     ) -> None:
         source_current, _, source_old = self.resize_roles(source_api)
         target_current, target_pending, _ = self.resize_roles(target_api)
@@ -7913,7 +8267,7 @@ done
         self.ensure_device_access(source_api, source)
         self.wait_for_cloud_init(source)
         self.ensure_resize_source_ready(source, measure=False)
-        target_plan_id = target_api.plan_ids[ram_gb]
+        target_plan_id = plan_id or target_api.plan_ids[ram_gb]
         plan = self.plan_catalog(target_api).get(target_plan_id)
         if not plan:
             raise EnvrError(
@@ -7940,7 +8294,7 @@ done
             return
 
         self.sync_from_server(source)
-        self.set_resize_marker(source, ram_gb)
+        self.set_resize_marker(source, ram_gb, **({"plan_id": plan_id} if plan_id else {}))
         target: dict[str, Any] | None = None
         promoted = False
         try:
@@ -7950,14 +8304,15 @@ done
                 label=RESIZE_TARGET_LABEL,
                 cache_state=False,
                 prepare_workspace=False,
+                **({"plan_id": plan_id} if plan_id else {}),
             )
-            self.set_resize_marker(target, ram_gb, role="target")
+            self.set_resize_marker(target, ram_gb, role="target", **({"plan_id": plan_id} if plan_id else {}))
             token = secrets.token_hex(8)
             public_key, host_key = self.migration_key_and_host(source, target, token)
             try:
                 self.prepare_resize_excludes(source, token)
                 self.authorize_resize_target(source, target, public_key, token)
-                transfer_bytes = self.ensure_resize_source_ready(source)
+                transfer_bytes = self.ensure_resize_source_ready(source, token=token)
                 self.ensure_resize_capacity(target, transfer_bytes)
                 self.quiesce_resize_source(source)
                 print("Transferring workspace and Codex state...")
@@ -8001,7 +8356,9 @@ done
         self.ubuntu_os_id(api)
         options: list[dict[str, Any]] = []
         seen: set[tuple[str, int]] = set()
-        for requested, plan_id in sorted(api.plan_ids.items()):
+        candidates = list(sorted(api.plan_ids.items()))
+        candidates += list(KVM_PLAN_IDS.get(self.provider_name(api), {}).items())
+        for requested, plan_id in candidates:
             plan = plans.get(str(plan_id))
             if not isinstance(plan, dict):
                 continue
@@ -8027,6 +8384,8 @@ done
                 "plan_id": str(plan_id),
                 "vcpu_count": int(plan.get("vcpu_count") or 0),
                 "region": regions[0],
+                "regions": regions,
+                "kvm": kvm_label(self.provider_name(api), str(plan_id)),
                 "plan": plan,
             })
         return options
@@ -8061,7 +8420,12 @@ done
         if len(marker_sizes) == 1:
             ram_gb = marker_sizes.pop()
             print(f"Resuming the interrupted {ram_gb} GB migration...")
-            self.resize(ram_gb)
+            saved_plans = {self._resize_plan_ids[str(i.get("id") or i.get("main_ip") or "")]
+                           for i in recovery_instances
+                           if str(i.get("id") or i.get("main_ip") or "") in self._resize_plan_ids}
+            if len(saved_plans) > 1:
+                raise EnvrError("conflicting destination plans in migration markers")
+            self.resize(ram_gb, **({"plan_id": saved_plans.pop()} if saved_plans else {}))
             return
         if pending or retired or len(marker_sizes) > 1:
             raise EnvrError("resize state is ambiguous; run envr status")
@@ -8078,6 +8442,8 @@ done
             f"{region_label(str(source.get('region') or ''))} · "
             f"{self.instance_ram_gb(source)} GB · "
             f"{int(source.get('vcpu_count') or 0)} CPU · {current_price}"
+            + (f" · [{kvm_label(source_provider, str(source.get('plan') or ''))}]"
+               if kvm_label(source_provider, str(source.get("plan") or "")) else "")
         )
 
         configured = list(PROVIDER_NAMES)
@@ -8111,7 +8477,11 @@ done
                 f"{option['vcpu_count']} CPU · "
                 f"{region_label(str(option['region']))} · "
                 f"{compact_price(option['plan'])}"
+                + (f" · [{option['kvm']}]" if option.get("kvm") else "")
             )
+            if option.get("kvm") and len(option.get("regions", [])) > 1:
+                print("     Available in: " + ", ".join(region_label(r) for r in option["regions"]))
+        print("  KVM = hardware virtualization; experimental = no production support. Unmarked plans do not promise KVM.")
         unavailable_sizes = [
             size for size in sorted(PLAN_IDS)
             if size not in provider_available_sizes
@@ -8129,16 +8499,16 @@ done
                 break
             print(f"Choose 1-{len(options)}, or Q.")
 
-        if target_provider == source_provider and int(option["ram_gb"]) == self.instance_ram_gb(source):
+        if target_provider == source_provider and option.get("plan_id") == source.get("plan") and int(option["ram_gb"]) == self.instance_ram_gb(source):
             print("Already using this size; no changes.")
             return
         atomic_write_json(
             self.cloud_path,
             {"schema": SCHEMA_VERSION, "selected": target_provider},
         )
-        self.resize(int(option["ram_gb"]))
+        self.resize(int(option["ram_gb"]), **({"plan_id": option["plan_id"]} if option.get("plan_id") else {}))
 
-    def resize(self, ram_gb: int) -> None:
+    def resize(self, ram_gb: int, *, plan_id: str | None = None) -> None:
         if ram_gb not in PLAN_IDS:
             supported = ", ".join(str(size) for size in sorted(PLAN_IDS))
             raise EnvrError(f"RAM must be one of: {supported}")
@@ -8168,7 +8538,7 @@ done
         if target_provider != source_provider:
             target_api = self.api(target_provider)
             self.account_response(target_api)
-            return self.resize_cross_provider(api, target_api, ram_gb)
+            return self.resize_cross_provider(api, target_api, ram_gb, **({"plan_id": plan_id} if plan_id else {}))
         current, targets, sources = self.resize_roles(api)
         if any(len(role) > 1 for role in (current, targets, sources)):
             raise EnvrError("ambiguous resize state; run envr status")
@@ -8210,7 +8580,7 @@ done
         current_ram = self.requested_ram_gb(source)
         self.ensure_device_access(api, source)
         self.wait_for_cloud_init(source)
-        if current_ram == ram_gb:
+        if current_ram == ram_gb and (plan_id is None or source.get("plan") == plan_id):
             marker = self.resize_marker_state(source)
             if marker is not None and marker[0] == "target":
                 self.remote_command(
@@ -8237,7 +8607,8 @@ done
 
         self.ensure_resize_source_ready(source, measure=False)
         print(
-            f"Resize envr from {current_ram} GB to {ram_gb} GB?\n\n"
+            f"Resize envr from {current_ram} GB to {ram_gb} GB"
+            + (f" · {plan_id}" if plan_id else "") + "?\n\n"
             "Preserved: workspace, Codex state, repository keys\n"
             "Rebuilt: operating system and standard envr tools\n"
             "Not preserved: Git-ignored files, custom packages, VPNs, "
@@ -8248,7 +8619,7 @@ done
             return None
 
         self.sync_from_server(source)
-        self.set_resize_marker(source, ram_gb)
+        self.set_resize_marker(source, ram_gb, **({"plan_id": plan_id} if plan_id else {}))
         target: dict[str, Any] | None = None
         promoted = False
         try:
@@ -8258,14 +8629,15 @@ done
                 label=RESIZE_TARGET_LABEL,
                 cache_state=False,
                 prepare_workspace=False,
+                **({"plan_id": plan_id} if plan_id else {}),
             )
-            self.set_resize_marker(target, ram_gb, role="target")
+            self.set_resize_marker(target, ram_gb, role="target", **({"plan_id": plan_id} if plan_id else {}))
             token = secrets.token_hex(8)
             public_key, host_key = self.migration_key_and_host(source, target, token)
             try:
                 self.prepare_resize_excludes(source, token)
                 self.authorize_resize_target(source, target, public_key, token)
-                transfer_bytes = self.ensure_resize_source_ready(source)
+                transfer_bytes = self.ensure_resize_source_ready(source, token=token)
                 self.ensure_resize_capacity(target, transfer_bytes)
                 self.quiesce_resize_source(source)
                 print("Transferring workspace and Codex state...")
@@ -8363,7 +8735,9 @@ done
         print(f"  Power:      {instance.get('power_status', '')}")
         hourly = plan.get("hourly_cost")
         monthly = plan.get("monthly_cost")
-        if hourly is not None and monthly is not None:
+        if hourly is not None and monthly is None:
+            print(f"  Price:      {compact_price(plan)}")
+        elif hourly is not None and monthly is not None:
             price_currency = str(plan.get("currency") or currency)
             symbol = "$" if price_currency == "USD" else f"{price_currency} "
             print(

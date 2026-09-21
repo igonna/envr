@@ -2102,10 +2102,46 @@ class ResizeTests(unittest.TestCase):
             )
 
             self.assertEqual(size, 0)
-            self.assertEqual(app.remote_script.call_args.args[2], ("no",))
+            self.assertEqual(app.remote_script.call_args.args[2], ("no", ""))
             script = app.remote_script.call_args.args[1]
             self.assertLess(script.index('test "$measure" != yes'),
-                            script.index("find \"$path\""))
+                            script.index("stats=$(sudo"))
+
+    def test_resize_measurement_filters_ignored_special_files_and_reports_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = envr.Envr(root / "config")
+            repository = root / "envr" / "repo"
+            ignored = repository / ".local"
+            ignored.mkdir(parents=True)
+            (repository / "keep.txt").write_text("preserved")
+            (ignored / "large").write_bytes(b"x" * 100000)
+            os.mkfifo(ignored / "pipe")
+            config = root / ".config" / "envr"
+            config.mkdir(parents=True)
+            excludes = config / ".resize-excludes-test"
+            excludes.write_bytes(b"/repo/.local/\0")
+            commands = root / "bin"
+            commands.mkdir()
+            for name, body in (("sudo", 'shift; exec "$@"'), ("pgrep", "exit 1"),
+                               ("envr-codex-supervisor", "exit 1")):
+                executable = commands / name
+                executable.write_text("#!/bin/sh\n" + body + "\n")
+                executable.chmod(0o700)
+            def remote(instance, script, arguments, **kwargs):
+                return subprocess.run(["bash", "-s", "--", *[a.replace("/home/remote", str(root)) for a in arguments]],
+                    input=script.replace("/home/remote", str(root)), text=True, capture_output=True,
+                    env={**os.environ, "PATH": str(commands) + os.pathsep + os.environ["PATH"]}, timeout=10)
+            app.remote_script = remote
+            measured = app.ensure_resize_source_ready({}, token="test")
+            self.assertGreater(measured, 0)
+            self.assertLess(measured, 100000)
+            excludes.write_bytes(b"")
+            with self.assertRaisesRegex(envr.EnvrError, "special file"):
+                app.ensure_resize_source_ready({}, token="test")
+            app.remote_script = mock.Mock(return_value=SimpleNamespace(returncode=1, stdout="", stderr="Permission denied: fixture"))
+            with self.assertRaisesRegex(envr.EnvrError, "Permission denied: fixture"):
+                app.ensure_resize_source_ready({}, token="test")
 
     def test_resize_options_show_actual_available_sizes_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2846,6 +2882,45 @@ class RemoteSupervisorTests(unittest.TestCase):
             self.assertIn(f"recover {self.SLOT}", tmux_calls)
             self.assertEqual(self.state(environment)["status"], "recovering")
 
+    def test_service_restart_recovers_armed_session_without_oom(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            supervisor, repository, environment = self.fixture(
+                temporary,
+                "#!/bin/sh\nexit 0\n",
+            )
+            state_path = Path(environment["ENVR_SUPERVISION_ROOT"]) / f"{self.SLOT}.json"
+            state_path.write_text(json.dumps({
+                "schema": 1,
+                "slot": self.SLOT,
+                "thread_id": self.THREAD_ONE,
+                "cwd": str(repository),
+                "tmux_session": "envr-repo-bet1",
+                "tmux_window": "0",
+                "pane": "%1",
+                "desired": "running",
+                "status": "running",
+                "boot_id": "boot-one",
+                "oom_baseline": 0,
+            }), encoding="utf-8")
+            (state_path.parent / "service-generation").write_text("new-generation")
+            completed = subprocess.run(
+                [str(supervisor), "inspect-once"],
+                cwd=repository,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            state = self.state(environment)
+            self.assertEqual(state["desired"], "running")
+            self.assertEqual(state["status"], "recovering")
+            self.assertEqual(state["service_generation"], "new-generation")
+            tmux_log = Path(environment["ENVR_TMUX_LOG"])
+            tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
+            self.assertIn("new-session", tmux_calls)
+
     def test_orphan_without_oom_is_disarmed_instead_of_restarted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             supervisor, repository, environment = self.fixture(
@@ -2966,7 +3041,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(namespace.command, "machine")
         self.assertEqual(
             envr.PROVIDER_NAMES,
-            ("vultr", "upcloud", "exoscale", "gcore", "digitalocean", "akamai"),
+            ("vultr", "upcloud", "exoscale", "gcore", "digitalocean", "akamai", "scaleway"),
         )
 
     def test_exoscale_hmac_matches_official_reference_vectors(self) -> None:

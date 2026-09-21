@@ -2,13 +2,14 @@
 
 `envr` is a small command-line tool for using one disposable cloud development
 VPS from Android Termux. It supports Vultr, UpCloud, Exoscale, Gcore,
-DigitalOcean, and Akamai Cloud and
+DigitalOcean, Akamai Cloud, and Scaleway Elastic Metal, and
 prepares Git repositories, remote shells, Codex
 authentication, development tools, and safe instance cleanup.
 
 Status: Vultr, UpCloud, Exoscale, and Gcore have passed account-backed create,
 SSH, cloud-init, tmux reconnect, destroy, and resource-cleanup tests.
-DigitalOcean and Akamai Cloud are contract-tested against current official APIs.
+DigitalOcean, Akamai Cloud, and Scaleway are contract-tested against current official APIs.
+Scaleway has not yet been validated with a billable deployment.
 
 ## Interface
 
@@ -104,7 +105,10 @@ That binding is supervised. A normal Codex exit, including exiting with
 `Ctrl-C`, leaves it stopped. Ctrl-C handled internally by Codex does not abandon
 the running process. If Linux records an out-of-memory kill and Codex is killed, envr waits
 for memory to recover and resumes only that UUID in the same named tmux session.
-It also restores an armed session after a VPS reboot. Recovery never uses
+It also restores an armed session after a VPS reboot or an envr-tmux service
+restart. A service-stop generation marker distinguishes that teardown from a
+normal Codex exit. Package maintenance excludes envr-tmux from needrestart
+automatic restarts; security packages still install normally. Recovery never uses
 `--last`, never injects a prompt, and never runs `/goal resume`; an active goal
 remains part of the resumed Codex thread. Recovery stops after three repeated
 OOM restarts in ten minutes. Plain `codex` remains completely unsupervised.
@@ -207,7 +211,7 @@ asks once for its API credentials, verifies them, and stores them privately. Exi
 installations remain selected as Vultr without a migration step. The same menu
 can rotate credentials or forget an unused provider locally; it refuses to forget
 the provider recorded as owning the running VPS. Provider menus use the deliberate
-best-fit order Vultr, UpCloud, Exoscale, Gcore, DigitalOcean, then Akamai Cloud;
+order Vultr, UpCloud, Exoscale, Gcore, DigitalOcean, Akamai Cloud, then Scaleway;
 this reflects tested value and operational friction for this workflow, not a
 claim that one cloud is universally superior.
 
@@ -229,6 +233,12 @@ access; envr stores it mode `600`. A restricted token needs account, Droplet,
 image, size, region, SSH-key, tag, and billing read/write scopes needed by the
 lifecycle. If billing read is omitted, envr still works but `status` reports
 that billing is unavailable.
+
+For Scaleway, enter the Project ID and secret API key under provider credentials.
+The key needs project read, IAM SSH-key list/create, and Elastic Metal
+list/read/create/update/delete/start permissions. Credentials stay on this device;
+the same project and key let another device discover the workspace. Account
+balance reporting is unavailable for this adapter.
 
 Provider signup constraints are separate from API support. Akamai currently
 requires SMS phone verification during onboarding and did not accept the test
@@ -466,3 +476,59 @@ undisturbed; remote supervisor upgrades follow the usual next-connection path.
 
 Existing devices need this version installed once before they have the update
 menu. Publishing is explicit; ordinary connections never publish a package.
+
+Resize preflight measures the preserved file list with a privileged rsync dry run,
+using the same Git-ignore exclusions as transfer. Ignored container runtime data
+is not traversed or counted; special files in preserved paths still block migration.
+
+
+## Nested virtualization / KVM
+
+Scaleway Elastic Metal offers a small hourly-only selection:
+16 GB `EM-A215R-HDD`, 32 GB `EM-A116X-SSD`, and 32 GB `EM-A610R-NVMe`.
+Each is marked **[KVM · bare metal · HDD/SSD/NVMe]**. There is no invented 8 GB
+option. Live stock is checked in Amsterdam, Paris, and Warsaw; Frankfurt is not
+an Elastic Metal location. The catalog requires Ubuntu 24.04 with cloud-init,
+an hourly subscription, and a verified zero setup fee. It rechecks the selected
+offer before purchase and refuses changed prices, hardware, or billing terms.
+No optional paid resources are requested. Only the hourly rate is displayed:
+the provider's separate monthly-contract price does not apply. Prices exclude tax.
+Deletion releases the server; powering it off does not stop billing. Bare-metal
+OS installation can take longer than VPS provisioning; envr allows up to one hour.
+
+Scaleway uses the same setup, migration, and KVM admission checks as Vultr VX1.
+Its adapter is locally contract-tested; actual provisioning and workload behavior
+still require a first deployment. See the official [Elastic Metal API](https://www.scaleway.com/en/developers/api/elastic-metal/),
+[pricing](https://www.scaleway.com/en/pricing/elastic-metal/), and
+[billing rules](https://www.scaleway.com/en/docs/billing/faq/).
+
+`envr machine` includes three additional Vultr VX1 general-purpose choices:
+8 GB / 2 vCPU / 120 GB local NVMe, 16 GB / 4 vCPU / 240 GB, and
+32 GB / 8 vCPU / 480 GB. They are marked **[KVM · VX1]**. Live prices and
+regional capacity come from the provider API, alongside the existing ordinary
+plans. The KVM choices prefer existing configured locations, then London,
+Paris, and Milan. As checked on 2026-09-21, the API offered all three in Amsterdam,
+London, Paris, and Milan; it did not advertise Frankfurt for those plans.
+
+Vultr explicitly documents [VX1 nested virtualization](https://discover.vultr.com/cpu-agentic-ai-infrastructure-vultr-vx1-amd-whitepaper)
+and [local-disk boot](https://docs.vultr.com/vultr-vx1-cloud-compute).
+Only local-disk plans are offered so no separately billed boot volume is needed.
+After creation, envr loads the KVM module, grants the remote user access through
+the kvm group, and verifies KVM API access plus creation of an empty VM. These
+settings persist across reboot. Migration rechecks KVM before promotion; a
+failed check preserves the source. No test VM is left running.
+
+Exoscale's existing 8/16/32 GB standard plans are marked **[KVM experimental]**:
+its [nested-VM guide](https://www.exoscale.com/blog/multipass/) documents the feature
+but explicitly excludes production support. That badge is informational, not a
+provisioning guarantee or automatic KVM setup. Ordinary Vultr, UpCloud, Gcore,
+DigitalOcean, and Akamai choices remain unmarked: using a KVM hypervisor or
+providing dedicated CPUs does not establish guest access to `/dev/kvm`.
+No confirmed supported nested-KVM offering was established for UpCloud or Gcore
+in this review. [Akamai](https://www.linode.com/community/questions/25027/kvm-not-available)
+and [DigitalOcean](https://www.digitalocean.com/community/questions/does-digitalocean-support-nested-kvm-now)
+state that nested KVM is unsupported in their cited guidance.
+
+Plan identity is retained through creation and migration markers. Switching
+between ordinary and VX1 at the same RAM size is a migration, not a no-op.
+No machine is provisioned just by listing configurations.

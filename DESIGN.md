@@ -1,8 +1,9 @@
 # envr design
 
 Status: Vultr, UpCloud, Exoscale, and Gcore are account-backed deployment
-validated. DigitalOcean and Akamai Cloud are implemented against current
-official API contracts and locally tested.
+validated. DigitalOcean, Akamai Cloud, and Scaleway Elastic Metal are implemented
+against current official API contracts and locally tested. Scaleway still needs
+an account-backed deployment test.
 
 ## Goal
 
@@ -43,10 +44,23 @@ not tied to a local installation.
 
 ## Provider boundary
 
-Vultr, UpCloud, Exoscale, Gcore, DigitalOcean, and Akamai Cloud adapters normalize account data,
+Vultr, UpCloud, Exoscale, Gcore, DigitalOcean, Akamai Cloud, and Scaleway adapters normalize account data,
 plans, regions, Ubuntu images, instances, creation, relabel/start, and deletion.
 Core SSH, cloud-init, Git, Codex, tmux, safety checks, and migration logic are
 shared. Adding a provider must not fork that lifecycle.
+
+Scaleway uses the Elastic Metal v1 API and IAM SSH keys with project-scoped
+credentials. Normalized server IDs include the zone so restart, relabel, start,
+and delete need no local mapping. Inventory is restricted to the configured
+project; mutations verify project ownership. Three named x86 offers cover 16 GB
+HDD and 32 GB SSD/NVMe. The live catalog admits only stocked hourly offers with
+zero setup fee and compatible cloud-init Ubuntu 24.04. Create revalidates billing,
+price, OS, and hardware, sends base64 cloud-init, and requests no paid options.
+Regional fallbacks must match the displayed price and hardware. Monthly pricing
+is intentionally omitted. Installation must complete before SSH setup; KVM must
+pass before target promotion. Ambiguous create failures reconcile inventory and
+stop rather than purchasing another server. Core migration and deletion-confirmation
+rules remain shared; account-backed validation is still outstanding.
 
 `envr machine` is the only provider configuration interface. It verifies and
 stores provider API credentials, and selects the destination used by machine creation and migration.
@@ -812,3 +826,22 @@ The authenticated Python source supplies the version without being executed.
 Only a higher semantic version replaces differing contents. No release registry,
 key recovery mechanism, or server-side decryption is involved. Losing the key
 means replacing it and publishing anew from a trusted local installation.
+
+
+Service maintenance recovery records a generation in ExecStopPost, after the
+service process group has stopped. Armed orphaned sessions with an older generation
+are eligible for the existing bounded exact-session restart path, even on the same
+boot without OOM evidence. Normal exits remain disarmed. needrestart excludes only
+envr-tmux.service from automatic restarts; security updates remain enabled.
+
+
+Nested-KVM choices extend plan identity without changing RAM-size aliases.
+KVM_PLAN_IDS is a small provider-specific allowlist of local-disk VX1 plans;
+menu availability is still checked against live plan and regional APIs. Explicit
+plan_id flows through creation and both migration paths. Atomic migration markers
+optionally append the selected plan ID, retaining compatibility with legacy
+role:size markers. Resume retains that plan even for same-size family changes.
+KVM admission is a separate post-provision/pre-promotion check using the remote
+user's device access and KVM_GET_API_VERSION / KVM_CREATE_VM, with persistent module
+and group setup. Provider claims are distinguished from experimental features;
+no existing host is modified during menu discovery.

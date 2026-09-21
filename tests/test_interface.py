@@ -55,13 +55,13 @@ class InterfaceTests(unittest.TestCase):
         self.app.cloud_menu = mock.Mock(return_value="vultr")
         self.app.api = mock.Mock()
         self.app.resize_options = mock.Mock(return_value=[{
-            "ram_gb": 12, "vcpu_count": 4, "region": "fra",
+            "ram_gb": 12, "vcpu_count": 4, "region": "fra", "plan_id": "vhp-4c-12gb-amd",
             "plan": {"hourly_cost": .1, "monthly_cost": 72},
         }])
         self.app.up = mock.Mock()
         with mock.patch("builtins.input", side_effect=["c", "1"]):
             self.app.machine_menu()
-        self.app.up.assert_called_once_with(12)
+        self.app.up.assert_called_once_with(12, plan_id="vhp-4c-12gb-amd")
 
     def test_existing_incomplete_machine_resumes_instead_of_creating(self):
         self.app.configured_providers = mock.Mock(return_value=["vultr"])
