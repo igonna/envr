@@ -1156,6 +1156,27 @@ class LifecycleLogicTests(unittest.TestCase):
 
             app.create_instance.assert_not_called()
 
+    def test_go_never_starts_host_based_on_stale_stopped_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            api = mock.Mock()
+            instance = {"id": "new", "main_ip": "192.0.2.10", "ram": 8192,
+                        "power_status": "stopped"}
+            app.cached_instance = mock.Mock(return_value=None)
+            app.probe_cached_instance = mock.Mock(return_value=None)
+            app.active_inventory = mock.Mock(return_value=(api, instance))
+            app.wait_for_instance = mock.Mock()
+            app.ensure_device_access = mock.Mock()
+            app.require_initial_setup_complete = mock.Mock()
+            app.prepare_go_instance = mock.Mock(return_value=(instance, None))
+            with mock.patch.object(envr, "ensure_commands"):
+                self.assertEqual(app.go(None), (instance, None))
+                app.ensure_device_access.side_effect = envr.EnvrError("SSH unreachable")
+                with self.assertRaisesRegex(envr.EnvrError, "SSH unreachable"):
+                    app.go(None)
+            api.request.assert_not_called()
+            app.wait_for_instance.assert_not_called()
+
     def test_go_refuses_interrupted_initial_setup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = envr.Envr(Path(temporary))
@@ -1948,6 +1969,8 @@ class ResizeTests(unittest.TestCase):
             self.assertIn("sync_dir /home/remote/.ssh/envr", transfer_script)
             self.assertIn(".config/envr/repos.json", transfer_script)
             self.assertIn(".config/envr/last-workspace", transfer_script)
+            self.assertIn("sync_file /home/remote/.local/share/envr/update.pkg", transfer_script)
+            self.assertIn("verify_file /home/remote/.local/share/envr/update.pkg", transfer_script)
             self.assertIn("--exclude-from=\"$excludes\"", transfer_script)
             self.assertIn("--from0", transfer_script)
             self.assertIn('--rsync-path="sudo -n rsync"', transfer_script)

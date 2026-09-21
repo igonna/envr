@@ -97,7 +97,7 @@ class PrivateUpdateTests(unittest.TestCase):
 
     def test_menu_publish_transmits_only_encrypted_package(self):
         app = envr.Envr(self.root / 'config')
-        with mock.patch.object(app, 'cached_instance', return_value={'id': 'test'}), \
+        with mock.patch.object(app, 'update_instance', return_value={'id': 'test'}), \
              mock.patch.object(app, 'remote_command') as remote, \
              mock.patch.object(envr, '__file__', str(self.target)), \
              mock.patch('builtins.input', side_effect=['u', 'q']), \
@@ -109,10 +109,27 @@ class PrivateUpdateTests(unittest.TestCase):
         self.assertNotIn('ab' * 32, str(remote.call_args))
         self.assertEqual(kwargs['strict_host_key_checking'], 'yes')
 
+    def test_update_resolves_migrated_machine_before_caching_access(self):
+        app = envr.Envr(self.root / 'config')
+        target = {'id': 'new', 'main_ip': '192.0.2.2'}
+        api = object()
+        app.active_inventory = mock.Mock(return_value=(api, target))
+        app.ensure_device_access = mock.Mock()
+        app.refuse_incomplete_resize = mock.Mock()
+        app.record_successful_connection = mock.Mock()
+        self.assertEqual(app.update_instance(), target)
+        app.ensure_device_access.assert_called_once_with(api, target)
+        app.record_successful_connection.assert_called_once_with(target)
+        app.ensure_device_access.side_effect = envr.EnvrError('Host key verification failed')
+        app.record_successful_connection.reset_mock()
+        with self.assertRaisesRegex(envr.EnvrError, 'Host key verification failed'):
+            app.update_instance()
+        app.record_successful_connection.assert_not_called()
+
     def test_menu_pull_installs_authenticated_download(self):
         app = envr.Envr(self.root / 'config')
         response = subprocess.CompletedProcess([], 0, base64.b64encode(self.updates.pack(self.new)).decode())
-        with mock.patch.object(app, 'cached_instance', return_value={'id': 'test'}), \
+        with mock.patch.object(app, 'update_instance', return_value={'id': 'test'}), \
              mock.patch.object(app, 'remote_command', return_value=response), \
              mock.patch.object(envr, '__file__', str(self.target)), \
              mock.patch('builtins.input', return_value='p'), \
@@ -131,7 +148,7 @@ class PrivateUpdateTests(unittest.TestCase):
             return subprocess.run(argv, input=kwargs.get('input_data'), text=True,
                                   capture_output=True, check=True, timeout=10)
         self.target.write_bytes(self.new)
-        with mock.patch.object(app, 'cached_instance', return_value={'id': 'test'}), \
+        with mock.patch.object(app, 'update_instance', return_value={'id': 'test'}), \
              mock.patch.object(app, 'remote_command', side_effect=remote), \
              mock.patch.object(envr, '__file__', str(self.target)), \
              mock.patch('builtins.input', side_effect=['u', 'q']), \
@@ -139,7 +156,7 @@ class PrivateUpdateTests(unittest.TestCase):
             app.update_menu()
         self.assertEqual([p.name for p in remote_home.rglob('*') if p.is_file()], ['update.pkg'])
         self.target.write_bytes(self.old)
-        with mock.patch.object(app, 'cached_instance', return_value={'id': 'test'}), \
+        with mock.patch.object(app, 'update_instance', return_value={'id': 'test'}), \
              mock.patch.object(app, 'remote_command', side_effect=remote), \
              mock.patch.object(envr, '__file__', str(self.target)), \
              mock.patch('builtins.input', return_value='p'), \

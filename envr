@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.18.5"
+VERSION = "0.18.7"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -7355,6 +7355,18 @@ sudo -n chmod 660 /dev/kvm
                 else:
                     print("Choose C, E, R, or B.")
 
+    def update_instance(self) -> dict[str, Any]:
+        # A migration can replace both the IP and host key. Discover the current
+        # machine and enroll through the normal SSH checks before strict transfer.
+        found = self.active_inventory()
+        if found is None:
+            raise EnvrError("envr-codex is not running; run envr machine")
+        api, instance = found
+        self.ensure_device_access(api, instance)
+        self.refuse_incomplete_resize(instance)
+        self.record_successful_connection(instance)
+        return instance
+
     def update_menu(self) -> None:
         updates = PrivateUpdates(self.root)
         while True:
@@ -7369,9 +7381,7 @@ sudo -n chmod 660 /dev/kvm
                 continue
             updates.require_crypto()
             updates.key()
-            instance = self.cached_instance()
-            if instance is None:
-                raise EnvrError("connect with envr go first so this device knows your machine")
+            instance = self.update_instance()
             target = Path(__file__).resolve()
             if choice == "u":
                 package = updates.pack(target.read_bytes())
@@ -7545,9 +7555,10 @@ sys.stdout.write(base64.b64encode(data).decode())
         api, instance = found
         current_ram = self.instance_ram_gb(instance)
         self.save_instance_state(instance, ram_gb=current_ram)
-        if instance.get("power_status") == "stopped":
-            api.request("POST", f"instances/{instance.get('id')}/start")
-        instance = self.wait_for_instance(api, str(instance.get("id")))
+        # Cloud power status can lag behind a working guest. Connecting must
+        # not issue power operations after an SSH failure or an unknown host key.
+        if instance.get("power_status") != "stopped":
+            instance = self.wait_for_instance(api, str(instance.get("id")))
         self.ensure_device_access(api, instance)
         self.require_initial_setup_complete(instance)
         return self.prepare_go_instance(instance, folder)
@@ -7782,7 +7793,8 @@ for path in \
     /home/remote/.codex \
     /home/remote/.ssh/envr \
     /home/remote/.config/envr/repos.json \
-    /home/remote/.config/envr/last-workspace; do
+    /home/remote/.config/envr/last-workspace \
+    /home/remote/.local/share/envr/update.pkg; do
     test -e "$path" || continue
     filters=()
     if test "$path" = /home/remote/envr && test -n "$excludes"; then
@@ -8037,7 +8049,7 @@ trap - EXIT
 printf '%s\n' "$1" > "$2"
 chmod 600 "$2"
 install -d -m 755 /home/remote/envr
-install -d -m 700 /home/remote/.codex /home/remote/.ssh/envr /home/remote/.config/envr
+install -d -m 700 /home/remote/.codex /home/remote/.ssh/envr /home/remote/.config/envr /home/remote/.local/share/envr
 """
         self.remote_script(
             target, setup, (known_host_line, known_hosts), quiet=True, timeout=30
@@ -8085,6 +8097,7 @@ sync_dir /home/remote/.ssh/envr /home/remote/.ssh/envr
 sync_file /home/remote/.ssh/authorized_keys /home/remote/.ssh/authorized_keys
 sync_file /home/remote/.config/envr/repos.json /home/remote/.config/envr/repos.json
 sync_file /home/remote/.config/envr/last-workspace /home/remote/.config/envr/last-workspace
+sync_file /home/remote/.local/share/envr/update.pkg /home/remote/.local/share/envr/update.pkg
 verify_dir() {
     source=$1
     destination=$2
@@ -8117,6 +8130,7 @@ verify_dir /home/remote/.ssh/envr /home/remote/.ssh/envr
 verify_file /home/remote/.ssh/authorized_keys /home/remote/.ssh/authorized_keys
 verify_file /home/remote/.config/envr/repos.json /home/remote/.config/envr/repos.json
 verify_file /home/remote/.config/envr/last-workspace /home/remote/.config/envr/last-workspace
+verify_file /home/remote/.local/share/envr/update.pkg /home/remote/.local/share/envr/update.pkg
 """
         self.remote_script(
             target,
