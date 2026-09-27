@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.18.10"
+VERSION = "0.18.11"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -6994,6 +6994,41 @@ git -C "$target" config --local core.sshCommand "$ssh_command"
         self.update_remote_manifest(instance, repository)
         print(f"Repository ready: {folder}")
 
+    def sync_repositories(self) -> None:
+        """Prepare saved Git repositories without attaching or changing branches."""
+        instance = self.probe_cached_instance(None)
+        if instance is None:
+            found = self.active_inventory()
+            if found is None:
+                raise EnvrError("no envr machine found; run envr machine first")
+            api, instance = found
+            self.ensure_device_access(api, instance)
+        self.refuse_incomplete_resize(instance)
+        self.require_initial_setup_complete(instance)
+        self.record_successful_connection(instance)
+        self.sync_from_server(instance)
+        names = sorted(name for name, record in self.repositories()['repositories'].items()
+                       if record.get('kind') not in {'folder', 'removed'})
+        if not names:
+            print("No Git repositories configured. Add them with envr go --choose.")
+            return
+        print(f"Preparing {len(names)} repositories on {instance['main_ip']}...", flush=True)
+        failures = []
+        for index, name in enumerate(names, 1):
+            print(f"[{index}/{len(names)}] {name}", flush=True)
+            try:
+                self.ensure_remote_repository(instance, self.repository(name))
+                manifest = self.repositories()
+                if name in manifest.get('pending', {}):
+                    manifest['pending'].pop(name)
+                    self.save_repositories(manifest)
+            except (EnvrError, subprocess.TimeoutExpired) as error:
+                failures.append(name)
+                eprint(f"  Failed: {error}")
+        print(f"Repositories ready: {len(names) - len(failures)}/{len(names)}.")
+        if failures:
+            raise EnvrError("could not prepare " + ', '.join(failures) + "; fix the reported errors and rerun envr go --sync")
+
     def repair_remote_repository_bindings(
         self, instance: dict[str, Any]
     ) -> None:
@@ -9465,7 +9500,9 @@ def build_parser() -> argparse.ArgumentParser:
         "repository_folder", nargs="?", metavar="WORKSPACE",
         help="workspace name; unknown names offer setup; omit for the last workspace",
     )
-    go.add_argument("--choose", action="store_true", help="add, edit, remove, or select workspaces (offline)")
+    go_actions = go.add_mutually_exclusive_group()
+    go_actions.add_argument("--choose", action="store_true", help="add, edit, remove, or select workspaces (offline)")
+    go_actions.add_argument("--sync", action="store_true", help="prepare all saved Git repositories on the machine, then exit")
 
     subparsers.add_parser("status", help="show account and VPS status")
     subparsers.add_parser("update", help="pull/publish private updates or set the shared key")
@@ -9497,6 +9534,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 app.relay_menu()
                 return 0
             if namespace.command == "go":
+                if namespace.sync:
+                    if namespace.repository_folder:
+                        raise EnvrError("envr go --sync prepares all repositories; omit the workspace name")
+                    app.sync_repositories()
+                    return 0
                 if namespace.choose and namespace.repository_folder:
                     raise EnvrError("use a workspace name or --choose, not both")
                 folder = namespace.repository_folder

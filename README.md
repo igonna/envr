@@ -17,6 +17,7 @@ Scaleway has not yet been validated with a billable deployment.
 envr machine              # create, migrate, destroy, provider credentials
 envr go [workspace]       # connect; add unknown workspaces interactively
 envr go --choose          # pick, add, or remove entries
+envr go --sync            # prepare all saved Git repositories, then exit
 envr status
 envr relay
 ```
@@ -49,6 +50,11 @@ Connect afterward:
 envr go                    # last selected workspace
 envr go repository-folder  # clone if absent, otherwise attach immediately
 ```
+
+Use `envr go --sync` after creating a machine to prepare all saved Git repositories
+in one pass. It clones missing checkouts and checks repository access, preserving
+existing branches and uncommitted changes. It does not pull commits or attach to
+tmux. Failed repositories are reported individually; rerunning is safe.
 
 `go` tries the cached IP and trusted SSH host key before contacting a cloud API. If
 the VPS is reachable, an API outage does not prevent reconnection. Stale or
