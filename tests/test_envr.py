@@ -935,7 +935,7 @@ class LifecycleLogicTests(unittest.TestCase):
 
             with (
                 contextlib.redirect_stdout(io.StringIO()),
-                self.assertRaisesRegex(envr.EnvrError, "remains running"),
+                self.assertRaisesRegex(envr.EnvrError, "still exists"),
             ):
                 app.create_instance(api, 1)
 

@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.18.8"
+VERSION = "0.18.9"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -5796,8 +5796,8 @@ runcmd:
                     else "envr machine"
                 )
                 raise EnvrError(
-                    f"VPS {instance.get('id')} was created and remains running "
-                    f"and billable, but setup did not finish: {error}. "
+                    f"VPS {instance.get('id')} was created and still exists "
+                    f"and may be billable, but setup did not finish: {error}. "
                     f"Run {resume_command} to resume it"
                 ) from error
 
@@ -5847,19 +5847,51 @@ runcmd:
         cache_state: bool = True,
     ) -> dict[str, Any]:
         timeout = getattr(api, "instance_timeout", INSTANCE_TIMEOUT)
-        deadline = time.monotonic() + (timeout if isinstance(timeout, int) else INSTANCE_TIMEOUT)
+        started = time.monotonic()
+        timeout = timeout if isinstance(timeout, int) else INSTANCE_TIMEOUT
+        deadline = started + timeout
+        next_report = started
+        next_probe = started
+        reported = None
+        print(f"Waiting for cloud startup (up to {timeout // 60} minutes)...", flush=True)
         last: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             response = api.get(f"instances/{instance_id}")
             instance = response.get("instance")
             if isinstance(instance, dict):
                 last = instance
+                now = time.monotonic()
+                status = ", ".join(
+                    f"{key}={instance.get(key, 'unknown')}"
+                    for key in ("status", "power_status", "server_status")
+                )
+                if status != reported or now >= next_report:
+                    print(f"  {int(now - started)}s elapsed · {status}", flush=True)
+                    reported = status
+                    next_report = now + 30
                 if self.provider_name(api) == "scaleway" and instance.get("status") in {"error", "out_of_stock"}:
                     raise EnvrError(f"Scaleway installation failed: {instance['status']}")
                 ip = str(instance.get("main_ip", ""))
+                # Power metadata has reported stopped for reachable VX1 guests.
+                # A successful authenticated SSH probe is stronger evidence;
+                # never issue a power operation merely to reconcile that field.
+                ssh_ready = False
+                if (instance.get("status") == "active"
+                        and instance.get("power_status") == "stopped"
+                        and instance.get("server_status") not in {"locked", "installing"}
+                        and ip and ip != "0.0.0.0" and now >= next_probe):
+                    next_probe = now + 30
+                    try:
+                        probe = self.remote_command(instance, "true", check=False,
+                                                    capture=True, timeout=10, connect_timeout=5)
+                        ssh_ready = probe.returncode == 0
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if ssh_ready:
+                        print("SSH is ready; cloud power status has not caught up.", flush=True)
                 if (
                     instance.get("status") == "active"
-                    and instance.get("power_status") == "running"
+                    and (instance.get("power_status") == "running" or ssh_ready)
                     and instance.get("server_status") not in {"locked", "installing"}
                     and ip
                     and ip != "0.0.0.0"
@@ -6386,9 +6418,14 @@ done
 
     def wait_for_ssh(self, instance: dict[str, Any]) -> None:
         print(f"Waiting for SSH at {instance.get('main_ip')}...")
-        deadline = time.monotonic() + INSTANCE_TIMEOUT
+        started = time.monotonic()
+        deadline = started + INSTANCE_TIMEOUT
+        next_report = started + 30
         detail = ""
-        while time.monotonic() < deadline:
+        while (now := time.monotonic()) < deadline:
+            if now >= next_report:
+                print(f"  {int(now - started)}s elapsed · SSH not ready; retrying...", flush=True)
+                next_report = now + 30
             try:
                 result = self.remote_command(
                     instance, "true", check=False, capture=True, timeout=15
