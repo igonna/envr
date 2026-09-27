@@ -88,6 +88,39 @@ class KVMTests(unittest.TestCase):
                 self.assertRaisesRegex(envr.EnvrError, 'Permission denied'):
             self.app.wait_for_ssh({'main_ip': '192.0.2.1'})
 
+    def test_cloud_status_retries_transient_api_failure(self):
+        ready = {'id': 'target', 'status': 'active', 'power_status': 'running',
+                 'main_ip': '192.0.2.1'}
+        self.api.get = mock.Mock(side_effect=[envr.ApiError(502, 'maintenance'), {'instance': ready}])
+        with mock.patch.object(envr.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.app.wait_for_instance(self.api, 'target', cache_state=False), ready)
+
+    def test_pending_setup_start_is_recorded_before_uncertain_request(self):
+        host = {'id': 'target', 'status': 'active', 'power_status': 'stopped',
+                'server_status': 'ok', 'main_ip': '192.0.2.1', 'tags': [envr.INITIAL_SETUP_TAG]}
+        self.api.get = mock.Mock(side_effect=lambda *args: {'instance': dict(host, tags=list(host['tags']))})
+        self.api.request = mock.Mock(side_effect=[{}, envr.ApiError(0, 'timeout')])
+        self.app.remote_command = mock.Mock(return_value=SimpleNamespace(returncode=255))
+        with mock.patch.object(envr.time, 'monotonic', side_effect=[0, 0, 0, 60, 60, 90, 90, 601]), \
+                mock.patch.object(envr.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(envr.EnvrError):
+            self.app.wait_for_instance(self.api, 'target', cache_state=False, recover_initial=True)
+        self.assertEqual([c.args[0] for c in self.api.request.call_args_list], ['PATCH', 'POST'])
+        self.assertIn(envr.INITIAL_START_TAG, self.api.request.call_args_list[0].kwargs['payload']['tags'])
+
+    def test_another_device_does_not_repeat_recorded_start(self):
+        host = {'id': 'target', 'status': 'active', 'power_status': 'stopped',
+                'server_status': 'ok', 'main_ip': '192.0.2.1',
+                'tags': [envr.INITIAL_SETUP_TAG, envr.INITIAL_START_TAG]}
+        self.api.get = mock.Mock(return_value={'instance': host})
+        self.api.request = mock.Mock()
+        self.app.remote_command = mock.Mock(return_value=SimpleNamespace(returncode=255))
+        with mock.patch.object(envr.time, 'monotonic', side_effect=[0, 0, 0, 60, 60, 601]), \
+                mock.patch.object(envr.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(envr.EnvrError):
+            self.app.wait_for_instance(self.api, 'target', cache_state=False, recover_initial=True)
+        self.api.request.assert_not_called()
+
     def test_kvm_regions_follow_live_availability(self):
         self.api.get = mock.Mock(side_effect=lambda path: {'available_plans': [self.plan] if '/lhr/' in path else []})
         self.assertEqual(self.app.available_regions(self.api, self.plan, {'locations': ['ams','lhr','ewr']}), ['lhr'])
