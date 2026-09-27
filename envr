@@ -9,6 +9,7 @@ import concurrent.futures
 import contextlib
 import fcntl
 import getpass
+import gzip
 import hashlib
 import hmac
 import http.client
@@ -33,7 +34,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.18.11"
+VERSION = "0.18.12"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -1947,6 +1948,16 @@ class RelayAPITunnel:
             self.temporary_directory = None
 
 
+def read_api_response(response: Any) -> bytes:
+    content = response.read()
+    if response.headers.get("Content-Encoding", "").lower() == "gzip":
+        try:
+            return gzip.decompress(content)
+        except (OSError, EOFError) as error:
+            raise EnvrError("cloud API returned malformed gzip data") from error
+    return content
+
+
 class VultrAPI:
     provider_name = "vultr"
     display_name = "Vultr"
@@ -1982,6 +1993,7 @@ class VultrAPI:
         headers = {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
+            "Accept-Encoding": "gzip",
             "User-Agent": f"envr/{VERSION}",
         }
         if payload is not None:
@@ -1993,10 +2005,10 @@ class VultrAPI:
                 self.opener.open if self.opener is not None else urllib.request.urlopen
             )
             with open_request(request, timeout=timeout) as response:
-                content = response.read()
+                content = read_api_response(response)
         except urllib.error.HTTPError as error:
             try:
-                content = error.read()
+                content = read_api_response(error)
             finally:
                 error.close()
             message = self._error_message(content, error.reason)
@@ -2108,6 +2120,7 @@ class JSONAPI:
         headers = {
             self.auth_header: f"{self.auth_scheme} {self.token}".strip(),
             "Accept": "application/json",
+            "Accept-Encoding": "gzip",
             "User-Agent": f"envr/{VERSION}",
         }
         if payload is not None:
@@ -2117,10 +2130,10 @@ class JSONAPI:
         try:
             open_request = self.opener.open if self.opener else urllib.request.urlopen
             with open_request(request, timeout=timeout) as response:
-                content = response.read()
+                content = read_api_response(response)
         except urllib.error.HTTPError as error:
             try:
-                content = error.read()
+                content = read_api_response(error)
             finally:
                 error.close()
             message = VultrAPI._error_message(content, error.reason)
@@ -2605,17 +2618,34 @@ class ExoscaleAPI:
                 "ssh_key": self._key_material.get(str(value.get("name") or "")),
             } for value in values]}
         if resource == "instances":
+            def query_zone(zone: str) -> tuple[str, list[dict], list[dict]]:
+                values = self._all_zone(zone, "instance", "instances", timeout)
+                # Empty regions need no hardware catalog. Expanded type records
+                # already contain everything needed to normalize the instance.
+                needs_types = any(
+                    value.get("instance-type", {}).get("id")
+                    and not value["instance-type"].get("family")
+                    for value in values
+                    if isinstance(value.get("instance-type"), dict)
+                )
+                types = (
+                    self._all_zone(zone, "instance-type", "instance-types", timeout)
+                    if needs_types else []
+                )
+                return zone, values, types
+
             instances = []
-            for zone in self.regions:
-                types = self._all_zone(zone, "instance-type", "instance-types", timeout)
-                self._instance_types.update({
-                    str(value["id"]): value for value in types if value.get("id")
-                })
-                for value in self._all_zone(zone, "instance", "instances", timeout):
-                    identifier = str(value.get("id") or "")
-                    if identifier:
-                        self._instance_zones[identifier] = zone
-                    instances.append(self._instance(value, zone))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                results = executor.map(query_zone, self.regions)
+                for zone, values, types in results:
+                    self._instance_types.update({
+                        str(value["id"]): value for value in types if value.get("id")
+                    })
+                    for value in values:
+                        identifier = str(value.get("id") or "")
+                        if identifier:
+                            self._instance_zones[identifier] = zone
+                        instances.append(self._instance(value, zone))
             return {"instances": instances}
         if resource.startswith("instances/"):
             identifier = resource.split("/", 1)[1]

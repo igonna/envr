@@ -22,6 +22,10 @@ envr status
 envr relay
 ```
 
+`envr status` checks live cloud data on every call. Independent cloud and region
+queries run concurrently; supported API responses use gzip to reduce transfer time.
+Provider response times can still delay the result.
+
 All configured cloud accounts together manage at most one `envr` VPS. Multiple repositories and
 trusted client devices share it. Each client has its own SSH key; the running
 VPS is authoritative for repository configuration and Codex authentication.

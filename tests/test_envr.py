@@ -108,13 +108,20 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     received_authorization = ""
     received_payload: dict[str, object] | None = None
     response_status = 200
+    compressed = False
+    corrupt_gzip = False
     response_payload: object = {"ok": True}
 
     def do_GET(self) -> None:  # noqa: N802
         type(self).received_authorization = self.headers.get("Authorization", "")
         content = json.dumps(type(self).response_payload).encode()
+        if type(self).compressed:
+            assert self.headers.get("Accept-Encoding") == "gzip"
+            content = b"invalid" if type(self).corrupt_gzip else envr.gzip.compress(content)
         self.send_response(type(self).response_status)
         self.send_header("Content-Type", "application/json")
+        if type(self).compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
@@ -135,6 +142,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
 class APITests(unittest.TestCase):
     def setUp(self) -> None:
         ApiHandler.response_status = 200
+        ApiHandler.compressed = False
+        ApiHandler.corrupt_gzip = False
         ApiHandler.response_payload = {"ok": True}
         ApiHandler.received_authorization = ""
         ApiHandler.received_payload = None
@@ -154,6 +163,27 @@ class APITests(unittest.TestCase):
         self.assertEqual(response, {"ok": True})
         self.assertEqual(ApiHandler.received_authorization, "Bearer secret-token")
         self.assertEqual(ApiHandler.received_payload, {"plan": "vc2-test"})
+
+    def test_gzip_success_errors_and_corruption_for_both_transports(self) -> None:
+        ApiHandler.compressed = True
+        host, port = self.server.server_address
+        generic = envr.JSONAPI("token", f"http://{host}:{port}", "Test")
+        for api in (self.api, generic):
+            with self.subTest(transport=type(api).__name__):
+                ApiHandler.response_status = 200
+                ApiHandler.corrupt_gzip = False
+                ApiHandler.response_payload = {"ok": True}
+                self.assertEqual(api.request("GET", "plans"), {"ok": True})
+                ApiHandler.response_status = 503
+                ApiHandler.response_payload = {"error": "temporarily unavailable"}
+                with self.assertRaises(envr.ApiError) as raised:
+                    api.request("GET", "plans")
+                self.assertEqual(raised.exception.status, 503)
+                self.assertEqual(raised.exception.message, "temporarily unavailable")
+                ApiHandler.response_status = 200
+                ApiHandler.corrupt_gzip = True
+                with self.assertRaisesRegex(envr.EnvrError, "malformed gzip"):
+                    api.request("GET", "plans")
 
     def test_gcore_uses_apikey_authorization_scheme(self) -> None:
         host, port = self.server.server_address
@@ -3207,6 +3237,47 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(result["instance"]["provider"], "exoscale")
         self.assertEqual(result["instance"]["main_ip"], "192.0.2.10")
         self.assertEqual(result["instance"]["ram"], 4096)
+
+    def test_exoscale_inventory_queries_empty_regions_concurrently_without_catalogs(self) -> None:
+        api = envr.ExoscaleAPI("EXO-key\nsecret")
+        api.regions = ["de-fra-1", "at-vie-1", "ch-gva-2"]
+        barrier = threading.Barrier(3)
+
+        def query(zone, resource, key, timeout):
+            self.assertEqual(resource, "instance")
+            barrier.wait(timeout=2)
+            return []
+
+        api._all_zone = mock.Mock(side_effect=query)
+        self.assertEqual(api.get("instances"), {"instances": []})
+        self.assertEqual(api._all_zone.call_count, 3)
+
+    def test_exoscale_inventory_resolves_types_and_preserves_zone_order(self) -> None:
+        api = envr.ExoscaleAPI("EXO-key\nsecret")
+        api.regions = ["de-fra-1", "at-vie-1"]
+        instance_type = {"id": "type-id", "family": "standard", "size": "large",
+                         "memory": 8 * 1024**3, "cpus": 4}
+
+        def query(zone, resource, key, timeout):
+            if resource == "instance-type":
+                self.assertEqual(zone, "de-fra-1")
+                return [instance_type]
+            return [{"id": zone, "state": "running", "instance-type": (
+                {"id": "type-id"} if zone == "de-fra-1" else instance_type
+            )}]
+
+        api._all_zone = mock.Mock(side_effect=query)
+        instances = api.get("instances")["instances"]
+        self.assertEqual([item["id"] for item in instances], api.regions)
+        self.assertTrue(all(item["ram"] == 8192 for item in instances))
+        self.assertEqual(api._instance_zones, {zone: zone for zone in api.regions})
+        self.assertEqual(api._all_zone.call_count, 3)
+
+    def test_exoscale_inventory_does_not_hide_failed_regions(self) -> None:
+        api = envr.ExoscaleAPI("EXO-key\nsecret")
+        api._all_zone = mock.Mock(side_effect=envr.ApiError(503, "unavailable"))
+        with self.assertRaises(envr.ApiError):
+            api.get("instances")
 
     def test_exoscale_instance_expands_live_type_reference(self) -> None:
         api = envr.ExoscaleAPI("EXO-key\nsecret")
