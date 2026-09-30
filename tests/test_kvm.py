@@ -64,10 +64,10 @@ class KVMTests(unittest.TestCase):
         self.app.remote_command = mock.Mock(return_value=SimpleNamespace(returncode=0))
         with contextlib.redirect_stdout(output := io.StringIO()):
             self.assertEqual(self.app.wait_for_instance(self.api, 'target', cache_state=False), host)
-        self.assertIn('power_status=stopped', output.getvalue())
-        self.assertIn('SSH is ready', output.getvalue())
+        self.assertNotIn('power_status=', output.getvalue())
+        self.assertIn('VPS is reachable', output.getvalue())
 
-    def test_cloud_wait_reports_unchanged_state_every_thirty_seconds(self):
+    def test_cloud_wait_shows_plain_stage_once_and_keeps_timeout_diagnostic(self):
         host = {'id': 'target', 'status': 'active', 'power_status': 'stopped',
                 'server_status': 'locked', 'main_ip': '192.0.2.1'}
         self.api.get = mock.Mock(return_value={'instance': host})
@@ -76,8 +76,8 @@ class KVMTests(unittest.TestCase):
                 mock.patch.object(envr.time, 'sleep'), contextlib.redirect_stdout(output := io.StringIO()), \
                 self.assertRaisesRegex(envr.EnvrError, 'power_status=stopped'):
             self.app.wait_for_instance(self.api, 'target', cache_state=False)
-        self.assertIn('0s elapsed', output.getvalue())
-        self.assertIn('30s elapsed', output.getvalue())
+        self.assertEqual(output.getvalue().count('Provisioning the VPS'), 1)
+        self.assertNotIn('power_status=', output.getvalue())
         self.app.remote_command.assert_not_called()
 
     def test_ssh_failure_preserves_diagnostic(self):

@@ -194,6 +194,16 @@ class APITests(unittest.TestCase):
         api.request("GET", "iam/clients/me")
         self.assertEqual(ApiHandler.received_authorization, "APIKey gcore-secret")
 
+    def test_problem_json_error_uses_human_title(self) -> None:
+        ApiHandler.response_status = 502
+        ApiHandler.response_payload = {
+            "type": "https://example.test/errors/bad-gateway", "status": 502,
+            "title": "Error accessing upstream service.", "correlation_id": "trace-id",
+        }
+        with self.assertRaises(envr.ApiError) as raised:
+            self.api.get("account")
+        self.assertEqual(raised.exception.message, "Error accessing upstream service.")
+
     def test_http_error_classification(self) -> None:
         ApiHandler.response_status = 503
         ApiHandler.response_payload = {"error": "capacity unavailable"}
@@ -563,6 +573,16 @@ class LifecycleLogicTests(unittest.TestCase):
             self.assertNotIn("codex login", command)
             self.assertNotIn("exec codex", command)
             self.assertTrue(app.remote_command.call_args_list[0].kwargs["tty"])
+
+    def test_failed_terminal_connection_is_not_reported_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = envr.Envr(Path(temporary))
+            app.remote_command = mock.Mock(return_value=SimpleNamespace(returncode=255))
+            app.sync_from_server = mock.Mock(return_value=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(envr.EnvrError, "SSH session ended unexpectedly"):
+                    app.connect_shell({"main_ip": "192.0.2.1"}, None)
+            app.sync_from_server.assert_called_once()
 
     def test_workspace_tmux_needs_no_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

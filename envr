@@ -27,6 +27,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Callable, Iterator, NamedTuple, Sequence
 import urllib.error
@@ -34,7 +35,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "0.18.12"
+VERSION = "0.18.13"
 SCHEMA_VERSION = 1
 
 # Run by cloud-init and by narrow recovery of an interrupted package install.
@@ -1604,6 +1605,48 @@ def exclusive_lock(root: Path) -> Iterator[None]:
         yield
 
 
+@contextlib.contextmanager
+def loading(message: str) -> Iterator[Callable[[str], None]]:
+    """Animate real waiting, without inventing a percentage or logging frames."""
+    stream = sys.stdout
+    interactive = stream.isatty() and os.environ.get("TERM") != "dumb"
+    started = time.perf_counter()
+    stopped = threading.Event()
+    label = [message]
+
+    def update(value: str) -> None:
+        if value != label[0]:
+            label[0] = value
+            if not interactive:
+                print(value + "...", file=stream, flush=True)
+
+    def animate() -> None:
+        frame = 0
+        frames = "|/-" + chr(92)
+        while not stopped.wait(0.1):
+            elapsed = int(time.perf_counter() - started)
+            width = max(1, shutil.get_terminal_size().columns - 1)
+            line = f"{frames[frame % 4]} {label[0]} · {elapsed}s"
+            stream.write("\r\033[K" + line[:width])
+            stream.flush()
+            frame += 1
+
+    worker = None
+    if interactive:
+        worker = threading.Thread(target=animate, daemon=True)
+        worker.start()
+    else:
+        print(message + "...", file=stream, flush=True)
+    try:
+        yield update
+    finally:
+        stopped.set()
+        if worker is not None:
+            worker.join()
+            stream.write("\r\033[K")
+            stream.flush()
+
+
 def run(
     command: Sequence[str],
     *,
@@ -2045,7 +2088,7 @@ class VultrAPI:
         try:
             value = json.loads(content.decode("utf-8"))
             if isinstance(value, dict):
-                for key in ("error", "message"):
+                for key in ("error", "message", "detail", "title"):
                     candidate = value.get(key)
                     if isinstance(candidate, str) and candidate:
                         return candidate
@@ -5883,6 +5926,14 @@ runcmd:
         cache_state: bool = True,
         recover_initial: bool = False,
     ) -> dict[str, Any]:
+        with loading(f"Waiting for {self.provider_label(api)} to prepare your VPS") as report:
+            return self._wait_for_instance(api, instance_id, cache_state=cache_state,
+                                          recover_initial=recover_initial, report=report)
+
+    def _wait_for_instance(
+        self, api: Any, instance_id: str, *, cache_state: bool,
+        recover_initial: bool, report: Callable[[str], None],
+    ) -> dict[str, Any]:
         timeout = getattr(api, "instance_timeout", INSTANCE_TIMEOUT)
         started = time.monotonic()
         timeout = timeout if isinstance(timeout, int) else INSTANCE_TIMEOUT
@@ -5892,7 +5943,6 @@ runcmd:
         reported = None
         stopped_since = None
         start_requested = False
-        print(f"Waiting for cloud startup (up to {timeout // 60} minutes)...", flush=True)
         last: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             try:
@@ -5902,7 +5952,7 @@ runcmd:
                     raise
                 now = time.monotonic()
                 if now >= next_report:
-                    print(f"  {int(now - started)}s elapsed · cloud API unavailable; retrying status...", flush=True)
+                    report(f"{self.provider_label(api)} is temporarily unavailable; retrying")
                     next_report = now + 30
                 time.sleep(min(15, max(5, error.retry_after or 5)))
                 continue
@@ -5916,7 +5966,12 @@ runcmd:
                     for key in ("status", "power_status", "server_status")
                 )
                 if status != reported or now >= next_report:
-                    print(f"  {int(now - started)}s elapsed · {status}", flush=True)
+                    stage = (
+                        "Provisioning the VPS"
+                        if instance.get("server_status") in {"locked", "installing"}
+                        else "Waiting for the VPS to boot"
+                    )
+                    report(stage)
                     reported = status
                     next_report = now + 30
                 if self.provider_name(api) == "scaleway" and instance.get("status") in {"error", "out_of_stock"}:
@@ -5940,7 +5995,7 @@ runcmd:
                     except subprocess.TimeoutExpired:
                         pass
                     if ssh_ready:
-                        print("SSH is ready; cloud power status has not caught up.", flush=True)
+                        report("VPS is reachable")
                     elif recover_initial and self.provider_name(api) == "vultr" and INITIAL_SETUP_TAG in (instance.get("tags") or []):
                         stopped_since = now if stopped_since is None else stopped_since
                         if now - stopped_since >= 60 and not start_requested:
@@ -5950,11 +6005,11 @@ runcmd:
                             api.request("PATCH", f"instances/{instance_id}", payload={"tags": tags})
                             instance['tags'] = tags
                             start_requested = True
-                            print("Starting the unfinished VPS once; keeping this same instance...", flush=True)
+                            report("Starting the unfinished VPS")
                             try:
                                 api.request("POST", f"instances/{instance_id}/start")
-                            except ApiError as error:
-                                print(f"Start request not confirmed: {error}. Waiting without repeating it.", flush=True)
+                            except ApiError:
+                                report("Waiting for the provider to confirm startup")
                 if (
                     instance.get("status") == "active"
                     and (instance.get("power_status") == "running" or ssh_ready)
@@ -6503,15 +6558,14 @@ done
         )
 
     def wait_for_ssh(self, instance: dict[str, Any]) -> None:
-        print(f"Waiting for SSH at {instance.get('main_ip')}...")
+        with loading("Waiting for SSH access"):
+            self._wait_for_ssh(instance)
+
+    def _wait_for_ssh(self, instance: dict[str, Any]) -> None:
         started = time.monotonic()
         deadline = started + INSTANCE_TIMEOUT
-        next_report = started + 30
         detail = ""
         while (now := time.monotonic()) < deadline:
-            if now >= next_report:
-                print(f"  {int(now - started)}s elapsed · SSH not ready; retrying...", flush=True)
-                next_report = now + 30
             try:
                 result = self.remote_command(
                     instance, "true", check=False, capture=True, timeout=15
@@ -6527,20 +6581,20 @@ done
         raise EnvrError("SSH did not become reachable" + (f": {detail}" if detail else ""))
 
     def wait_for_cloud_init(self, instance: dict[str, Any]) -> None:
-        print("Waiting for cloud-init...")
-        result = self.remote_command(
-            instance,
-            "sudo cloud-init status --wait >/dev/null 2>&1 || true; "
-            "if test -f /var/lib/envr-ready && command -v codex >/dev/null; "
-            "then exit 0; fi; "
-            "if test -f /usr/local/lib/envr/install-packages && "
-            "! test -f /var/lib/envr-packages-ready; then "
-            "echo 'envr: package setup incomplete' >&2; fi; "
-            "sudo cloud-init status --long >&2; exit 1",
-            check=False,
-            capture=True,
-            timeout=CLOUD_INIT_TIMEOUT,
-        )
+        with loading("Installing tools and configuring your VPS"):
+            result = self.remote_command(
+                instance,
+                "sudo cloud-init status --wait >/dev/null 2>&1 || true; "
+                "if test -f /var/lib/envr-ready && command -v codex >/dev/null; "
+                "then exit 0; fi; "
+                "if test -f /usr/local/lib/envr/install-packages && "
+                "! test -f /var/lib/envr-packages-ready; then "
+                "echo 'envr: package setup incomplete' >&2; fi; "
+                "sudo cloud-init status --long >&2; exit 1",
+                check=False,
+                capture=True,
+                timeout=CLOUD_INIT_TIMEOUT,
+            )
         if result.returncode != 0:
             detail = result.stderr.strip() if result.stderr else "cloud-init failed"
             if "Could not get APT lock" in detail or "envr: package setup incomplete" in detail:
@@ -7215,7 +7269,9 @@ trap - EXIT
         )
         print(f"Connecting to {display_name}. Detach safely with Ctrl-b d.")
         try:
-            self.remote_command(instance, command, tty=True, check=False)
+            result = self.remote_command(instance, command, tty=True, check=False)
+            if result.returncode != 0:
+                raise EnvrError(f"SSH session ended unexpectedly (exit {result.returncode}); reconnect with envr go")
         finally:
             try:
                 self.sync_from_server(instance)
